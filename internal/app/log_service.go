@@ -33,6 +33,10 @@ type LogService struct {
 	// 日志保留天数（启动时确定，修改后重启生效）
 	retentionDays int
 
+	// 最近日志的 attempt_index 缓存（内存态，不持久化）。
+	// 写库拿到 log.ID 后记录，查询时按 log.ID 回填，供 /admin/logs 展示重试次数。
+	attemptIndexCache *attemptIndexCache
+
 	// 优雅关闭
 	shutdownCh     chan struct{}
 	isShuttingDown *atomic.Bool
@@ -50,13 +54,14 @@ func NewLogService(
 	wg *sync.WaitGroup,
 ) *LogService {
 	return &LogService{
-		store:          store,
-		logChan:        make(chan *model.LogEntry, logBufferSize),
-		logWorkers:     logWorkers,
-		retentionDays:  retentionDays,
-		shutdownCh:     shutdownCh,
-		isShuttingDown: isShuttingDown,
-		wg:             wg,
+		store:             store,
+		logChan:           make(chan *model.LogEntry, logBufferSize),
+		logWorkers:        logWorkers,
+		retentionDays:     retentionDays,
+		attemptIndexCache: newAttemptIndexCache(3000),
+		shutdownCh:        shutdownCh,
+		isShuttingDown:    isShuttingDown,
+		wg:                wg,
 	}
 }
 
@@ -150,6 +155,8 @@ retryLoop:
 		err := s.store.BatchAddLogs(ctx, logs)
 		cancel()
 		if err == nil {
+			// 写库成功且 ID 已由存储层回填，记录 ID→attempt_index 缓存
+			s.recordAttemptIndexes(logs)
 			if attempt > 1 {
 				log.Printf("[WARN] 日志批量写入重试成功 (attempt=%d/%d, batch_size=%d)", attempt, maxRetries, len(logs))
 			}
@@ -217,6 +224,28 @@ func (s *LogService) AddLogAsync(entry *model.LogEntry) {
 			log.Printf("[ERROR] 日志队列已满，日志被丢弃 (累计丢弃: %d) - 考虑增大 LOG_BUFFER_SIZE 或 LOG_WORKERS", count)
 		}
 	}
+}
+
+// recordAttemptIndexes 把已写库日志的 ID→attempt_index 记入内存缓存。
+// 仅记录有有效 attempt_index 的条目（AttemptIndex>0 且 ID 已回填）。
+func (s *LogService) recordAttemptIndexes(logs []*model.LogEntry) {
+	if s.attemptIndexCache == nil {
+		return
+	}
+	for _, e := range logs {
+		if e == nil || e.AttemptIndex <= 0 || e.ID <= 0 {
+			continue
+		}
+		s.attemptIndexCache.record(e.ID, e.AttemptIndex)
+	}
+}
+
+// LookupAttemptIndex 按 log ID 查询 attempt_index（供 /admin/logs 回填）。
+func (s *LogService) LookupAttemptIndex(id int64) (int32, bool) {
+	if s.attemptIndexCache == nil || id <= 0 {
+		return 0, false
+	}
+	return s.attemptIndexCache.lookup(id)
 }
 
 // ============================================================================

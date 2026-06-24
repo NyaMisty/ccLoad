@@ -95,6 +95,11 @@ type LogEntry struct {
 
 	// 瞬态字段：不持久化到 logs 表，仅用于传递 debug 数据到写入管道
 	DebugData *DebugLogEntry `json:"-"`
+
+	// 瞬态字段：重试尝试次数（1-based，全局累计）。
+	// 不持久化（logs 表无此列）；写入时由 app 层持有，写库拿到 ID 后缓存 ID→index，
+	// 查询时由 app 层从内存缓存按 log.ID 回填。
+	AttemptIndex int32 `json:"attempt_index,omitempty"`
 }
 
 // LogFilter 日志查询过滤条件

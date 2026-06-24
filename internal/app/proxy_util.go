@@ -683,6 +683,7 @@ type logEntryParams struct {
 	StartTime      time.Time            // 渠道尝试开始时间（用于日志记录）
 	DebugData      *model.DebugLogEntry // Debug日志数据
 	CostMultiplier float64              // 渠道成本倍率快照（0=免费，<0 视为 1）
+	AttemptIndex   int32                // 重试尝试次数（1-based，全局累计；瞬态，不持久化）
 }
 
 // buildLogEntry 构建日志条目（消除重复代码，遵循DRY原则）
@@ -779,6 +780,7 @@ func buildLogEntry(p logEntryParams) *model.LogEntry {
 	}
 
 	entry.DebugData = p.DebugData
+	entry.AttemptIndex = p.AttemptIndex
 	return entry
 }
 

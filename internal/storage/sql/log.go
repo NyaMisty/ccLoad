@@ -217,7 +217,7 @@ func (s *SQLStore) BatchAddLogs(ctx context.Context, logs []*model.LogEntry) err
 	}
 
 	if len(plain) > 0 {
-		if err := batchInsertPlainLogs(ctx, tx, plain); err != nil {
+		if err := batchInsertPlainLogs(ctx, tx, plain, s.IsSQLite()); err != nil {
 			return err
 		}
 	}
@@ -243,7 +243,8 @@ func (s *SQLStore) filterDeletedChannelLogs(logs []*model.LogEntry) []*model.Log
 }
 
 // batchInsertPlainLogs 多值 INSERT 写入无 debug 数据的日志，按 batchSize 分块。
-func batchInsertPlainLogs(ctx context.Context, tx *sql.Tx, logs []*model.LogEntry) error {
+// 回填每条日志的自增 ID（供 app 层缓存 ID→attempt_index 用）。
+func batchInsertPlainLogs(ctx context.Context, tx *sql.Tx, logs []*model.LogEntry, isSQLite bool) error {
 	// 单批最多 100 行（2500 占位符），兼容 SQLite 32766/MySQL 65535 上限。
 	const batchSize = 100
 	for offset := 0; offset < len(logs); offset += batchSize {
@@ -261,11 +262,38 @@ func batchInsertPlainLogs(ctx context.Context, tx *sql.Tx, logs []*model.LogEntr
 			b.WriteString(logRowPlaceholders)
 			args = append(args, logRowArgs(e)...)
 		}
-		if _, err := tx.ExecContext(ctx, b.String(), args...); err != nil {
+		result, err := tx.ExecContext(ctx, b.String(), args...)
+		if err != nil {
 			return err
 		}
+		assignInsertedIDs(chunk, result, isSQLite)
 	}
 	return nil
+}
+
+// assignInsertedIDs 回填多值 INSERT 生成的自增 ID 到各条目。
+//
+// 单条多值 INSERT 内自增 ID 连续，但两端语义因驱动不同：
+//   - SQLite：LastInsertId 返回最后一条
+//   - MySQL：LastInsertId 返回第一条
+//
+// 若驱动不支持或无返回值，跳过回填（不影响其他功能，仅 attempt_index 查不到）。
+func assignInsertedIDs(entries []*model.LogEntry, result sql.Result, isSQLite bool) {
+	lastID, err := result.LastInsertId()
+	if err != nil || lastID <= 0 {
+		return
+	}
+	n := int64(len(entries))
+	if isSQLite {
+		first := lastID - n + 1
+		for i := range entries {
+			entries[i].ID = first + int64(i)
+		}
+	} else {
+		for i := range entries {
+			entries[i].ID = lastID + int64(i)
+		}
+	}
 }
 
 // insertLogsWithDebug 逐条插入需要 LastInsertId 关联 debug_logs 的日志。
@@ -282,6 +310,7 @@ func insertLogsWithDebug(ctx context.Context, tx *sql.Tx, logs []*model.LogEntry
 			return err
 		}
 		logID, _ := result.LastInsertId()
+		e.ID = logID // 回填自增 ID
 		if _, err := tx.ExecContext(ctx, `
 			INSERT INTO debug_logs (log_id, created_at, req_method, req_url, req_headers, req_body, resp_status, resp_headers, resp_body)
 			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,

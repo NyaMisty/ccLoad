@@ -11,7 +11,7 @@ func TestHandleActiveRequests(t *testing.T) {
 
 	m := newActiveRequestManager()
 	id := m.Register(time.Now(), "m1", "1.2.3.4", true)
-	m.Update(id, 10, "ch", "openai", "sk-test", 7, 1.5) //nolint:gosec // 测试用假凭证
+	m.Update(id, 10, "ch", "openai", "sk-test", 7, 1.5, 1) //nolint:gosec // 测试用假凭证
 	m.AddBytes(id, 123)
 	m.SetClientFirstByteTime(id, 50*time.Millisecond)
 
@@ -50,7 +50,7 @@ func TestHandleActiveRequests_PreservesZeroCostMultiplier(t *testing.T) {
 
 	m := newActiveRequestManager()
 	id := m.Register(time.Now(), "m1", "1.2.3.4", true)
-	m.Update(id, 10, "free-channel", "openai", "sk-test", 7, 0) //nolint:gosec // 测试用假凭证
+	m.Update(id, 10, "free-channel", "openai", "sk-test", 7, 0, 1) //nolint:gosec // 测试用假凭证
 
 	s := &Server{activeRequests: m}
 

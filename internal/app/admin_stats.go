@@ -30,6 +30,13 @@ func (s *Server) HandleErrors(c *gin.Context) {
 		return
 	}
 
+	// 从内存缓存按 log ID 回填 attempt_index（非持久化字段，logs 表无此列）
+	for _, e := range logs {
+		if idx, ok := s.logService.LookupAttemptIndex(e.ID); ok {
+			e.AttemptIndex = idx
+		}
+	}
+
 	RespondJSONWithCount(c, http.StatusOK, logs, total)
 }
 

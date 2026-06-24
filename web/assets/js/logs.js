@@ -878,6 +878,11 @@ function renderLogs(data) {
       'status-success' : 'status-error';
     const statusCode = entry.status_code;
 
+    // 2.5. 重试尝试次数角标（attempt_index>1 表示该请求发生过重试）
+    const attemptBadge = (Number(entry.attempt_index) > 1)
+      ? ` <sup class="logs-attempt-badge" style="color: var(--warning-600); font-weight: 600;" title="第 ${entry.attempt_index} 次尝试（已重试）">↻${entry.attempt_index}</sup>`
+      : '';
+
     // 3. 模型显示（支持重定向角标）
     let modelDisplay;
     if (entry.model) {
@@ -993,7 +998,7 @@ function renderLogs(data) {
           <td class="logs-col-api-key" data-mobile-label="${logMobileLabels.apiKey}" style="text-align: center; white-space: nowrap;">${apiKeyDisplay}</td>
           <td class="logs-col-channel" data-mobile-label="${logMobileLabels.channel}" style="text-align: left;">${configDisplay}</td>
           <td class="logs-col-model" data-mobile-label="${logMobileLabels.model}">${modelDisplay}</td>
-          <td class="logs-col-status" data-mobile-label="${logMobileLabels.status}"><span class="${statusClass}">${statusCode}</span></td>
+          <td class="logs-col-status" data-mobile-label="${logMobileLabels.status}"><span class="${statusClass}">${statusCode}${attemptBadge}</span></td>
           <td class="logs-col-timing" data-mobile-label="${logMobileLabels.timing}" style="text-align: right; white-space: nowrap;">${responseTimingDisplay}</td>
           <td class="logs-col-speed${speedDisplay ? '' : ' mobile-empty-cell'}" data-mobile-label="${logMobileLabels.speed}" style="text-align: right; white-space: nowrap;">${speedDisplay}</td>
           <td class="logs-col-input${inputTokensDisplay ? '' : ' mobile-empty-cell'}" data-mobile-label="${logMobileLabels.input}" style="text-align: right; white-space: nowrap;">${inputTokensDisplay}</td>
