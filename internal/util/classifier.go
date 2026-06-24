@@ -444,10 +444,10 @@ func classifySSEError(responseBody []byte) ErrorLevel {
 
 	// 根据error.type/code判断错误级别
 	switch errResp.ErrorType() {
-	case "api_error", "overloaded_error", "service_unavailable_error", "server_is_overloaded", "1305":
+	case "api_error", "overloaded_error", "service_unavailable_error", "server_is_overloaded", "1305", "1312":
 		// 上游服务错误或过载 → 渠道级冷却
 		return ErrorLevelChannel
-	case "rate_limit_error", "authentication_error", "invalid_request_error", "1308", "1310":
+	case "rate_limit_error", "authentication_error", "invalid_request_error", "1308", "1310", "1313", "1302":
 		// 限流/认证/请求错误 → Key级冷却
 		return ErrorLevelKey
 	default:
