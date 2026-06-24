@@ -227,13 +227,22 @@ func (s *LogService) AddLogAsync(entry *model.LogEntry) {
 }
 
 // recordAttemptIndexes 把已写库日志的 ID→(reqID, attempt_index) 记入内存缓存。
-// 仅记录有有效 attempt_index 的条目（AttemptIndex>0 且 ID 已回填）。
+// - IsTerminalOverride 的条目（汇总/兜底日志）记为该请求链的 final override，
+//   覆盖 maxIdx 派生判定，使其成为唯一「终」、撤销同链上游失败日志的错标。
+// - 其余仅记录有有效 attempt_index 的条目（AttemptIndex>0 且 ID 已回填）。
 func (s *LogService) recordAttemptIndexes(logs []*model.LogEntry) {
 	if s.attemptIndexCache == nil {
 		return
 	}
 	for _, e := range logs {
-		if e == nil || e.AttemptIndex <= 0 || e.ID <= 0 {
+		if e == nil || e.ID <= 0 {
+			continue
+		}
+		if e.IsTerminalOverride {
+			s.attemptIndexCache.recordFinal(e.ID, e.RequestID)
+			continue
+		}
+		if e.AttemptIndex <= 0 {
 			continue
 		}
 		s.attemptIndexCache.record(e.ID, e.RequestID, e.AttemptIndex)

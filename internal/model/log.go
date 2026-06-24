@@ -108,6 +108,13 @@ type LogEntry struct {
 	// 瞬态字段：所属请求链 ID（activeReqID），仅用于写库后缓存 reqID→max idx，
 	// 不返回给前端。
 	RequestID int64 `json:"-"`
+
+	// 瞬态字段：标记该日志为所属请求链「真正返回给 client 的最终结果」。
+	// 用于覆盖 attempt_index maxIdx 派生判定——多渠道全失败时，汇总日志
+	// （writeFinalProxyResponse）而非最后一条上游失败日志，才是返回 client 的那条。
+	// 不持久化；写库后由 LogService 记入 attemptIndexCache 的 final override。
+	// 不返回给前端。
+	IsTerminalOverride bool `json:"-"`
 }
 
 // LogFilter 日志查询过滤条件
