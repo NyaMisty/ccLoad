@@ -1253,7 +1253,7 @@ func buildTestFailureClassificationInput(result map[string]any) (statusCode int,
 	// “HTTP 200 + 结构化 error 对象”本质上不是成功，只是上游把错误塞进了响应体。
 	if statusCode >= 200 && statusCode < 300 && hasStructuredAPIError {
 		// 仅配额类(1308/1310)映射为 596；其余 GLM 错误按 597 处理
-		if _, _, reason, ok := util.ParseGLMErrorCooldown(errorBody, time.Now()); ok && util.IsGLMQuotaErrorCode(reason) {
+		if _, _, reason, ok := util.ParseGLMErrorCooldown(errorBody, headers, time.Now()); ok && util.IsGLMQuotaErrorCode(reason) {
 			statusCode = util.StatusQuotaExceeded
 		} else {
 			statusCode = util.StatusSSEError

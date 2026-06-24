@@ -6,17 +6,18 @@ import (
 )
 
 func TestParseGLMErrorCooldown(t *testing.T) {
-	// 固定 now，便于验证相对冷却(retry-after/30s 兜底)
+	// 固定 now，便于验证相对冷却(retry-after / 兜底)
 	now := time.Date(2026, 6, 24, 15, 0, 0, 0, time.Local)
 
 	tests := []struct {
 		name          string
 		responseBody  string
+		headers       map[string][]string // HTTP 响应头（测试 Retry-After）
 		expectOK      bool
 		expectLevel   ErrorLevel
 		expectReason  string        // GLM 码
 		expectAbsTime string        // 绝对重置时间(配额类)，格式 "2006-01-02 15:04:05"；为空则校验 expectOffset
-		expectOffset  time.Duration // 相对冷却(retry-after/30s)，配合 now 校验
+		expectOffset  time.Duration // 相对冷却，配合 now 校验
 	}{
 		// 配额类 1308：绝对时间优先（type 字段即码）
 		{
@@ -43,27 +44,27 @@ func TestParseGLMErrorCooldown(t *testing.T) {
 			expectReason:  "1310",
 			expectAbsTime: "2026-04-20 15:24:20",
 		},
-		// 配额类但无绝对时间 → 降级 retry-after(无) > 30s 兜底
+		// 配额类但无绝对时间 → 降级 retry-after(无) > 10s 兜底
 		{
-			name:         "1308无时间-兜底30s",
+			name:         "1308无时间-兜底10s",
 			responseBody: `{"error":{"type":"1308","message":"错误信息但没有时间"},"request_id":"xxx"}`,
 			expectOK:     true,
 			expectLevel:  ErrorLevelKey,
 			expectReason: "1308",
-			expectOffset: 30 * time.Second,
+			expectOffset: 10 * time.Second,
 		},
 		{
-			name:         "1310无时间-兜底30s",
+			name:         "1310无时间-兜底10s",
 			responseBody: `{"error":{"code":"1310","message":"Weekly/Monthly Limit Exhausted"}}`,
 			expectOK:     true,
 			expectLevel:  ErrorLevelKey,
 			expectReason: "1310",
-			expectOffset: 30 * time.Second,
+			expectOffset: 10 * time.Second,
 		},
 
 		// 限流类 1302：码在 code 字段、type 是 rate_limit_error
 		{
-			name:          "1302速率限制-顶层retry-after",
+			name:          "1302速率限制-body顶层retry-after",
 			responseBody:  `{"type":"error","error":{"type":"rate_limit_error","code":"1302","message":"[1302][您的账户已达到速率限制]"},"request_id":"20260624145731442e21731d414015","retry-after":"40"}`,
 			expectOK:      true,
 			expectLevel:   ErrorLevelKey,
@@ -71,12 +72,31 @@ func TestParseGLMErrorCooldown(t *testing.T) {
 			expectOffset:  40 * time.Second,
 		},
 		{
-			name:         "1302无retry-after-兜底30s",
-			responseBody: `{"type":"error","error":{"type":"rate_limit_error","code":"1302","message":"[1302][您的账户已达到速率限制]"}}`,
-			expectOK:     true,
-			expectLevel:  ErrorLevelKey,
-			expectReason: "1302",
-			expectOffset: 30 * time.Second,
+			name:          "1302速率限制-HTTP header Retry-After(429标准位置)",
+			responseBody:  `{"type":"error","error":{"type":"rate_limit_error","code":"1302","message":"[1302][您的账户已达到速率限制]"}}`,
+			headers:       map[string][]string{"Retry-After": {"40"}},
+			expectOK:      true,
+			expectLevel:   ErrorLevelKey,
+			expectReason:  "1302",
+			expectOffset:  40 * time.Second,
+		},
+		{
+			name:          "1302-header优先于body字段",
+			responseBody:  `{"error":{"code":"1302","message":"x","retry-after":"99"}}`,
+			headers:       map[string][]string{"Retry-After": {"25"}},
+			expectOK:      true,
+			expectLevel:   ErrorLevelKey,
+			expectReason:  "1302",
+			expectOffset:  25 * time.Second,
+		},
+		{
+			name:          "1302-小写retry-after头",
+			responseBody:  `{"error":{"code":"1302","message":"x"}}`,
+			headers:       map[string][]string{"retry-after": {"18"}},
+			expectOK:      true,
+			expectLevel:   ErrorLevelKey,
+			expectReason:  "1302",
+			expectOffset:  18 * time.Second,
 		},
 		{
 			name:          "1302-retry-after在error对象内",
@@ -86,14 +106,22 @@ func TestParseGLMErrorCooldown(t *testing.T) {
 			expectReason:  "1302",
 			expectOffset:  15 * time.Second,
 		},
+		{
+			name:         "1302无retry-after-兜底3s",
+			responseBody: `{"type":"error","error":{"type":"rate_limit_error","code":"1302","message":"[1302][您的账户已达到速率限制]"}}`,
+			expectOK:     true,
+			expectLevel:  ErrorLevelKey,
+			expectReason: "1302",
+			expectOffset: 3 * time.Second,
+		},
 		// 限流类 1313：码在 code 字段、type 是 api_error
 		{
-			name:         "1313公平使用策略-兜底30s",
+			name:         "1313公平使用策略-兜底3s",
 			responseBody: `{"type":"error","error":{"type":"api_error","code":"1313","message":"[1313][您的账户当前使用模式不符合公平使用策略]"},"request_id":"202606241456268d419043239a420a"}`,
 			expectOK:     true,
 			expectLevel:  ErrorLevelKey,
 			expectReason: "1313",
-			expectOffset: 30 * time.Second,
+			expectOffset: 3 * time.Second,
 		},
 
 		// 服务类 1305/1312：渠道级
@@ -106,12 +134,20 @@ func TestParseGLMErrorCooldown(t *testing.T) {
 			expectOffset:  20 * time.Second,
 		},
 		{
-			name:         "1312过载-渠道级兜底30s",
+			name:         "1305过载-渠道级兜底3s",
+			responseBody: `{"error":{"code":"1305","message":"该模型当前访问量过大"}}`,
+			expectOK:     true,
+			expectLevel:  ErrorLevelChannel,
+			expectReason: "1305",
+			expectOffset: 3 * time.Second,
+		},
+		{
+			name:         "1312过载-渠道级兜底10s",
 			responseBody: `{"error":{"code":"1312","message":"overloaded"}}`,
 			expectOK:     true,
 			expectLevel:  ErrorLevelChannel,
 			expectReason: "1312",
-			expectOffset: 30 * time.Second,
+			expectOffset: 10 * time.Second,
 		},
 
 		// 非 GLM 码 / 格式错误
@@ -134,7 +170,7 @@ func TestParseGLMErrorCooldown(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			until, level, reason, ok := ParseGLMErrorCooldown([]byte(tt.responseBody), now)
+			until, level, reason, ok := ParseGLMErrorCooldown([]byte(tt.responseBody), tt.headers, now)
 
 			if ok != tt.expectOK {
 				t.Fatalf("ok = %v, want %v", ok, tt.expectOK)
@@ -174,7 +210,7 @@ func TestParseGLMErrorCooldown(t *testing.T) {
 func TestParseGLMErrorCooldown_Timezone(t *testing.T) {
 	responseBody := `{"type":"error","error":{"type":"1308","message":"您的限额将在 2025-12-09 18:08:11 重置。"},"request_id":"xxx"}`
 
-	resetTime, _, _, ok := ParseGLMErrorCooldown([]byte(responseBody), time.Now())
+	resetTime, _, _, ok := ParseGLMErrorCooldown([]byte(responseBody), nil, time.Now())
 	if !ok {
 		t.Fatal("解析失败")
 	}
@@ -188,7 +224,7 @@ func TestParseGLMErrorCooldown_Timezone(t *testing.T) {
 func TestParseGLMErrorCooldown_MultipleOccurrences(t *testing.T) {
 	responseBody := `{"type":"error","error":{"type":"1308","message":"您之前将在某时 2025-01-01 00:00:00，现在的限额将在 2025-12-09 18:08:11 重置。"},"request_id":"xxx"}`
 
-	resetTime, _, _, ok := ParseGLMErrorCooldown([]byte(responseBody), time.Now())
+	resetTime, _, _, ok := ParseGLMErrorCooldown([]byte(responseBody), nil, time.Now())
 	if !ok {
 		t.Fatal("解析失败")
 	}
@@ -200,7 +236,7 @@ func TestParseGLMErrorCooldown_MultipleOccurrences(t *testing.T) {
 	}
 }
 
-// 验证主分类路径对 1302 产出固定 Key 级冷却（修复目标：不再落入指数退避）
+// 验证主分类路径对 HTTP 429 + 1302(body 含 retry-after)产出固定 Key 级冷却
 func TestClassifyHTTPResponseWithMeta_GLM1302UsesRetryAfter(t *testing.T) {
 	body := []byte(`{"type":"error","error":{"type":"rate_limit_error","code":"1302","message":"[1302][您的账户已达到速率限制]"},"request_id":"x","retry-after":"40"}`)
 
@@ -213,6 +249,35 @@ func TestClassifyHTTPResponseWithMeta_GLM1302UsesRetryAfter(t *testing.T) {
 	}
 	if !got.HasKeyCooldownUntil {
 		t.Fatal("expected fixed key cooldown until (retry-after=40s)")
+	}
+	if got.KeyCooldownReason != "1302" {
+		t.Fatalf("KeyCooldownReason=%q, want 1302", got.KeyCooldownReason)
+	}
+
+	minUntil := before.Add(40*time.Second - 2*time.Second)
+	maxUntil := after.Add(40*time.Second + 2*time.Second)
+	if got.KeyCooldownUntil.Before(minUntil) || got.KeyCooldownUntil.After(maxUntil) {
+		t.Fatalf("KeyCooldownUntil=%s, want ~40s window between %s and %s",
+			got.KeyCooldownUntil.Format(time.RFC3339),
+			minUntil.Format(time.RFC3339),
+			maxUntil.Format(time.RFC3339))
+	}
+}
+
+// 验证主分类路径对 HTTP 429 + Retry-After 头 产出固定冷却（header 是 429 的标准位置）
+func TestClassifyHTTPResponseWithMeta_GLM1302UsesHeaderRetryAfter(t *testing.T) {
+	body := []byte(`{"type":"error","error":{"type":"rate_limit_error","code":"1302","message":"[1302][您的账户已达到速率限制]"}}`)
+	headers := map[string][]string{"Retry-After": {"40"}}
+
+	before := time.Now()
+	got := classifyHTTPResponseWithMetaAt(429, headers, body, time.Now())
+	after := time.Now()
+
+	if got.Level != ErrorLevelKey {
+		t.Fatalf("Level=%v, want ErrorLevelKey", got.Level)
+	}
+	if !got.HasKeyCooldownUntil {
+		t.Fatal("expected fixed key cooldown until (header Retry-After=40s)")
 	}
 	if got.KeyCooldownReason != "1302" {
 		t.Fatalf("KeyCooldownReason=%q, want 1302", got.KeyCooldownReason)

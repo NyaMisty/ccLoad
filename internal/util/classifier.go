@@ -266,7 +266,7 @@ func ClassifyHTTPResponseWithMeta(statusCode int, headers map[string][]string, r
 func classifyHTTPResponseWithMetaAt(statusCode int, headers map[string][]string, responseBody []byte, now time.Time) HTTPResponseClassification {
 	// [INFO] 特殊处理：检测 GLM 错误（可能以 SSE error 事件形式出现，HTTP 状态码是 200）
 	// 识别全部 GLM 错误码并按其语义级别冷却，冷却时长：绝对时间 > retry-after > 30s
-	if cooldownUntil, level, reason, ok := ParseGLMErrorCooldown(responseBody, now); ok {
+	if cooldownUntil, level, reason, ok := ParseGLMErrorCooldown(responseBody, headers, now); ok {
 		classification := HTTPResponseClassification{Level: level}
 		switch level {
 		case ErrorLevelChannel:
@@ -778,7 +778,7 @@ func IsGLMQuotaErrorCode(reason string) bool {
 //   - level: 错误级别（Key/Channel），保留 GLM 语义
 //   - reason: GLM 错误码（如 "1308"），供调用方区分配额类
 //   - ok: 是否为 GLM 错误
-func ParseGLMErrorCooldown(responseBody []byte, now time.Time) (until time.Time, level ErrorLevel, reason string, ok bool) {
+func ParseGLMErrorCooldown(responseBody []byte, headers map[string][]string, now time.Time) (until time.Time, level ErrorLevel, reason string, ok bool) {
 	// 解析JSON结构，支持两种格式：
 	//   1. Anthropic格式: {"type":"error", "error":{"type":"1308", ...}}
 	//   2. 其他渠道格式: {"error":{"code":"1308", ...}}
@@ -807,7 +807,7 @@ func ParseGLMErrorCooldown(responseBody []byte, now time.Time) (until time.Time,
 	}
 
 	// 2. retry-after（顶层优先，回退 error 对象内）
-	if seconds := parseGLMRetryAfterSeconds(errResp); seconds > 0 {
+	if seconds := parseGLMRetryAfterSeconds(headers, errResp); seconds > 0 {
 		return now.Add(time.Duration(seconds) * time.Second), lvl, code, true
 	}
 
@@ -822,14 +822,33 @@ func ParseGLMErrorCooldown(responseBody []byte, now time.Time) (until time.Time,
 	return now.Add(10 * time.Second), lvl, code, true
 }
 
-// parseGLMRetryAfterSeconds 从 SSE error 中提取 retry-after 秒数（顶层或 error 对象内）。
-func parseGLMRetryAfterSeconds(errResp sseErrorResponse) int {
+// parseGLMRetryAfterSeconds 从 HTTP header 或 body 中提取 retry-after 秒数。
+// 优先 HTTP header 的 Retry-After（429 标准位置），回退 body 顶层/error 对象内字段。
+func parseGLMRetryAfterSeconds(headers map[string][]string, errResp sseErrorResponse) int {
+	if seconds := retryAfterSecondsFromHeader(headers); seconds > 0 {
+		return seconds
+	}
 	for _, raw := range []string{errResp.RetryAfter, errResp.Error.RetryAfter} {
 		if raw == "" {
 			continue
 		}
 		if seconds, err := strconv.Atoi(strings.TrimSpace(raw)); err == nil && seconds > 0 {
 			return seconds
+		}
+	}
+	return 0
+}
+
+// retryAfterSecondsFromHeader 从 HTTP header 提取 Retry-After 秒数（兼容大小写键名）。
+func retryAfterSecondsFromHeader(headers map[string][]string) int {
+	if len(headers) == 0 {
+		return 0
+	}
+	for _, key := range []string{"Retry-After", "retry-after"} {
+		if values := headers[key]; len(values) > 0 {
+			if seconds, err := strconv.Atoi(strings.TrimSpace(values[0])); err == nil && seconds > 0 {
+				return seconds
+			}
 		}
 	}
 	return 0
