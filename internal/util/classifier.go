@@ -797,6 +797,10 @@ func ParseGLMErrorCooldown(responseBody []byte, headers map[string][]string, now
 		return time.Time{}, ErrorLevelNone, "", false
 	}
 
+	if lvl == ErrorLevelChannel {
+		return now.Add(5 * time.Second), lvl, code, true
+	}
+
 	// 1. 配额类：优先从 message 提取绝对重置时间（不依赖具体语言文案）
 	if glmQuotaErrorCodes[code] {
 		if timeStr := resetTime1308Regex.FindString(errResp.Error.Message); timeStr != "" {
@@ -809,13 +813,6 @@ func ParseGLMErrorCooldown(responseBody []byte, headers map[string][]string, now
 	// 2. retry-after（顶层优先，回退 error 对象内）
 	if seconds := parseGLMRetryAfterSeconds(headers, errResp); seconds > 0 {
 		return now.Add(time.Duration(seconds) * time.Second), lvl, code, true
-	}
-
-	if code == "1302" || code == "1313" || code == "1305" {
-		// 1302 您的账户已达到速率限制，请您控制请求频率
-		// 1305 该模型当前访问量过大，请您稍后再试
-		// 1313 您的账户当前使用模式不符合公平使用策略，请求频率已受到限制。详情请参阅《条款与协议-订阅及自动续费协议》，如需恢复请前往个人中心-编程套餐总览-顶部申请解除限制
-		return now.Add(3 * time.Second), lvl, code, true
 	}
 
 	// 3. 兜底 10s
