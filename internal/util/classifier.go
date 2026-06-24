@@ -105,13 +105,15 @@ type HTTPResponseClassification struct {
 }
 
 // sseErrorResponse SSE error事件的JSON结构（Anthropic API / 88code API）
-// [FIX] 提取为公共结构体，消除 classifySSEError 和 ParseResetTimeFrom1308Error 的重复定义
+// [FIX] 提取为公共结构体，消除 classifySSEError 和 ParseGLMErrorCooldown 的重复定义
 type sseErrorResponse struct {
-	Type  string `json:"type"`
+	Type       string `json:"type"`
+	RetryAfter string `json:"retry-after"` // GLM 限流类(1302等)顶层的 retry-after(秒)
 	Error struct {
-		Type    string `json:"type"` // Anthropic使用
-		Code    string `json:"code"` // 其他渠道使用
-		Message string `json:"message"`
+		Type       string `json:"type"`        // Anthropic使用
+		Code       string `json:"code"`        // 其他渠道使用
+		Message    string `json:"message"`
+		RetryAfter string `json:"retry-after"` // 部分渠道放在 error 对象内
 	} `json:"error"`
 }
 
@@ -262,15 +264,21 @@ func ClassifyHTTPResponseWithMeta(statusCode int, headers map[string][]string, r
 }
 
 func classifyHTTPResponseWithMetaAt(statusCode int, headers map[string][]string, responseBody []byte, now time.Time) HTTPResponseClassification {
-	// [INFO] 特殊处理：检测1308错误（可能以SSE error事件形式出现，HTTP状态码是200）
-	// 1308错误表示达到使用上限，应该触发Key级冷却
-	if resetTime, has1308 := ParseResetTimeFrom1308Error(responseBody); has1308 {
-		return HTTPResponseClassification{
-			Level:               ErrorLevelKey,
-			KeyCooldownUntil:    resetTime,
-			HasKeyCooldownUntil: true,
-			KeyCooldownReason:   "1308",
+	// [INFO] 特殊处理：检测 GLM 错误（可能以 SSE error 事件形式出现，HTTP 状态码是 200）
+	// 识别全部 GLM 错误码并按其语义级别冷却，冷却时长：绝对时间 > retry-after > 30s
+	if cooldownUntil, level, reason, ok := ParseGLMErrorCooldown(responseBody, now); ok {
+		classification := HTTPResponseClassification{Level: level}
+		switch level {
+		case ErrorLevelChannel:
+			classification.ChannelCooldownUntil = cooldownUntil
+			classification.HasChannelCooldownUntil = true
+			classification.ChannelCooldownReason = reason
+		default:
+			classification.KeyCooldownUntil = cooldownUntil
+			classification.HasKeyCooldownUntil = true
+			classification.KeyCooldownReason = reason
 		}
+		return classification
 	}
 
 	if cooldownUntil, reason, level, ok := parseStructuredQuotaCooldown(responseBody, now); ok {
@@ -730,49 +738,101 @@ func classify404Error(responseBody []byte) ErrorLevel {
 	return ErrorLevelChannel
 }
 
-// ParseResetTimeFrom1308Error 从1308错误响应中提取重置时间
-// 错误格式: {"type":"error","error":{"type":"1308","message":"已达到 5 小时的使用上限。您的限额将在 2025-12-09 18:08:11 重置。"},"request_id":"..."}
+// GLM 错误码语义分组（保留各码原有语义）。
+//   - Key 级（限流/配额/请求）：1302 速率限制、1308 配额超限、1310 周/月度限额、1313 公平使用策略
+//   - 渠道级（上游服务错误/过载）：1305、1312
+var glmErrorCodes = map[string]ErrorLevel{
+	"1302": ErrorLevelKey,
+	"1308": ErrorLevelKey,
+	"1310": ErrorLevelKey,
+	"1313": ErrorLevelKey,
+	"1305": ErrorLevelChannel,
+	"1312": ErrorLevelChannel,
+}
+
+// glmQuotaErrorCodes 配额类（message 含绝对重置时间），命中后映射为 596。
+var glmQuotaErrorCodes = map[string]bool{
+	"1308": true,
+	"1310": true,
+}
+
+// IsGLMQuotaErrorCode 判断给定 reason(GLM 码) 是否为配额超限类（有绝对重置时间，映射 596）。
+func IsGLMQuotaErrorCode(reason string) bool {
+	return glmQuotaErrorCodes[reason]
+}
+
+// ParseGLMErrorCooldown 从 GLM 错误响应中提取冷却截止时间与级别。
 //
-// [FIX] 使用正则匹配时间格式，不再依赖中文文案（如"将在"/"重置"）
-// 这样即使上游修改错误消息措辞或切换语言，只要包含 YYYY-MM-DD HH:MM:SS 格式的时间就能正确解析
+// 识别全部 GLM 错误码并保留其语义级别（见 glmErrorCodes）。
+// 冷却时长优先级：
+//  1. 配额类(1308/1310)：从 message 中提取绝对重置时间(YYYY-MM-DD HH:MM:SS)
+//  2. retry-after：body 顶层或 error 对象内的 "retry-after"(秒)
+//  3. 兜底：固定 30s
 //
 // 参数:
-//   - responseBody: JSON格式的错误响应体
+//   - responseBody: JSON 格式的错误响应体
+//   - now: 当前时间，用于计算相对冷却(retry-after / 30s 兜底)
 //
 // 返回:
-//   - time.Time: 解析出的重置时间（如果成功）
-//   - bool: 是否成功解析（true表示是1308错误且成功提取时间）
-func ParseResetTimeFrom1308Error(responseBody []byte) (time.Time, bool) {
-	// 1. 解析JSON结构
-	// [FIX] 支持两种格式：
+//   - until: 冷却截止时间
+//   - level: 错误级别（Key/Channel），保留 GLM 语义
+//   - reason: GLM 错误码（如 "1308"），供调用方区分配额类
+//   - ok: 是否为 GLM 错误
+func ParseGLMErrorCooldown(responseBody []byte, now time.Time) (until time.Time, level ErrorLevel, reason string, ok bool) {
+	// 解析JSON结构，支持两种格式：
 	//   1. Anthropic格式: {"type":"error", "error":{"type":"1308", ...}}
 	//   2. 其他渠道格式: {"error":{"code":"1308", ...}}
 	var errResp sseErrorResponse
-
 	if err := json.Unmarshal(responseBody, &errResp); err != nil {
-		return time.Time{}, false
+		return time.Time{}, ErrorLevelNone, "", false
 	}
 
-	// 2. 检查是否为1308或1310错误（优先使用type，如果为空则使用code）
-	errorType := errResp.ErrorType()
-	if errorType != "1308" && errorType != "1310" {
-		return time.Time{}, false
+	// 识别是否为 GLM 错误：优先 code（1302/1313 等码在 code 字段），回退 type（1308 的 type 字段即码）
+	code := errResp.Error.Code
+	if _, found := glmErrorCodes[code]; !found {
+		code = errResp.Error.Type
+	}
+	lvl, isGLM := glmErrorCodes[code]
+	if !isGLM {
+		return time.Time{}, ErrorLevelNone, "", false
 	}
 
-	// 3. 使用正则从message中提取时间字符串（不依赖具体语言文案）
-	// 匹配格式: YYYY-MM-DD HH:MM:SS
-	timeStr := resetTime1308Regex.FindString(errResp.Error.Message)
-	if timeStr == "" {
-		return time.Time{}, false
+	// 1. 配额类：优先从 message 提取绝对重置时间（不依赖具体语言文案）
+	if glmQuotaErrorCodes[code] {
+		if timeStr := resetTime1308Regex.FindString(errResp.Error.Message); timeStr != "" {
+			if resetTime, err := time.ParseInLocation("2006-01-02 15:04:05", timeStr, time.Local); err == nil {
+				return resetTime, lvl, code, true
+			}
+		}
 	}
 
-	// 4. 解析时间字符串
-	resetTime, err := time.ParseInLocation("2006-01-02 15:04:05", timeStr, time.Local)
-	if err != nil {
-		return time.Time{}, false
+	// 2. retry-after（顶层优先，回退 error 对象内）
+	if seconds := parseGLMRetryAfterSeconds(errResp); seconds > 0 {
+		return now.Add(time.Duration(seconds) * time.Second), lvl, code, true
 	}
 
-	return resetTime, true
+	if code == "1302" || code == "1313" || code == "1305" {
+		// 1302 您的账户已达到速率限制，请您控制请求频率
+		// 1305 该模型当前访问量过大，请您稍后再试
+		// 1313 您的账户当前使用模式不符合公平使用策略，请求频率已受到限制。详情请参阅《条款与协议-订阅及自动续费协议》，如需恢复请前往个人中心-编程套餐总览-顶部申请解除限制
+		return now.Add(3 * time.Second), lvl, code, true
+	}
+
+	// 3. 兜底 10s
+	return now.Add(10 * time.Second), lvl, code, true
+}
+
+// parseGLMRetryAfterSeconds 从 SSE error 中提取 retry-after 秒数（顶层或 error 对象内）。
+func parseGLMRetryAfterSeconds(errResp sseErrorResponse) int {
+	for _, raw := range []string{errResp.RetryAfter, errResp.Error.RetryAfter} {
+		if raw == "" {
+			continue
+		}
+		if seconds, err := strconv.Atoi(strings.TrimSpace(raw)); err == nil && seconds > 0 {
+			return seconds
+		}
+	}
+	return 0
 }
 
 // ClassifyError 统一错误分类器（网络错误+HTTP错误）

@@ -1087,9 +1087,10 @@ func shouldProbeSoftError(reqCtx *requestContext, resp *http.Response, channelTy
 }
 
 // classifySSEErrorStatus 根据响应体内容判定 SSE 错误的内部状态码：
-// 1308 配额超限 → 596；明确限流 → 429；其他 → 597。
+// 配额类(1308/1310) → 596；明确限流 → 429；其他 → 597。
 func classifySSEErrorStatus(body []byte) int {
-	if _, is1308 := util.ParseResetTimeFrom1308Error(body); is1308 {
+	// 仅配额类(1308/1310)映射为 596；限流类(1302/1313)走 429，服务类(1305/1312)走 597
+	if _, _, reason, ok := util.ParseGLMErrorCooldown(body, time.Now()); ok && util.IsGLMQuotaErrorCode(reason) {
 		return util.StatusQuotaExceeded
 	}
 	if isSSERateLimitError(body) {
