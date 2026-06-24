@@ -271,7 +271,14 @@ function buildActiveRequestInfoContent(req) {
   const hasBytes = !!bytesInfo;
   const infoDisplay = hasBytes ? `已接收 ${bytesInfo}` : '请求处理中...';
   const infoColor = hasBytes ? 'var(--success-600)' : 'var(--neutral-500)';
-  const infoHtml = `<span style="color: ${infoColor};">${escapeHtml(infoDisplay)}</span>`;
+  let infoHtml = `<span style="color: ${infoColor};">${escapeHtml(infoDisplay)}</span>`;
+
+  // 尝试次数标记（attempt_index > 1 表示正在重试）
+  const attemptIndex = Number(req?.attempt_index);
+  if (Number.isFinite(attemptIndex) && attemptIndex > 1) {
+    infoHtml += ` <span class="logs-attempt-badge" style="color: var(--warning-600); font-weight: 600;" title="已重试次数">↻${attemptIndex}</span>`;
+  }
+
   const activeRequestId = Number(req?.id);
 
   if (!req?.debug_log_available || !Number.isFinite(activeRequestId) || activeRequestId <= 0) {

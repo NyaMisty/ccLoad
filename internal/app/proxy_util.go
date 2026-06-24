@@ -146,6 +146,7 @@ type proxyRequestContext struct {
 	startTime        time.Time            // 请求开始时间（用于统计）
 	channelStartTime time.Time            // 当前渠道尝试开始时间（每次切换渠道时重置）
 	attemptStartTime time.Time            // 渠道内单次 Key/URL 尝试开始时间
+	attemptIndex     int                  // 全局尝试次数计数器（每次尝试递增，用于前端显示）
 	baseURL          string               // 当前尝试使用的上游URL（多URL场景）
 	debugData        *model.DebugLogEntry // Debug日志数据（debug开启时填充）
 }

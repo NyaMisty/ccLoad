@@ -27,6 +27,7 @@ type ActiveRequest struct {
 	BytesReceived       int64   `json:"bytes_received,omitempty"`         // 上游已返回的字节数（快照）
 	ClientFirstByteTime float64 `json:"client_first_byte_time,omitempty"` // 客户端侧首字节响应时间（秒），流式请求有效
 	CostMultiplier      float64 `json:"cost_multiplier"`                  // 渠道成本倍率
+	AttemptIndex        int32   `json:"attempt_index,omitempty"`          // 当前尝试次数（1-based，全局累计）
 	DebugLogAvailable   bool    `json:"debug_log_available,omitempty"`    // 运行中请求是否已有可读取的调试快照
 }
 
@@ -48,6 +49,7 @@ type activeRequest struct {
 
 	bytesCounter            atomic.Int64 // 上游已返回的字节数（原子累加）
 	clientFirstByteTimeUsec atomic.Int64 // 客户端侧首字节响应时间（微秒），CAS保证只写一次，0表示未设置
+	attemptIndex            atomic.Int32 // 当前尝试次数（1-based，全局累计）
 }
 
 // activeRequestManager 管理进行中的请求（内存状态，不持久化）
@@ -81,7 +83,7 @@ func (m *activeRequestManager) Register(startTime time.Time, model, clientIP str
 
 // Update 更新活跃请求的渠道信息（在选择渠道/key后调用）
 // 每次切换渠道/Key 时重置首字节计时和已接收字节，避免前次失败尝试的残留数据误导前端显示
-func (m *activeRequestManager) Update(id int64, channelID int64, channelName, channelType, apiKey string, tokenID int64, costMultiplier float64) {
+func (m *activeRequestManager) Update(id int64, channelID int64, channelName, channelType, apiKey string, tokenID int64, costMultiplier float64, attemptIndex int32) {
 	m.mu.Lock()
 	if req, ok := m.requests[id]; ok {
 		req.ChannelID = channelID
@@ -93,6 +95,7 @@ func (m *activeRequestManager) Update(id int64, channelID int64, channelName, ch
 		req.StartTime = time.Now().UnixMilli()
 		req.clientFirstByteTimeUsec.Store(0)
 		req.bytesCounter.Store(0)
+		req.attemptIndex.Store(attemptIndex)
 	}
 	m.mu.Unlock()
 }
@@ -189,6 +192,7 @@ func (m *activeRequestManager) List() []*ActiveRequest {
 			BaseURL:           req.BaseURL,
 			BytesReceived:     req.bytesCounter.Load(),
 			CostMultiplier:    req.CostMultiplier,
+			AttemptIndex:      req.attemptIndex.Load(),
 			DebugLogAvailable: req.debugCapture != nil,
 		}
 		if usec := req.clientFirstByteTimeUsec.Load(); usec > 0 {

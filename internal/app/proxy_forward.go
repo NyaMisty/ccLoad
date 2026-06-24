@@ -2027,9 +2027,12 @@ func (s *Server) tryChannelWithKeys(ctx context.Context, cfg *model.Config, reqC
 		// 标记Key为已尝试
 		triedKeys[keyIndex] = true
 
+		// 递增全局尝试计数（用于前端显示）
+		reqCtx.attemptIndex++
+
 		// 更新活跃请求的渠道信息（用于前端显示）
 		if reqCtx.activeReqID > 0 {
-			s.activeRequests.Update(reqCtx.activeReqID, cfg.ID, cfg.Name, cfg.GetChannelType(), selectedKey, reqCtx.tokenID, cfg.CostMultiplier)
+			s.activeRequests.Update(reqCtx.activeReqID, cfg.ID, cfg.Name, cfg.GetChannelType(), selectedKey, reqCtx.tokenID, cfg.CostMultiplier, int32(reqCtx.attemptIndex))
 		}
 
 		// URL循环（单URL时退化为单次迭代）
