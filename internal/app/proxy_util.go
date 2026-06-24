@@ -684,6 +684,7 @@ type logEntryParams struct {
 	DebugData      *model.DebugLogEntry // Debug日志数据
 	CostMultiplier float64              // 渠道成本倍率快照（0=免费，<0 视为 1）
 	AttemptIndex   int32                // 重试尝试次数（1-based，全局累计；瞬态，不持久化）
+	RequestID      int64                // 所属请求链 ID（activeReqID；瞬态，仅用于缓存关联）
 }
 
 // buildLogEntry 构建日志条目（消除重复代码，遵循DRY原则）
@@ -781,6 +782,7 @@ func buildLogEntry(p logEntryParams) *model.LogEntry {
 
 	entry.DebugData = p.DebugData
 	entry.AttemptIndex = p.AttemptIndex
+	entry.RequestID = p.RequestID
 	return entry
 }
 

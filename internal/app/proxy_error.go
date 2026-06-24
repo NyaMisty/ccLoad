@@ -120,6 +120,7 @@ func (s *Server) logProxyResult(
 		DebugData:      reqCtx.debugData,
 		CostMultiplier: cfg.CostMultiplier,
 		AttemptIndex:   int32(reqCtx.attemptIndex),
+		RequestID:      reqCtx.activeReqID,
 	}))
 }
 

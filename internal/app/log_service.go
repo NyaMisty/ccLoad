@@ -226,7 +226,7 @@ func (s *LogService) AddLogAsync(entry *model.LogEntry) {
 	}
 }
 
-// recordAttemptIndexes 把已写库日志的 ID→attempt_index 记入内存缓存。
+// recordAttemptIndexes 把已写库日志的 ID→(reqID, attempt_index) 记入内存缓存。
 // 仅记录有有效 attempt_index 的条目（AttemptIndex>0 且 ID 已回填）。
 func (s *LogService) recordAttemptIndexes(logs []*model.LogEntry) {
 	if s.attemptIndexCache == nil {
@@ -236,14 +236,15 @@ func (s *LogService) recordAttemptIndexes(logs []*model.LogEntry) {
 		if e == nil || e.AttemptIndex <= 0 || e.ID <= 0 {
 			continue
 		}
-		s.attemptIndexCache.record(e.ID, e.AttemptIndex)
+		s.attemptIndexCache.record(e.ID, e.RequestID, e.AttemptIndex)
 	}
 }
 
-// LookupAttemptIndex 按 log ID 查询 attempt_index（供 /admin/logs 回填）。
-func (s *LogService) LookupAttemptIndex(id int64) (int32, bool) {
+// LookupAttemptIndex 按 log ID 查询 attempt_index，并判断是否为所属请求链的最后一条。
+// 供 /admin/logs 回填 attempt_index 与 is_final。
+func (s *LogService) LookupAttemptIndex(id int64) (idx int32, isFinal bool, ok bool) {
 	if s.attemptIndexCache == nil || id <= 0 {
-		return 0, false
+		return 0, false, false
 	}
 	return s.attemptIndexCache.lookup(id)
 }

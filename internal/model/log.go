@@ -100,6 +100,14 @@ type LogEntry struct {
 	// 不持久化（logs 表无此列）；写入时由 app 层持有，写库拿到 ID 后缓存 ID→index，
 	// 查询时由 app 层从内存缓存按 log.ID 回填。
 	AttemptIndex int32 `json:"attempt_index,omitempty"`
+
+	// 瞬态字段：该日志是否为所属请求链的「最后一条」（attempt_index 等于该链最大值）。
+	// 不持久化；查询时由 app 层按 log.ID 从内存缓存回填。
+	IsFinal bool `json:"is_final,omitempty"`
+
+	// 瞬态字段：所属请求链 ID（activeReqID），仅用于写库后缓存 reqID→max idx，
+	// 不返回给前端。
+	RequestID int64 `json:"-"`
 }
 
 // LogFilter 日志查询过滤条件
