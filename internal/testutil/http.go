@@ -61,8 +61,7 @@ func NewRequest(method, target string, body []byte) *http.Request {
 	return NewRequestReader(method, target, reader)
 }
 
-// NewJSONRequest 创建 JSON 请求
-func NewJSONRequest(method, target string, v any) (*http.Request, error) {
+func newJSONRequest(method, target string, v any) (*http.Request, error) {
 	b, err := json.Marshal(v)
 	if err != nil {
 		return nil, err
@@ -76,7 +75,7 @@ func NewJSONRequest(method, target string, v any) (*http.Request, error) {
 func MustNewJSONRequest(t testing.TB, method, target string, v any) *http.Request {
 	t.Helper()
 
-	req, err := NewJSONRequest(method, target, v)
+	req, err := newJSONRequest(method, target, v)
 	if err != nil {
 		t.Fatalf("marshal json failed: %v", err)
 	}
@@ -99,28 +98,11 @@ func ServeHTTP(t testing.TB, h http.Handler, req *http.Request) *httptest.Respon
 	return w
 }
 
-// MustUnmarshalJSON 反序列化 JSON，失败时终止测试
-func MustUnmarshalJSON(t testing.TB, b []byte, v any) {
-	t.Helper()
-	if err := json.Unmarshal(b, v); err != nil {
-		t.Fatalf("unmarshal json failed: %v", err)
-	}
-}
-
 // APIResponse 通用 API 响应结构
 type APIResponse[T any] struct {
 	Success bool   `json:"success"`
 	Data    T      `json:"data,omitempty"`
 	Error   string `json:"error,omitempty"`
-}
-
-// MustParseAPIResponse 解析 API 响应，失败时终止测试
-func MustParseAPIResponse[T any](t testing.TB, body []byte) APIResponse[T] {
-	t.Helper()
-
-	var resp APIResponse[T]
-	MustUnmarshalJSON(t, body, &resp)
-	return resp
 }
 
 // WaitForGoroutineDeltaLE 等待 goroutine 数量回落到基线+阈值以内
@@ -143,10 +125,4 @@ func WaitForGoroutineDeltaLE(t testing.TB, baseline int, maxDelta int, timeout t
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-}
-
-// GetGoroutineBaseline 获取当前 goroutine 数量作为基线
-func GetGoroutineBaseline() int {
-	runtime.GC()
-	return runtime.NumGoroutine()
 }

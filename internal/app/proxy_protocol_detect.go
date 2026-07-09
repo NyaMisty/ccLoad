@@ -5,7 +5,6 @@ import (
 	"fmt"
 
 	"ccLoad/internal/protocol"
-	"ccLoad/internal/util"
 
 	"github.com/bytedance/sonic"
 	"github.com/gin-gonic/gin"
@@ -18,7 +17,7 @@ const (
 
 func captureClientRequestMetadata() gin.HandlerFunc {
 	return func(c *gin.Context) {
-		c.Set(clientProtocolContextKey, protocol.Protocol(util.DetectChannelTypeFromPath(c.Request.URL.Path)))
+		c.Set(clientProtocolContextKey, detectClientProtocolFromPath(c.Request.URL.Path))
 		c.Set(clientPathContextKey, c.Request.URL.Path)
 		c.Next()
 	}
@@ -34,9 +33,27 @@ func clientRequestMetadata(c *gin.Context) (protocol.Protocol, string) {
 		path = c.Request.URL.Path
 	}
 	if p == "" {
-		p = protocol.Protocol(util.DetectChannelTypeFromPath(path))
+		p = detectClientProtocolFromPath(path)
 	}
 	return p, path
+}
+
+func detectClientProtocolFromPath(path string) protocol.Protocol {
+	switch protocol.DetectRequestFamily(path) {
+	case protocol.RequestFamilyMessages:
+		return protocol.Anthropic
+	case protocol.RequestFamilyResponses:
+		return protocol.Codex
+	case protocol.RequestFamilyChatCompletions,
+		protocol.RequestFamilyCompletions,
+		protocol.RequestFamilyEmbeddings,
+		protocol.RequestFamilyImages:
+		return protocol.OpenAI
+	case protocol.RequestFamilyGenerateContent:
+		return protocol.Gemini
+	default:
+		return ""
+	}
 }
 
 func validateClientBodyMatchesProtocol(clientProtocol protocol.Protocol, body []byte) error {

@@ -49,6 +49,7 @@ type channelTestRequestPlan struct {
 	requestBody      []byte
 	clientBody       []byte
 	timeout          *channelTestTimeout
+	debugCapture     *debugCapture
 }
 
 type channelTestTimeout struct {
@@ -214,7 +215,7 @@ func (s *Server) describeChannelTestTimeoutError(start time.Time, testReq *testu
 }
 
 func testStreamParserHasFirstContent(parser usageParser) bool {
-	return parser != nil && (parser.GetLastError() != nil || parser.HasStreamOutput() || parser.IsStreamComplete())
+	return parser != nil && (parser.GetLastError() != nil || parser.HasStreamOutput())
 }
 
 func markTestFirstStreamContent(requestPlan *channelTestRequestPlan, result map[string]any, start time.Time) {
@@ -464,7 +465,7 @@ func (s *Server) handleChannelTestRequest(c *gin.Context, requireBaseURL bool) {
 
 	requestedModel := testReq.Model
 	testResult := s.executeChannelTestWithCooldown(c.Request.Context(), cfg, keySelection.keyIndex, keySelection.apiKey, &testReq, keySelection.updatePersistedCooldown)
-	s.persistDetectionLog(c.Request.Context(), detectionLogFromResult(cfg, model.LogSourceManualTest, requestedModel, testReq.Model, keySelection.apiKey, c.ClientIP(), 0, testResult))
+	s.persistDetectionLog(c.Request.Context(), detectionLogFromResult(cfg, model.LogSourceManualTest, requestedModel, testReq.Model, keySelection.apiKey, c.ClientIP(), 0, testReq.ThinkingEffort, testResult))
 	testResult["tested_key_index"] = keySelection.keyIndex
 	testResult["total_keys"] = len(apiKeys)
 
@@ -690,10 +691,14 @@ func (s *Server) testChannelAPIWithURL(
 	resp, err := s.doUpstreamRequest(cfg, req)
 	if err != nil {
 		if errors.Is(err, ErrChannelRPMExceeded) {
-			return channelRPMExceededTestResult(start, channelRPMRetryAfter(err))
+			result := channelRPMExceededTestResult(start, channelRPMRetryAfter(err))
+			result["is_streaming"] = testReq.Stream
+			return attachTestDebugData(requestPlan, nil, result)
 		}
 		if errors.Is(err, ErrChannelConcurrencyExceeded) {
-			return channelConcurrencyExceededTestResult(start, err)
+			result := channelConcurrencyExceededTestResult(start, err)
+			result["is_streaming"] = testReq.Stream
+			return attachTestDebugData(requestPlan, nil, result)
 		}
 		errorMsg := "网络请求失败: " + err.Error()
 		statusCode := 0
@@ -709,9 +714,13 @@ func (s *Server) testChannelAPIWithURL(
 		if statusCode > 0 {
 			result["status_code"] = statusCode
 		}
-		return result
+		result["is_streaming"] = testReq.Stream
+		return attachTestDebugData(requestPlan, nil, result)
 	}
 	defer func() { _ = resp.Body.Close() }()
+	if requestPlan.debugCapture != nil {
+		requestPlan.debugCapture.wrapResponseBody(resp)
+	}
 
 	// 判断是否为SSE响应，以及是否请求了流式
 	contentType := resp.Header.Get("Content-Type")
@@ -719,14 +728,18 @@ func (s *Server) testChannelAPIWithURL(
 
 	// 通用结果初始化
 	result := map[string]any{
-		"success":     resp.StatusCode >= 200 && resp.StatusCode < 300,
-		"status_code": resp.StatusCode,
+		"success":      resp.StatusCode >= 200 && resp.StatusCode < 300,
+		"status_code":  resp.StatusCode,
+		"is_streaming": testReq.Stream,
 	}
 
 	// 始终返回上游请求原始数据，便于调试排查（不依赖 debug_log_enabled）
 	result["upstream_request_url"] = requestPlan.fullURL
 	result["upstream_request_headers"] = maskSensitiveHeaderMap(flattenHeader(req.Header))
 	result["upstream_request_body"] = string(requestPlan.requestBody)
+	if effort := testRequestThinkingEffort(testReq, requestPlan); effort != "" {
+		result["thinking_effort"] = effort
+	}
 
 	// 附带响应头与类型，便于排查（不含请求头以避免泄露）
 	if len(resp.Header) > 0 {
@@ -738,9 +751,9 @@ func (s *Server) testChannelAPIWithURL(
 
 	if isEventStream {
 		if requestPlan.clientProtocol != requestPlan.upstreamProtocol {
-			return s.parseTestTranslatedSSEResponse(ctx, requestPlan, testReq, resp, start, result)
+			return attachTestDebugData(requestPlan, resp, s.parseTestTranslatedSSEResponse(ctx, requestPlan, testReq, resp, start, result))
 		}
-		return s.parseTestNativeSSEResponse(ctx, requestPlan, testReq, resp, contentType, start, result)
+		return attachTestDebugData(requestPlan, resp, s.parseTestNativeSSEResponse(ctx, requestPlan, testReq, resp, contentType, start, result))
 	}
 
 	// 非流式或非SSE响应：按原逻辑读取完整响应（即便前端请求了流式，但上游未返回SSE，也按普通响应处理，确保能展示完整错误体）
@@ -752,14 +765,15 @@ func (s *Server) testChannelAPIWithURL(
 			errorMsg = timeoutMsg
 			statusCode = timeoutStatus
 		}
-		return map[string]any{
-			"success":     false,
-			"error":       errorMsg,
-			"duration_ms": time.Since(start).Milliseconds(),
-			"status_code": statusCode,
-		}
+		return attachTestDebugData(requestPlan, resp, map[string]any{
+			"success":      false,
+			"error":        errorMsg,
+			"duration_ms":  time.Since(start).Milliseconds(),
+			"status_code":  statusCode,
+			"is_streaming": testReq.Stream,
+		})
 	}
-	return s.parseTestNonStreamResponse(ctx, requestPlan, testReq, resp, contentType, start, respBody, result)
+	return attachTestDebugData(requestPlan, resp, s.parseTestNonStreamResponse(ctx, requestPlan, testReq, resp, contentType, start, respBody, result))
 }
 
 // parseTestNonStreamResponse 解析非流式响应（成功/失败两路），写入 result 并返回。
@@ -867,10 +881,10 @@ func (s *Server) buildTestUpstreamRequest(
 		return nil, nil, nil, fmt.Errorf("构造测试请求失败: %w", err)
 	}
 
-	// anyrouter 渠道：为 /v1/messages 自动注入 adaptive thinking（与代理链路保持一致）
+	// anyrouter Anthropic thinking 兜底归一（与代理链路保持一致）
 	if requestPlan.upstreamProtocol == "anthropic" {
 		if parsed, perr := neturl.Parse(requestPlan.fullURL); perr == nil && strings.HasSuffix(parsed.Path, "/v1/messages") {
-			requestPlan.requestBody = maybeInjectAnyrouterAdaptiveThinking(cfgForBuild, "/v1/messages", requestPlan.requestBody)
+			requestPlan.requestBody = normalizeAnyrouterAdaptiveThinking(cfgForBuild, "/v1/messages", requestPlan.requestBody)
 		}
 	}
 
@@ -896,8 +910,17 @@ func (s *Server) buildTestUpstreamRequest(
 		req.Header.Set(key, value)
 	}
 	applyHeaderRules(req.Header, cfgForBuild.HeaderRules())
+	requestPlan.debugCapture = s.captureDebugRequest(req, requestPlan.requestBody)
 
 	return req, requestPlan, timeout.cancelAll, nil
+}
+
+func attachTestDebugData(requestPlan *channelTestRequestPlan, resp *http.Response, result map[string]any) map[string]any {
+	if result == nil || requestPlan == nil || requestPlan.debugCapture == nil {
+		return result
+	}
+	result["debug_data"] = requestPlan.debugCapture.buildEntry(resp)
+	return result
 }
 
 // parseTestTranslatedSSEResponse 处理需要跨协议翻译的 SSE 响应分支。
@@ -1119,12 +1142,14 @@ func populateTestSSEUsageAndCost(
 func normalizedTestUsage(parser usageParser) (map[string]any, bool) {
 	input, output, cacheRead, cacheCreation := parser.GetUsage()
 	cache5m, cache1h, _ := parser.GetCacheBreakdown()
-	if input+output+cacheRead+cacheCreation+cache5m+cache1h == 0 {
+	reasoningTokens := parser.GetReasoningTokens()
+	if input+output+cacheRead+cacheCreation+cache5m+cache1h+reasoningTokens == 0 {
 		return nil, false
 	}
 	return map[string]any{
 		"input_tokens":                input,
 		"output_tokens":               output,
+		"reasoning_tokens":            reasoningTokens,
 		"cache_read_input_tokens":     cacheRead,
 		"cache_creation_input_tokens": cacheCreation,
 		"cache_5m_input_tokens":       cache5m,
@@ -1136,6 +1161,9 @@ func populateTestNormalizedUsageAndCost(result map[string]any, testReq *testutil
 	usage, ok := normalizedTestUsage(parser)
 	if ok {
 		result["usage"] = usage
+	}
+	if effort := parser.GetThinkingEffort(); effort != "" {
+		result["thinking_effort"] = effort
 	}
 
 	billableInput, output, cacheRead, _ := parser.GetUsage()
@@ -1152,6 +1180,18 @@ func populateTestNormalizedUsageAndCost(result map[string]any, testReq *testutil
 	} else if toolCost := parser.GetToolCostUSD(); toolCost > 0 {
 		result["cost_usd"] = toolCost
 	}
+}
+
+func testRequestThinkingEffort(testReq *testutil.TestChannelRequest, requestPlan *channelTestRequestPlan) string {
+	if requestPlan != nil {
+		if effort := extractThinkingEffortFromJSON(requestPlan.requestBody); effort != "" {
+			return effort
+		}
+	}
+	if testReq == nil {
+		return ""
+	}
+	return normalizeThinkingEffort(testReq.ThinkingEffort)
 }
 
 // parseTestNativeSSEResponse 处理客户端协议与上游协议一致时的原生 SSE 解析。
@@ -1208,6 +1248,13 @@ func (s *Server) parseTestNativeSSEResponse(
 	result["raw_response"] = collector.rawResponse()
 	result["upstream_response_body"] = collector.rawResponse()
 	populateTestSSEUsageAndCost(result, testReq, usageParser, collector.lastUsage)
+
+	if timeoutStatus, timeoutMsg, ok := s.describeChannelTestTimeoutError(start, testReq, requestPlan.timeout, ctx.Err()); ok {
+		result["success"] = false
+		result["status_code"] = timeoutStatus
+		result["error"] = timeoutMsg
+		return result
+	}
 
 	if collector.lastErrMsg != "" {
 		// 软错误：HTTP 200 但 SSE 流携带错误事件（余额不足、配额耗尽等）

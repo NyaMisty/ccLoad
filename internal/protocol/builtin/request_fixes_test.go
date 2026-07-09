@@ -253,7 +253,7 @@ func TestOpenAIToAnthropic_SamplingPropagation(t *testing.T) {
 	body := string(raw)
 	for _, frag := range []string{
 		`"max_tokens":2048`, `"temperature":0.3`, `"top_p":0.9`, `"top_k":40`,
-		`"stop_sequences":["stop1","stop2"]`, `"thinking":{"type":"enabled","budget_tokens":16384}`,
+		`"stop_sequences":["stop1","stop2"]`, `"thinking":{"type":"adaptive"}`, `"output_config":{"effort":"high"}`,
 	} {
 		if !strings.Contains(body, frag) {
 			t.Fatalf("expected fragment %s in body: %s", frag, body)
@@ -292,6 +292,32 @@ func TestOpenAIToCodex_SamplingPropagation(t *testing.T) {
 		if !strings.Contains(body, frag) {
 			t.Fatalf("expected fragment %s in body: %s", frag, body)
 		}
+	}
+}
+
+func TestOpenAIToCodex_PreservesXHighReasoningEffort(t *testing.T) {
+	req := openAIChatRequest{
+		Model:           "gpt-x",
+		Messages:        []openAIChatMessage{{Role: "user", Content: "hi"}},
+		ReasoningEffort: "xhigh",
+	}
+	conv, err := normalizeOpenAIConversation(req)
+	if err != nil {
+		t.Fatalf("normalizeOpenAIConversation failed: %v", err)
+	}
+	raw, err := encodeCodexRequest("codex-x", conv, false)
+	if err != nil {
+		t.Fatalf("encodeCodexRequest failed: %v", err)
+	}
+	var out codexRequestPayload
+	if err := json.Unmarshal(raw, &out); err != nil {
+		t.Fatalf("unmarshal codex request failed: %v", err)
+	}
+	if out.Reasoning == nil {
+		t.Fatalf("expected reasoning config, got body %s", raw)
+	}
+	if got, _ := out.Reasoning["effort"].(string); got != "xhigh" {
+		t.Fatalf("reasoning.effort=%q, want xhigh; body=%s", got, raw)
 	}
 }
 
@@ -399,7 +425,8 @@ func TestConvertAnthropicRequestToOpenAI_PreservesThinkingEffort(t *testing.T) {
 	raw := []byte(`{
 		"model":"gpt-5",
 		"messages":[{"role":"user","content":[{"type":"text","text":"think hard"}]}],
-		"thinking":{"type":"enabled","budget_tokens":16384}
+		"thinking":{"type":"adaptive"},
+		"output_config":{"effort":"high"}
 	}`)
 	out, err := convertAnthropicRequestToOpenAI("gpt-5", raw, false)
 	if err != nil {
@@ -407,6 +434,135 @@ func TestConvertAnthropicRequestToOpenAI_PreservesThinkingEffort(t *testing.T) {
 	}
 	if !strings.Contains(string(out), `"reasoning_effort":"high"`) {
 		t.Fatalf("expected high reasoning_effort, got %s", out)
+	}
+}
+
+func TestConvertAnthropicRequestToCodex_PreservesThinkingEffort(t *testing.T) {
+	raw := []byte(`{
+		"model":"gpt-5-codex",
+		"messages":[{"role":"user","content":[{"type":"text","text":"think hard"}]}],
+		"thinking":{"type":"adaptive"},
+		"output_config":{"effort":"high"}
+	}`)
+	out, err := convertAnthropicRequestToCodex("gpt-5-codex", raw, false)
+	if err != nil {
+		t.Fatalf("convertAnthropicRequestToCodex failed: %v", err)
+	}
+	var req codexRequestPayload
+	if err := json.Unmarshal(out, &req); err != nil {
+		t.Fatalf("unmarshal codex request failed: %v", err)
+	}
+	if req.Reasoning == nil {
+		t.Fatalf("expected reasoning config, got body %s", out)
+	}
+	if got, _ := req.Reasoning["effort"].(string); got != "high" {
+		t.Fatalf("reasoning.effort=%q, want high; body=%s", got, out)
+	}
+}
+
+func TestConvertAnthropicRequestToCodex_PreservesOutputConfigEffortWhenThinkingDisabled(t *testing.T) {
+	raw := []byte(`{
+		"model":"gpt-5-codex",
+		"messages":[{"role":"user","content":[{"type":"text","text":"think hard"}]}],
+		"thinking":{"type":"disabled"},
+		"output_config":{"effort":"high"}
+	}`)
+	out, err := convertAnthropicRequestToCodex("gpt-5-codex", raw, false)
+	if err != nil {
+		t.Fatalf("convertAnthropicRequestToCodex failed: %v", err)
+	}
+	var req codexRequestPayload
+	if err := json.Unmarshal(out, &req); err != nil {
+		t.Fatalf("unmarshal codex request failed: %v", err)
+	}
+	if req.Reasoning == nil {
+		t.Fatalf("expected reasoning config, got body %s", out)
+	}
+	if got, _ := req.Reasoning["effort"].(string); got != "high" {
+		t.Fatalf("reasoning.effort=%q, want high; body=%s", got, out)
+	}
+}
+
+func TestConvertAnthropicRequestToCodex_MapsMaxOutputConfigEffortToXHigh(t *testing.T) {
+	raw := []byte(`{
+		"model":"gpt-5-codex",
+		"messages":[{"role":"user","content":[{"type":"text","text":"think hard"}]}],
+		"thinking":{"type":"adaptive","display":"summarized"},
+		"output_config":{"effort":"max"}
+	}`)
+	out, err := convertAnthropicRequestToCodex("gpt-5-codex", raw, false)
+	if err != nil {
+		t.Fatalf("convertAnthropicRequestToCodex failed: %v", err)
+	}
+	var req codexRequestPayload
+	if err := json.Unmarshal(out, &req); err != nil {
+		t.Fatalf("unmarshal codex request failed: %v", err)
+	}
+	if req.Reasoning == nil {
+		t.Fatalf("expected reasoning config, got body %s", out)
+	}
+	if got, _ := req.Reasoning["effort"].(string); got != "xhigh" {
+		t.Fatalf("reasoning.effort=%q, want xhigh; body=%s", got, out)
+	}
+}
+
+func TestConvertAnthropicRequestToGemini3_MapsMaxOutputConfigEffortToThinkingLevel(t *testing.T) {
+	raw := []byte(`{
+		"model":"gpt-5",
+		"messages":[{"role":"user","content":[{"type":"text","text":"think hard"}]}],
+		"thinking":{"type":"adaptive","display":"summarized"},
+		"output_config":{"effort":"max"}
+	}`)
+	out, err := convertAnthropicRequestToGemini("gemini-3.5-flash", raw, true)
+	if err != nil {
+		t.Fatalf("convertAnthropicRequestToGemini failed: %v", err)
+	}
+	var req geminiRequestPayload
+	if err := json.Unmarshal(out, &req); err != nil {
+		t.Fatalf("unmarshal gemini request failed: %v", err)
+	}
+	if req.GenerationConfig == nil || req.GenerationConfig.ThinkingConfig == nil {
+		t.Fatalf("expected thinkingConfig, got body %s", out)
+	}
+	if got := req.GenerationConfig.ThinkingConfig.ThinkingLevel; got != "high" {
+		t.Fatalf("thinkingLevel=%q, want high; body=%s", got, out)
+	}
+	if req.GenerationConfig.ThinkingConfig.ThinkingBudget != nil {
+		t.Fatalf("Gemini 3 thinkingConfig must not include thinkingBudget with thinkingLevel; body=%s", out)
+	}
+	if !req.GenerationConfig.ThinkingConfig.IncludeThoughts {
+		t.Fatalf("expected includeThoughts=true, body=%s", out)
+	}
+}
+
+func TestConvertAnthropicRequestToCodex_LiftsMessageSystemRole(t *testing.T) {
+	raw := []byte(`{
+		"model":"gpt-5-codex",
+		"messages":[
+			{"role":"system","content":[{"type":"text","text":"stay terse"}]},
+			{"role":"user","content":[{"type":"text","text":"hi"}]}
+		]
+	}`)
+	out, err := convertAnthropicRequestToCodex("gpt-5-codex", raw, false)
+	if err != nil {
+		t.Fatalf("convertAnthropicRequestToCodex failed: %v", err)
+	}
+	var req codexRequest
+	if err := json.Unmarshal(out, &req); err != nil {
+		t.Fatalf("unmarshal codex request failed: %v", err)
+	}
+	if req.Instructions != "stay terse" {
+		t.Fatalf("expected system message in instructions, got %q", req.Instructions)
+	}
+	if len(req.Input) != 1 {
+		t.Fatalf("expected one user input item, got %d", len(req.Input))
+	}
+	var item map[string]any
+	if err := json.Unmarshal(req.Input[0], &item); err != nil {
+		t.Fatalf("unmarshal codex input failed: %v", err)
+	}
+	if item["type"] != "message" || item["role"] != "user" {
+		t.Fatalf("unexpected codex input item: %+v", item)
 	}
 }
 
@@ -441,8 +597,8 @@ func TestNormalizeCodex_SamplingReasoningAndParallel(t *testing.T) {
 		len(conv.Sampling.Stop) != 1 || conv.Sampling.Stop[0] != "END" {
 		t.Fatalf("sampling mismatch: %+v", conv.Sampling)
 	}
-	if conv.Thinking == nil || conv.Thinking.Type != "enabled" || conv.Thinking.BudgetTokens != 16384 {
-		t.Fatalf("expected Thinking{enabled,16384} from reasoning.effort=high, got %+v", conv.Thinking)
+	if conv.Thinking == nil || conv.Thinking.Type != "adaptive" || conv.Thinking.Effort != "high" {
+		t.Fatalf("expected Thinking{adaptive,high} from reasoning.effort=high, got %+v", conv.Thinking)
 	}
 }
 
@@ -498,7 +654,8 @@ func TestConvertCodexRequestToAnthropic_FieldsPreserved(t *testing.T) {
 	for _, want := range []string{
 		`"temperature":0.3`, `"top_p":0.95`, `"max_tokens":4096`,
 		`"stop_sequences":["BYE"]`,
-		`"thinking":{"type":"enabled","budget_tokens":16384}`,
+		`"thinking":{"type":"adaptive"}`,
+		`"output_config":{"effort":"high"}`,
 		`"disable_parallel_tool_use":true`,
 	} {
 		if !strings.Contains(body, want) {

@@ -145,6 +145,9 @@ func migrate(ctx context.Context, db *sql.DB, dialect Dialect) error {
 			if err := ensureAPIKeysDisabled(ctx, db, dialect); err != nil {
 				return fmt.Errorf("migrate api_keys disabled: %w", err)
 			}
+			if err := ensureAPIKeysNote(ctx, db, dialect); err != nil {
+				return fmt.Errorf("migrate api_keys note: %w", err)
+			}
 		}
 
 		// 增量迁移：确保auth_tokens表有缓存token字段（2025-12新增）
@@ -198,6 +201,11 @@ func migrate(ctx context.Context, db *sql.DB, dialect Dialect) error {
 				return err
 			}
 		}
+	}
+
+	// effective_cost_usd 的历史回填依赖 logs.cost_multiplier，必须等 logs 增量迁移完成后再执行。
+	if err := ensureAuthTokensEffectiveCost(ctx, db, dialect); err != nil {
+		return fmt.Errorf("migrate auth_tokens effective_cost: %w", err)
 	}
 
 	// 初始化默认配置
@@ -329,7 +337,8 @@ func initDefaultSettings(ctx context.Context, db *sql.DB, dialect Dialect) error
 		{"gemini_non_stream_timeout", "0", "duration", "Gemini非流式请求超时(秒,0=使用全局non_stream_timeout)", "0"},
 		{"model_fuzzy_match", "false", "bool", "模型匹配失败时，使用子串模糊匹配(多匹配时选最新版本)", "false"},
 		{"channel_test_content", "sonnet 4.0的发布日期是什么", "string", "渠道测试默认内容", "sonnet 4.0的发布日期是什么"},
-		{"channel_check_interval_hours", "5", "int", "渠道定时检测间隔(小时,0=关闭,修改后重启生效)", "5"},
+		{"channel_check_interval_hours", "5", "float", "渠道定时检测间隔(小时,支持小数如0.5=30分钟,0=关闭,修改后重启生效)", "5"},
+		{"auto_update_interval_hours", "12", "int", "自动更新检测间隔(小时整数,0=关闭,启用时最低1小时)", "12"},
 		{"log_channel_click_action", "edit", "string", "日志页点击渠道名行为(edit=打开编辑器,navigate=跳转到渠道管理定位)", "edit"},
 		{"channel_stats_range", "today", "string", "渠道管理费用统计范围", "today"},
 		// 健康度排序配置
@@ -384,6 +393,14 @@ func initDefaultSettings(ctx context.Context, db *sql.DB, dialect Dialect) error
 		); err != nil {
 			return fmt.Errorf("refresh setting metadata debug_log_retention_minutes: %w", err)
 		}
+		if _, err := db.ExecContext(ctx, metaSQL,
+			"自动更新检测间隔(小时整数,0=关闭,启用时最低1小时)",
+			"12",
+			"int",
+			"auto_update_interval_hours",
+		); err != nil {
+			return fmt.Errorf("refresh setting metadata auto_update_interval_hours: %w", err)
+		}
 	}
 
 	// 迁移 success_rate_penalty_weight 类型：float → int（2026-01 类型修正）
@@ -400,6 +417,20 @@ func initDefaultSettings(ctx context.Context, db *sql.DB, dialect Dialect) error
 	}
 
 	// 清理已废弃的配置项
+
+	// 迁移 channel_check_interval_hours 类型：int → float（支持分钟级小数间隔）
+	{
+		keyCol := "key"
+		if dialect == DialectMySQL {
+			keyCol = "`key`"
+		}
+		//nolint:gosec // G201: keyCol 仅为 "key" 或 "`key`"，由内部逻辑控制
+		typeSQL := fmt.Sprintf("UPDATE system_settings SET value_type = 'float', description = '渠道定时检测间隔(小时,支持小数如0.5=30分钟,0=关闭,修改后重启生效)', default_value = '5' WHERE %s = 'channel_check_interval_hours' AND value_type = 'int'", keyCol)
+		if _, err := db.ExecContext(ctx, typeSQL); err != nil {
+			return fmt.Errorf("migrate channel_check_interval_hours type: %w", err)
+		}
+	}
+
 	obsoleteKeys := []string{
 		"88code_free_only", // 2026-01移除：88code免费订阅限制功能已删除
 	}

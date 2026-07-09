@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -243,6 +244,21 @@ func TestHandleChannelChatWritesOnlyUpstreamEvents(t *testing.T) {
 			http.NotFound(w, r)
 			return
 		}
+		body, _ := io.ReadAll(r.Body)
+		var payload map[string]any
+		if err := sonic.Unmarshal(body, &payload); err != nil {
+			t.Fatalf("unmarshal upstream request failed: %v; body=%s", err, body)
+		}
+		searchOptions, ok := payload["web_search_options"].(map[string]any)
+		if !ok {
+			t.Fatalf("OpenAI chat request missing web_search_options: %s", body)
+		}
+		if len(searchOptions) != 0 {
+			t.Fatalf("OpenAI chat web_search_options = %#v, want empty object: %s", searchOptions, body)
+		}
+		if _, ok := payload["tools"]; ok {
+			t.Fatalf("OpenAI chat search must use web_search_options, not tools: %s", body)
+		}
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.WriteHeader(http.StatusOK)
 		close(upstreamHeaders)
@@ -276,8 +292,9 @@ func TestHandleChannelChatWritesOnlyUpstreamEvents(t *testing.T) {
 
 	channelID := fmt.Sprintf("%d", created.ID)
 	req := newJSONRequest(t, http.MethodPost, "/admin/channels/"+channelID+"/chat", map[string]any{
-		"model":  "gpt-4o-mini",
-		"stream": true,
+		"model":          "gpt-4o-mini",
+		"stream":         true,
+		"builtin_search": true,
 		"messages": []map[string]string{
 			{"role": "user", "content": "hi"},
 		},
@@ -330,6 +347,180 @@ func TestHandleChannelChatWritesOnlyUpstreamEvents(t *testing.T) {
 	body := w.BodyString()
 	if !strings.Contains(body, `"delta":"late answer"`) || !strings.Contains(body, "data: [DONE]") {
 		t.Fatalf("expected upstream answer, got:\n%s", body)
+	}
+}
+
+func TestHandleChannelChatPersistsDetectionLogWithStreamStatusAndDebugData(t *testing.T) {
+	upstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/chat/completions" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, `data: {"choices":[{"delta":{"content":"logged answer"}}]}`+"\n\n")
+		_, _ = io.WriteString(w, "data: [DONE]\n\n")
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+	}))
+	defer upstream.Close()
+
+	srv := newInMemoryServer(t)
+	srv.client = upstream.Client()
+	srv.configService.mu.Lock()
+	srv.configService.cache["debug_log_enabled"] = &model.SystemSetting{Key: "debug_log_enabled", Value: "true"}
+	srv.configService.mu.Unlock()
+
+	ctx := context.Background()
+	created, err := srv.store.CreateConfig(ctx, &model.Config{
+		Name:         "chat-log-stream-debug",
+		URL:          upstream.URL,
+		Priority:     1,
+		ChannelType:  "openai",
+		ModelEntries: []model.ModelEntry{{Model: "gpt-4o-mini"}},
+		Enabled:      true,
+	})
+	if err != nil {
+		t.Fatalf("CreateConfig failed: %v", err)
+	}
+	if err := srv.store.CreateAPIKeysBatch(ctx, []*model.APIKey{{ChannelID: created.ID, KeyIndex: 0, APIKey: "sk-test"}}); err != nil {
+		t.Fatalf("CreateAPIKeysBatch failed: %v", err)
+	}
+
+	started := time.Now()
+	channelID := fmt.Sprintf("%d", created.ID)
+	req := newJSONRequest(t, http.MethodPost, "/admin/channels/"+channelID+"/chat", map[string]any{
+		"model":  "gpt-4o-mini",
+		"stream": true,
+		"messages": []map[string]string{
+			{"role": "user", "content": "hi"},
+		},
+	})
+	c, w := newTestContext(t, req)
+	c.Params = gin.Params{{Key: "id", Value: channelID}}
+
+	srv.HandleChannelChat(c)
+
+	if got := w.Body.String(); !strings.Contains(got, `"delta":"logged answer"`) {
+		t.Fatalf("expected frontend answer, got:\n%s", got)
+	}
+
+	logs, err := srv.store.ListLogsRange(
+		ctx,
+		started.Add(-time.Second),
+		time.Now().Add(time.Second),
+		10,
+		0,
+		&model.LogFilter{LogSource: model.LogSourceDetection},
+	)
+	if err != nil {
+		t.Fatalf("ListLogsRange failed: %v", err)
+	}
+	if len(logs) != 1 {
+		t.Fatalf("len(logs)=%d, want 1; logs=%+v", len(logs), logs)
+	}
+	entry := logs[0]
+	if entry.LogSource != model.LogSourceManualChat {
+		t.Fatalf("log_source=%q, want %q", entry.LogSource, model.LogSourceManualChat)
+	}
+	if entry.StatusCode != http.StatusOK {
+		t.Fatalf("status_code=%d, want 200; entry=%+v", entry.StatusCode, entry)
+	}
+	if !entry.IsStreaming {
+		t.Fatalf("is_streaming=false, want true; entry=%+v", entry)
+	}
+	if entry.Message != "ok" {
+		t.Fatalf("message=%q, want ok", entry.Message)
+	}
+
+	debugLog, err := srv.store.GetDebugLogByLogID(ctx, entry.ID)
+	if err != nil {
+		t.Fatalf("GetDebugLogByLogID failed: %v", err)
+	}
+	if debugLog == nil {
+		t.Fatal("debug log should be persisted for chat detection log")
+	}
+	if debugLog.RespStatus != http.StatusOK {
+		t.Fatalf("debug resp status=%d, want 200", debugLog.RespStatus)
+	}
+	if !strings.Contains(string(debugLog.RespBody), "logged answer") {
+		t.Fatalf("debug response body missing upstream stream: %q", string(debugLog.RespBody))
+	}
+}
+
+func TestHandleChannelChatLogsThinkingEffortFromUpstreamRequestBody(t *testing.T) {
+	upstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		if !strings.Contains(string(body), `"output_config":{"effort":"high"}`) {
+			t.Fatalf("upstream request missing output_config.effort high: %s", body)
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, `data: {"choices":[{"delta":{"content":"answer"}}]}`+"\n\n")
+		_, _ = io.WriteString(w, "data: [DONE]\n\n")
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+	}))
+	defer upstream.Close()
+
+	srv := newInMemoryServer(t)
+	srv.client = upstream.Client()
+	ctx := context.Background()
+
+	created, err := srv.store.CreateConfig(ctx, &model.Config{
+		Name:        "chat-thinking-from-upstream-request",
+		URL:         upstream.URL,
+		Priority:    1,
+		ChannelType: "openai",
+		ModelEntries: []model.ModelEntry{
+			{Model: "gpt-4o-mini"},
+		},
+		Enabled: true,
+		CustomRequestRules: &model.CustomRequestRules{
+			Body: []model.CustomBodyRule{
+				{Action: model.RuleActionOverride, Path: "output_config.effort", Value: json.RawMessage(`"high"`)},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("CreateConfig failed: %v", err)
+	}
+	if err := srv.store.CreateAPIKeysBatch(ctx, []*model.APIKey{{ChannelID: created.ID, KeyIndex: 0, APIKey: "sk-test"}}); err != nil {
+		t.Fatalf("CreateAPIKeysBatch failed: %v", err)
+	}
+
+	started := time.Now()
+	channelID := fmt.Sprintf("%d", created.ID)
+	req := newJSONRequest(t, http.MethodPost, "/admin/channels/"+channelID+"/chat", map[string]any{
+		"model":  "gpt-4o-mini",
+		"stream": true,
+		"messages": []map[string]string{
+			{"role": "user", "content": "hi"},
+		},
+	})
+	c, _ := newTestContext(t, req)
+	c.Params = gin.Params{{Key: "id", Value: channelID}}
+
+	srv.HandleChannelChat(c)
+
+	logs, err := srv.store.ListLogsRange(
+		ctx,
+		started.Add(-time.Second),
+		time.Now().Add(time.Second),
+		10,
+		0,
+		&model.LogFilter{LogSource: model.LogSourceDetection},
+	)
+	if err != nil {
+		t.Fatalf("ListLogsRange failed: %v", err)
+	}
+	if len(logs) != 1 {
+		t.Fatalf("len(logs)=%d, want 1; logs=%+v", len(logs), logs)
+	}
+	if got := logs[0].ThinkingEffort; got != "high" {
+		t.Fatalf("thinking_effort=%q, want high", got)
 	}
 }
 
@@ -488,7 +679,7 @@ func TestStreamChatWithURLHandlesNonStreamOpenAIResponseAsFrontendSSE(t *testing
 	}
 
 	c, w := newTestContext(t, httptest.NewRequest(http.MethodPost, "/admin/channels/1/chat", nil))
-	attempt := srv.streamChatWithURL(c, cfg, "sk-test", testReq, "openai", upstream.URL)
+	attempt := srv.streamChatWithURL(c, cfg, "sk-test", testReq, "openai", upstream.URL, testReq.Model)
 	if !attempt.handled {
 		t.Fatal("expected non-stream chat response to be handled without URL fallback")
 	}
@@ -550,6 +741,70 @@ func TestHandleChannelChatWritesErrorWhenAllURLsFailBeforeResponse(t *testing.T)
 	}
 	if !strings.Contains(body, "网络请求失败") {
 		t.Fatalf("expected network failure message, got:\n%s", body)
+	}
+}
+
+func TestHandleChannelChatPersistsLogOnHTTPError(t *testing.T) {
+	upstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = io.WriteString(w, `{"error":{"type":"permission_error","message":"forbidden"}}`)
+	}))
+	defer upstream.Close()
+
+	srv := newInMemoryServer(t)
+	srv.client = upstream.Client()
+	ctx := context.Background()
+
+	created, err := srv.store.CreateConfig(ctx, &model.Config{
+		Name:         "chat-http-error-log",
+		URL:          upstream.URL,
+		Priority:     1,
+		ChannelType:  "openai",
+		ModelEntries: []model.ModelEntry{{Model: "gpt-4o-mini"}},
+		Enabled:      true,
+	})
+	if err != nil {
+		t.Fatalf("CreateConfig failed: %v", err)
+	}
+	if err := srv.store.CreateAPIKeysBatch(ctx, []*model.APIKey{{ChannelID: created.ID, KeyIndex: 0, APIKey: "sk-test"}}); err != nil {
+		t.Fatalf("CreateAPIKeysBatch failed: %v", err)
+	}
+
+	started := time.Now()
+	channelID := fmt.Sprintf("%d", created.ID)
+	req := newJSONRequest(t, http.MethodPost, "/admin/channels/"+channelID+"/chat", map[string]any{
+		"model":  "gpt-4o-mini",
+		"stream": true,
+		"messages": []map[string]string{
+			{"role": "user", "content": "hi"},
+		},
+	})
+	c, _ := newTestContext(t, req)
+	c.Params = gin.Params{{Key: "id", Value: channelID}}
+
+	srv.HandleChannelChat(c)
+
+	logs, err := srv.store.ListLogsRange(
+		ctx,
+		started.Add(-time.Second),
+		time.Now().Add(time.Second),
+		10,
+		0,
+		&model.LogFilter{LogSource: model.LogSourceDetection},
+	)
+	if err != nil {
+		t.Fatalf("ListLogsRange failed: %v", err)
+	}
+	if len(logs) != 1 {
+		t.Fatalf("len(logs)=%d, want 1", len(logs))
+	}
+	entry := logs[0]
+	if entry.StatusCode != http.StatusForbidden {
+		t.Fatalf("status_code=%d, want 403", entry.StatusCode)
+	}
+	if entry.LogSource != model.LogSourceManualChat {
+		t.Fatalf("log_source=%q, want %q", entry.LogSource, model.LogSourceManualChat)
 	}
 }
 
@@ -739,7 +994,7 @@ func TestStreamChatWithURLKeepsFirstContentTimeoutUntilValidSSEEvent(t *testing.
 
 	done := make(chan chatURLAttemptResult, 1)
 	go func() {
-		done <- srv.streamChatWithURL(c, cfg, "sk-test", testReq, "openai", upstream.URL)
+		done <- srv.streamChatWithURL(c, cfg, "sk-test", testReq, "openai", upstream.URL, testReq.Model)
 	}()
 
 	select {
@@ -754,6 +1009,51 @@ func TestStreamChatWithURLKeepsFirstContentTimeoutUntilValidSSEEvent(t *testing.
 	body := w.Body.String()
 	if !strings.Contains(body, `"error"`) || !strings.Contains(body, "首个有效流内容超时") {
 		t.Fatalf("expected first content timeout error event, got:\n%s", body)
+	}
+}
+
+func TestStreamChatWithURLDoesNotTreatDoneEventAsFirstContent(t *testing.T) {
+	upstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, "data: [DONE]\n\n")
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+	}))
+	defer upstream.Close()
+
+	srv := newInMemoryServer(t)
+	srv.client = upstream.Client()
+	cfg := &model.Config{
+		ID:           78,
+		Name:         "chat-done-is-not-content",
+		URL:          upstream.URL,
+		Priority:     1,
+		ChannelType:  "openai",
+		ModelEntries: []model.ModelEntry{{Model: "gpt-4o-mini"}},
+		Enabled:      true,
+	}
+	testReq := &testutil.TestChannelRequest{
+		Model:       "gpt-4o-mini",
+		Stream:      true,
+		ChannelType: "openai",
+		Messages: []testutil.ChatMessage{
+			{Role: "user", Content: "hi"},
+		},
+	}
+
+	c, w := newTestContext(t, httptest.NewRequest(http.MethodPost, "/admin/channels/78/chat", nil))
+	attempt := srv.streamChatWithURL(c, cfg, "sk-test", testReq, "openai", upstream.URL, testReq.Model)
+	if !attempt.handled {
+		t.Fatal("expected stream attempt to be handled")
+	}
+	body := w.Body.String()
+	if !strings.Contains(body, `"duration_ms"`) {
+		t.Fatalf("expected summary duration, got:\n%s", body)
+	}
+	if strings.Contains(body, `"first_byte_ms"`) {
+		t.Fatalf("DONE control event must not produce first_byte_ms, got:\n%s", body)
 	}
 }
 

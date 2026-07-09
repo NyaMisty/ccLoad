@@ -29,6 +29,7 @@ type ActiveRequest struct {
 	CostMultiplier      float64 `json:"cost_multiplier"`                  // 渠道成本倍率
 	AttemptIndex        int32   `json:"attempt_index,omitempty"`          // 当前尝试次数（1-based，全局累计）
 	DebugLogAvailable   bool    `json:"debug_log_available,omitempty"`    // 运行中请求是否已有可读取的调试快照
+	ThinkingEffort      string  `json:"thinking_effort,omitempty"`
 }
 
 type activeRequest struct {
@@ -45,11 +46,20 @@ type activeRequest struct {
 	BaseURL     string
 
 	CostMultiplier float64 // 渠道成本倍率
+	ThinkingEffort string
 	debugCapture   *debugCapture
 
 	bytesCounter            atomic.Int64 // 上游已返回的字节数（原子累加）
 	clientFirstByteTimeUsec atomic.Int64 // 客户端侧首字节响应时间（微秒），CAS保证只写一次，0表示未设置
 	attemptIndex            atomic.Int32 // 当前尝试次数（1-based，全局累计）
+}
+
+func (m *activeRequestManager) SetThinkingEffort(id int64, thinkingEffort string) {
+	m.mu.Lock()
+	if req, ok := m.requests[id]; ok {
+		req.ThinkingEffort = normalizeThinkingEffort(thinkingEffort)
+	}
+	m.mu.Unlock()
 }
 
 // activeRequestManager 管理进行中的请求（内存状态，不持久化）
@@ -142,6 +152,12 @@ func (m *activeRequestManager) Remove(id int64) {
 	m.mu.Unlock()
 }
 
+func (m *activeRequestManager) Count() int {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return len(m.requests)
+}
+
 // AddBytes 原子地增加指定请求的字节数（线程安全）
 func (m *activeRequestManager) AddBytes(id int64, n int64) {
 	if n <= 0 {
@@ -194,6 +210,7 @@ func (m *activeRequestManager) List() []*ActiveRequest {
 			CostMultiplier:    req.CostMultiplier,
 			AttemptIndex:      req.attemptIndex.Load(),
 			DebugLogAvailable: req.debugCapture != nil,
+			ThinkingEffort:    req.ThinkingEffort,
 		}
 		if usec := req.clientFirstByteTimeUsec.Load(); usec > 0 {
 			view.ClientFirstByteTime = float64(usec) / 1e6

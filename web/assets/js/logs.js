@@ -20,7 +20,7 @@ let latestActiveRequests = []; // 缓存 ui.js 最近一次推送的活动请求
 let lastActiveRequestStates = null; // Map<id, fingerprint>：上次活跃请求状态，用于检测请求结束/渠道切换
 let logsLoadInFlight = false;
 let logsLoadPending = false;
-let logsLoadScheduled = false;
+// logsLoadScheduled 已被 _scheduleLoadTimer 取代
 
 // === 列显隐 ===
 const LOGS_COL_STORAGE_KEY = 'ccload_logs_columns';
@@ -224,13 +224,13 @@ function appendLogsTimeRangeParams(params, filters) {
   return params;
 }
 
+let _scheduleLoadTimer = null;
 function scheduleLoad() {
-  if (logsLoadScheduled) return;
-  logsLoadScheduled = true;
-  setTimeout(() => {
-    logsLoadScheduled = false;
+  if (_scheduleLoadTimer) clearTimeout(_scheduleLoadTimer);
+  _scheduleLoadTimer = setTimeout(() => {
+    _scheduleLoadTimer = null;
     load(true); // 自动刷新时跳过 loading 状态，避免闪烁
-  }, 0);
+  }, 2000);
 }
 
 function toUnixMs(value) {
@@ -370,6 +370,96 @@ function getStreamFlagHtml(isStreaming) {
     : '<span class="stream-flag placeholder">流</span>';
 }
 
+function buildTimingSeparatorHtml() {
+  return '<span class="log-timing-separator" style="color: var(--neutral-400);">/</span>';
+}
+
+function buildFirstByteTimingHtml(seconds, text) {
+  return `<span class="log-timing-first-byte" style="color: ${window.getFirstByteTimingColor(seconds)};">${text}</span>`;
+}
+
+function buildDurationTimingHtml(seconds, text) {
+  return `<span class="log-timing-duration" style="color: ${window.getDurationTimingColor(seconds)};">${text}</span>`;
+}
+
+function buildActiveRequestTimingHtml(req, elapsedRaw, elapsedText) {
+  if (!Number.isFinite(elapsedRaw)) return '-';
+
+  const durationDisplay = buildDurationTimingHtml(elapsedRaw, `${elapsedText}s...`);
+  if (req.is_streaming && req.client_first_byte_time > 0) {
+    const firstByte = Number(req.client_first_byte_time);
+    return `<span class="log-timing-pair">${buildFirstByteTimingHtml(firstByte, `${firstByte.toFixed(2)}s`)}${buildTimingSeparatorHtml()}${durationDisplay}</span>`;
+  }
+  return durationDisplay;
+}
+
+function normalizeThinkingEffortDisplay(value) {
+  const effort = String(value || '').trim().toLowerCase();
+  // thinking.type=disabled 表示思考关闭，等同未设置思考等级，不作为 badge 展示
+  if (effort === 'disabled') return '';
+  return effort;
+}
+
+function thinkingEffortBadgeText(value) {
+  return normalizeThinkingEffortDisplay(value);
+}
+
+function normalizeReasoningTokens(value) {
+  const n = Number(value);
+  return Number.isFinite(n) && n > 0 ? Math.trunc(n) : 0;
+}
+
+function buildThinkingEffortBadge(thinkingEffort, reasoningTokens) {
+  const effort = normalizeThinkingEffortDisplay(thinkingEffort);
+  const tokens = normalizeReasoningTokens(reasoningTokens);
+  if (!effort && tokens === 0) return '';
+  const text = [thinkingEffortBadgeText(effort), tokens > 0 ? String(tokens) : '']
+    .filter(Boolean)
+    .join(' ');
+  const titleParts = [];
+  if (effort) titleParts.push(`思考等级: ${escapeHtml(effort)}`);
+  if (tokens > 0) titleParts.push(`思考/推理Token: ${tokens}`);
+  const title = titleParts.join('&#10;');
+  return `<sup class="thinking-effort-badge" title="${title}">${escapeHtml(text)}</sup>`;
+}
+
+function buildLogModelDisplay(model, actualModel, thinkingEffort, reasoningTokens) {
+  if (!model) {
+    return '<span style="color: var(--neutral-500);">-</span>';
+  }
+
+  const redirected = actualModel && actualModel !== model;
+  const effort = normalizeThinkingEffortDisplay(thinkingEffort);
+  const tokens = normalizeReasoningTokens(reasoningTokens);
+  const classes = ['model-tag'];
+  const titleParts = [];
+  if (redirected) {
+    classes.push('model-redirected');
+    titleParts.push(`请求模型: ${escapeHtml(model)}`);
+    titleParts.push(`实际模型: ${escapeHtml(actualModel)}`);
+  }
+  if (effort) {
+    classes.push('model-thinking');
+    titleParts.push(`思考等级: ${escapeHtml(effort)}`);
+  }
+  if (tokens > 0) {
+    classes.push('model-thinking');
+    titleParts.push(`思考/推理Token: ${tokens}`);
+  }
+  const title = titleParts.length > 0 ? ` title="${titleParts.join('&#10;')}"` : '';
+  const redirectBadge = redirected ? '<sup class="redirect-badge">↪</sup>' : '';
+  const badgeHtml = redirectBadge || effort || tokens > 0
+    ? `<span class="model-badges">${redirectBadge}${buildThinkingEffortBadge(effort, tokens)}</span>`
+    : '';
+
+  return `<span class="model-display">
+      <span class="${classes.join(' ')}"${title}>
+        <span class="model-text">${escapeHtml(model)}</span>
+      </span>
+      ${badgeHtml}
+    </span>`;
+}
+
 function getLogMobileLabels() {
   return {
     time: escapeHtml(t('logs.colTime')),
@@ -422,6 +512,8 @@ function renderLogSourceBadge(logSource) {
       return `<span class="log-source-badge log-source-badge--scheduled">${escapeHtml(t('logs.sourceScheduledCheckBadge'))}</span>`;
     case 'manual_test':
       return `<span class="log-source-badge log-source-badge--manual">${escapeHtml(t('logs.sourceManualTestBadge'))}</span>`;
+    case 'manual_chat':
+      return `<span class="log-source-badge log-source-badge--manual">${escapeHtml(t('logs.sourceManualChatBadge'))}</span>`;
     default:
       return '';
   }
@@ -537,28 +629,6 @@ function calculateLogSpeed(entry) {
     Number(entry?.duration),
     entry?.is_streaming ? Number(entry?.first_byte_time) : 0
   );
-}
-
-// 加载默认测试内容（从系统设置）
-async function loadDefaultTestContent() {
-  try {
-    const setting = await fetchDataWithAuth('/admin/settings/channel_test_content');
-    if (setting && setting.value) {
-      logsDefaultTestContent = setting.value;
-    }
-  } catch (e) {
-    console.warn('加载默认测试内容失败，使用内置默认值', e);
-  }
-}
-
-async function loadLogChannelClickAction() {
-  try {
-    const setting = await fetchDataWithAuth('/admin/settings/log_channel_click_action');
-    const value = String(setting?.value || '').trim().toLowerCase();
-    logChannelClickAction = value === 'navigate' ? 'navigate' : 'edit';
-  } catch (e) {
-    logChannelClickAction = 'edit';
-  }
 }
 
 async function load(skipLoading = false) {
@@ -730,34 +800,29 @@ function handleActiveRequestsData(rawActiveRequests) {
   renderActiveRequests(activeRequests);
 }
 
-// 渲染进行中的请求（插入到表格顶部）
+// 渲染进行中的请求（按 ID diff 更新，避免无意义的 DOM churn）
 function renderActiveRequests(activeRequests) {
-  // 移除旧的进行中行
-  clearActiveRequestsRows();
-
-  if (!activeRequests || activeRequests.length === 0) return;
-
   const tbody = document.getElementById('tbody');
-  const firstRow = tbody.firstChild;
+  if (!tbody) return;
+
+  const activeIds = new Set();
   const totalCols = getTableColspan();
   const logMobileLabels = getLogMobileLabels();
+  const firstNonPending = tbody.querySelector('tr:not(.pending-row)');
 
-  // 使用 DocumentFragment 批量构建，减少 DOM 操作
-  const fragment = document.createDocumentFragment();
+  for (const req of (activeRequests || [])) {
+    const id = String(req.id);
+    activeIds.add(id);
 
-  for (const req of activeRequests) {
     const startMs = toUnixMs(req.start_time);
     const elapsedRaw = startMs ? Math.max(0, (Date.now() - startMs) / 1000) : null;
     const elapsed = elapsedRaw !== null ? elapsedRaw.toFixed(1) : '-';
     const streamFlag = getStreamFlagHtml(req.is_streaming);
 
-    // 耗时显示：流式请求有首字时间则显示 "首字/总耗时" 格式
-    let durationDisplay = startMs ? `${elapsed}s...` : '-';
-    if (req.is_streaming && req.client_first_byte_time > 0 && startMs) {
-      durationDisplay = `${req.client_first_byte_time.toFixed(2)}s/${elapsed}s...`;
-    }
+    const durationDisplay = startMs ? buildActiveRequestTimingHtml(req, elapsedRaw, elapsed) : '-';
 
     const channelDisplay = buildActiveRequestChannelDisplay(req);
+    const modelDisplay = buildLogModelDisplay(req.model, '', req.thinking_effort, req.reasoning_tokens);
     const tokenDescDisplay = buildActiveRequestTokenDescDisplay(req);
     const tokenDescCellClass = `logs-col-token-desc${tokenDescDisplay ? '' : ' mobile-empty-cell'}`;
 
@@ -769,27 +834,40 @@ function renderActiveRequests(activeRequests) {
 
     const infoContent = buildActiveRequestInfoContent(req);
 
-    const row = document.createElement('tr');
-    row.className = 'mobile-card-row pending-row';
-    if (totalCols < 8) {
-      row.innerHTML = `
+    let existingRow = tbody.querySelector(`tr.pending-row[data-req-id="${id}"]`);
+
+    if (existingRow) {
+      // 更新现有行的动态字段
+      const timingCell = existingRow.querySelector('.logs-col-timing');
+      if (timingCell) timingCell.innerHTML = `${durationDisplay} ${streamFlag}`;
+      const channelCell = existingRow.querySelector('.logs-col-channel');
+      if (channelCell) channelCell.innerHTML = channelDisplay;
+      const msgCell = existingRow.querySelector('.logs-col-message');
+      if (msgCell) msgCell.innerHTML = infoContent;
+    } else {
+      // 创建新行
+      const row = document.createElement('tr');
+      row.className = 'mobile-card-row pending-row';
+      row.setAttribute('data-req-id', id);
+      if (totalCols < 8) {
+        row.innerHTML = `
             <td colspan="${totalCols}">
               <span class="status-pending">进行中</span>
               <span style="margin-left: 8px;">${formatTime(req.start_time)}</span>
               <span class="logs-mono-text" style="margin-left: 8px;" title="${escapeHtml(req.client_ip || '')}">${escapeHtml(maskIP(req.client_ip) || '-')}</span>
-              <span style="margin-left: 8px;">${escapeHtml(req.model || '-')}</span>
+              <span style="margin-left: 8px;">${modelDisplay}</span>
               <span style="margin-left: 8px;">${durationDisplay} ${streamFlag}</span>
               <span style="margin-left: 8px;">${infoContent}</span>
             </td>
           `;
-    } else {
-      row.innerHTML = `
+      } else {
+        row.innerHTML = `
             <td class="logs-col-time" data-mobile-label="${logMobileLabels.time}" style="white-space: nowrap;">${formatTime(req.start_time)}</td>
             <td class="logs-col-ip logs-mono-text" data-mobile-label="${logMobileLabels.ip}" style="white-space: nowrap;" title="${escapeHtml(req.client_ip || '')}">${escapeHtml(maskIP(req.client_ip) || '-')}</td>
             <td class="${tokenDescCellClass}" data-mobile-label="${logMobileLabels.tokenDesc}" style="white-space: nowrap;">${tokenDescDisplay}</td>
             <td class="logs-col-api-key" data-mobile-label="${logMobileLabels.apiKey}" style="text-align: center; white-space: nowrap;">${keyDisplay}</td>
             <td class="logs-col-channel" data-mobile-label="${logMobileLabels.channel}" style="text-align: left;">${channelDisplay}</td>
-            <td class="logs-col-model" data-mobile-label="${logMobileLabels.model}"><span class="model-tag">${escapeHtml(req.model || '-')}</span></td>
+            <td class="logs-col-model" data-mobile-label="${logMobileLabels.model}">${modelDisplay}</td>
             <td class="logs-col-status" data-mobile-label="${logMobileLabels.status}"><span class="status-pending">进行中</span></td>
             <td class="logs-col-timing" data-mobile-label="${logMobileLabels.timing}" style="text-align: right; white-space: nowrap;">${durationDisplay} ${streamFlag}</td>
             <td class="logs-col-speed mobile-empty-cell" data-mobile-label="${logMobileLabels.speed}" style="text-align: right; white-space: nowrap;"></td>
@@ -801,12 +879,17 @@ function renderActiveRequests(activeRequests) {
             <td class="logs-col-cost mobile-empty-cell" data-mobile-label="${logMobileLabels.cost}" style="text-align: right; white-space: nowrap;"></td>
             <td class="logs-col-message" data-mobile-label="${logMobileLabels.message}">${infoContent}</td>
           `;
+      }
+      tbody.insertBefore(row, firstNonPending);
     }
-    fragment.appendChild(row);
   }
 
-  // 一次性插入所有 pending 行
-  tbody.insertBefore(fragment, firstRow);
+  // 移除已消失的 pending 行
+  tbody.querySelectorAll('tr.pending-row').forEach(row => {
+    if (!activeIds.has(row.getAttribute('data-req-id'))) {
+      row.remove();
+    }
+  });
 }
 
 // ✅ 动态计算列数（避免硬编码维护成本）
@@ -889,26 +972,13 @@ function renderLogs(data) {
       ? ` <sup class="logs-final-badge" style="color: ${finalStatusOk ? 'var(--success-600)' : 'var(--error-600)'}; font-weight: 700;" title="该请求的最终结果（${finalStatusOk ? '成功' : '失败'}）">终</sup>`
       : '';
 
-    // 3. 模型显示（支持重定向角标）
-    let modelDisplay;
-    if (entry.model) {
-      if (entry.actual_model && entry.actual_model !== entry.model) {
-        // 有重定向：显示角标 + tooltip
-        modelDisplay = `<span class="model-tag model-redirected" title="请求模型: ${escapeHtml(entry.model)}&#10;实际模型: ${escapeHtml(entry.actual_model)}">
-              <span class="model-text">${escapeHtml(entry.model)}</span>
-              <sup class="redirect-badge">↪</sup>
-            </span>`;
-      } else {
-        modelDisplay = `<span class="model-tag">${escapeHtml(entry.model)}</span>`;
-      }
-    } else {
-      modelDisplay = '<span style="color: var(--neutral-500);">-</span>';
-    }
+    // 3. 模型显示（支持重定向与思考等级角标）
+    const modelDisplay = buildLogModelDisplay(entry.model, entry.actual_model, entry.thinking_effort, entry.reasoning_tokens);
 
     // 4. 响应时间显示(流式/非流式)
     const hasDuration = entry.duration !== undefined && entry.duration !== null;
     const durationDisplay = hasDuration ?
-      `<span style="color: var(--neutral-700);">${entry.duration.toFixed(2)}</span>` :
+      buildDurationTimingHtml(entry.duration, entry.duration.toFixed(2)) :
       '<span style="color: var(--neutral-500);">-</span>';
 
     const streamFlag = getStreamFlagHtml(entry.is_streaming);
@@ -917,11 +987,11 @@ function renderLogs(data) {
     if (entry.is_streaming) {
       const hasFirstByte = entry.first_byte_time !== undefined && entry.first_byte_time !== null;
       const firstByteDisplay = hasFirstByte ?
-        `<span class="log-timing-first-byte" style="color: var(--success-600);">${entry.first_byte_time.toFixed(2)}</span>` :
+        buildFirstByteTimingHtml(entry.first_byte_time, entry.first_byte_time.toFixed(2)) :
         '<span class="log-timing-first-byte" style="color: var(--neutral-500);">-</span>';
-      responseTimingDisplay = `<span class="log-timing-pair">${firstByteDisplay}<span class="log-timing-separator" style="color: var(--neutral-400);">/</span><span class="log-timing-duration">${durationDisplay}</span></span>${streamFlag}`;
+      responseTimingDisplay = `<span class="log-timing-pair">${firstByteDisplay}${buildTimingSeparatorHtml()}${durationDisplay}</span>${streamFlag}`;
     } else {
-      responseTimingDisplay = `<span class="log-timing-pair"><span class="log-timing-duration">${durationDisplay}</span></span>${streamFlag}`;
+      responseTimingDisplay = `<span class="log-timing-pair">${durationDisplay}</span>${streamFlag}`;
     }
 
     const logSpeed = calculateLogSpeed(entry);
@@ -1105,16 +1175,6 @@ function jumpToPage() {
   jumpPageInput.value = '';
 }
 
-function changePageSize() {
-  const newPageSize = parseInt(document.getElementById('page_size').value);
-  if (newPageSize !== logsPageSize) {
-    logsPageSize = newPageSize;
-    currentLogsPage = 1;
-    totalLogsPages = 1;
-    load();
-  }
-}
-
 function applyFilter() {
   currentLogsPage = 1;
   totalLogsPages = 1;
@@ -1216,17 +1276,22 @@ function getLogSourceFilterElements() {
   return { group, select };
 }
 
-async function syncLogSourceVisibility() {
+async function syncLogSourceVisibility(preloadedIntervalHours) {
   const { group, select } = getLogSourceFilterElements();
   if (!group || !select) return false;
 
   let scheduledCheckEnabledByConfig = false;
-  try {
-    const setting = await fetchDataWithAuth('/admin/settings/channel_check_interval_hours');
-    const intervalHours = Number(setting && setting.value);
-    scheduledCheckEnabledByConfig = Number.isFinite(intervalHours) && intervalHours > 0;
-  } catch (error) {
-    console.warn('Failed to load channel check interval setting for logs filter', error);
+  if (preloadedIntervalHours !== undefined) {
+    // 预加载路径：跳过 fetch，直接使用 bootstrap 数据
+    scheduledCheckEnabledByConfig = Number.isFinite(preloadedIntervalHours) && preloadedIntervalHours > 0;
+  } else {
+    try {
+      const setting = await fetchDataWithAuth('/admin/settings/channel_check_interval_hours');
+      const intervalHours = Number(setting && setting.value);
+      scheduledCheckEnabledByConfig = Number.isFinite(intervalHours) && intervalHours > 0;
+    } catch (error) {
+      console.warn('Failed to load channel check interval setting for logs filter', error);
+    }
   }
 
   group.hidden = !scheduledCheckEnabledByConfig;
@@ -1335,7 +1400,7 @@ function initLogsModelCombobox(initialValue) {
   });
 }
 
-async function initFilters(restoredFilters) {
+async function initFilters(restoredFilters, preloaded) {
   const range = restoredFilters.range || 'today';
   const authToken = restoredFilters.authToken || '';
 
@@ -1362,22 +1427,26 @@ async function initFilters(restoredFilters) {
   initLogsChannelNameCombobox(restoredFilters.channelName || '');
   initLogsModelCombobox(restoredFilters.model || '');
   applyLogsFilterValues(restoredFilters);
-  await syncLogSourceVisibility();
-
-  authTokens = await window.initAuthTokenFilter({
-    selectId: 'f_auth_token',
-    value: authToken,
-    onChange: () => {
-      window.persistFilterState({
-        key: LOGS_FILTER_KEY,
-        getValues: getLogsFilters
-      });
-      currentLogsPage = 1;
-      load();
-    }
-  });
-
-  await loadLogsModels(currentChannelType, range);
+  // 并行化：三个独立网络请求同时发起（高 RTT 环境下节省 ~2 个往返延迟）
+  // 若有 preloaded 数据则跳过对应的网络请求
+  const [, tokens] = await Promise.all([
+    syncLogSourceVisibility(preloaded ? preloaded.channelCheckIntervalHours : undefined),
+    window.initAuthTokenFilter({
+      selectId: 'f_auth_token',
+      value: authToken,
+      onChange: () => {
+        window.persistFilterState({
+          key: LOGS_FILTER_KEY,
+          getValues: getLogsFilters
+        });
+        currentLogsPage = 1;
+        load();
+      },
+      ...(preloaded ? { preloadedTokens: preloaded.authTokens } : {})
+    }),
+    preloaded ? Promise.resolve() : loadLogsModels(currentChannelType, range)
+  ]);
+  authTokens = tokens;
 
   // 事件监听
   document.getElementById('btn_filter').addEventListener('click', applyFilter);
@@ -1671,8 +1740,15 @@ window.initPageBootstrap({
   }, hasUrlParams ? u : null);
   currentChannelType = restoredFilters.channelType || 'all';
 
-  // 并行初始化：渠道类型 + 默认测试内容同时加载（节省一次 RTT）
-  await Promise.all([
+  // 构造 bootstrap 请求参数（和 loadLogsModels 一致）
+  const bootstrapParams = new URLSearchParams();
+  appendLogsTimeRangeParams(bootstrapParams, { range: restoredFilters.range || 'today' });
+  if (currentChannelType && currentChannelType !== 'all') {
+    bootstrapParams.set('channel_type', currentChannelType);
+  }
+
+  // Wave 1：channel-types（浏览器缓存）+ bootstrap（合并 5 个请求）
+  const [, bootstrap] = await Promise.all([
     window.initChannelTypeFilter('f_channel_type', currentChannelType, async (value) => {
       currentChannelType = value;
       window.persistFilterState({
@@ -1683,11 +1759,25 @@ window.initPageBootstrap({
       await loadLogsModels(value);
       load();
     }),
-    loadDefaultTestContent(),
-    loadLogChannelClickAction()
+    fetchDataWithAuth('/admin/logs/bootstrap?' + bootstrapParams.toString()).catch(() => null)
   ]);
 
-  await initFilters(restoredFilters);
+  // 从 bootstrap 数据应用设置（bootstrap 失败时各字段回退到原有 fetch 路径）
+  if (bootstrap) {
+    if (bootstrap.channel_test_content) logsDefaultTestContent = bootstrap.channel_test_content;
+    const clickAction = String(bootstrap.log_channel_click_action || '').trim().toLowerCase();
+    logChannelClickAction = clickAction === 'navigate' ? 'navigate' : 'edit';
+    window.availableLogsModels = [...new Set(bootstrap.models || [])];
+    window.logsChannels = bootstrap.channels || [];
+    if (logsChannelNameCombobox) logsChannelNameCombobox.refresh();
+    if (logsModelCombobox) logsModelCombobox.refresh();
+  }
+
+  // Wave 2：initFilters（有预加载则跳过内部 fetch）
+  await initFilters(restoredFilters, bootstrap ? {
+    channelCheckIntervalHours: bootstrap.channel_check_interval_hours,
+    authTokens: bootstrap.auth_tokens || []
+  } : undefined);
 
   if (!hasUrlParams && savedFilters) {
     window.persistFilterState({
@@ -2159,290 +2249,14 @@ function composeDebugRawResponse(data) {
   return parts.join('\n');
 }
 
-function appendMergedText(bucket, value) {
-  if (!bucket || value == null) return;
-  if (Array.isArray(value)) {
-    value.forEach(item => appendMergedText(bucket, item));
-    return;
-  }
-  if (typeof value === 'object') {
-    if (typeof value.text === 'string') {
-      appendMergedText(bucket, value.text);
-      return;
-    }
-    if (typeof value.content === 'string') {
-      appendMergedText(bucket, value.content);
-      return;
-    }
-    try {
-      bucket.push(JSON.stringify(value));
-    } catch {
-      // ignore values that cannot be rendered
-    }
-    return;
-  }
-  const text = String(value);
-  if (text) bucket.push(text);
-}
-
-function collectMergedResponsePayload(payload, state) {
-  if (!payload || typeof payload !== 'object' || !state) return;
-
-  const collectContentParts = (content) => {
-    if (!Array.isArray(content)) {
-      appendMergedText(state.text, content);
-      return;
-    }
-    content.forEach(part => {
-      if (!part || typeof part !== 'object') {
-        appendMergedText(state.text, part);
-        return;
-      }
-      appendMergedText(state.text, part.text ?? part.content);
-    });
-  };
-
-  const collectMessage = (message) => {
-    if (!message || typeof message !== 'object') return;
-    appendMergedText(state.reasoning, message.reasoning_content);
-    appendMergedText(state.reasoning, message.reasoning);
-    appendMergedText(state.text, message.content);
-    appendMergedText(state.text, message.refusal);
-  };
-
-  const collectAnthropicDelta = (payload) => {
-    const delta = payload.delta;
-    if (!delta || typeof delta !== 'object') return;
-
-    appendMergedText(state.reasoning, delta.thinking);
-    appendMergedText(state.text, delta.text);
-
-    if (delta.partial_json != null) {
-      if (
-        payload.index != null
-        && state.lastFunctionCallIndex != null
-        && state.lastFunctionCallIndex !== payload.index
-      ) {
-        state.functionCalls.push('\n\n');
-      }
-      if (payload.index != null) state.lastFunctionCallIndex = payload.index;
-      appendMergedText(state.functionCalls, delta.partial_json);
-      state.hasFunctionCallDelta = true;
-    }
-
-    if (delta.thinking != null) state.hasReasoningDelta = true;
-    if (delta.text != null) state.hasTextDelta = true;
-  };
-
-  const hasFunctionCallDeltaFor = (index) => {
-    return index != null && state.functionCallDeltaIndexes?.has(index);
-  };
-
-  const appendFunctionCallText = (index, text, fromDelta = false) => {
-    if (
-      index != null
-      && state.lastFunctionCallIndex != null
-      && state.lastFunctionCallIndex !== index
-    ) {
-      state.functionCalls.push('\n\n');
-    }
-    if (index != null) state.lastFunctionCallIndex = index;
-    appendMergedText(state.functionCalls, text);
-    if (fromDelta) {
-      state.hasFunctionCallDelta = true;
-      if (index != null) state.functionCallDeltaIndexes.add(index);
-    }
-  };
-
-  const collectOutputItem = (item, fallbackIndex = null) => {
-    if (!item || typeof item !== 'object') return;
-    const outputIndex = item.output_index ?? fallbackIndex;
-    if (item.type === 'message') {
-      if (state.hasTextDelta) return;
-      collectContentParts(item.content);
-      return;
-    }
-    if (item.type === 'function_call') {
-      if (hasFunctionCallDeltaFor(outputIndex) || (outputIndex == null && state.hasFunctionCallDelta)) return;
-      if (state.functionCalls.length > 0) state.functionCalls.push('\n\n');
-      appendMergedText(state.functionCalls, item.arguments);
-      return;
-    }
-    if (item.type === 'custom_tool_call') {
-      if (hasFunctionCallDeltaFor(outputIndex) || (outputIndex == null && state.hasFunctionCallDelta)) return;
-      if (state.functionCalls.length > 0) state.functionCalls.push('\n\n');
-      appendMergedText(state.functionCalls, item.input);
-      return;
-    }
-    if (item.type === 'reasoning') {
-      if (state.hasReasoningDelta) return;
-      appendMergedText(state.reasoning, item.summary || item.content);
-    }
-  };
-
-  const collectGeminiCandidate = (candidate) => {
-    if (!candidate || typeof candidate !== 'object') return;
-    const parts = candidate.content?.parts;
-    if (!Array.isArray(parts)) {
-      appendMergedText(state.text, candidate.content?.text ?? candidate.content);
-      return;
-    }
-    parts.forEach(part => {
-      if (!part || typeof part !== 'object') {
-        appendMergedText(state.text, part);
-        return;
-      }
-      const target = part.thought === true ? state.reasoning : state.text;
-      appendMergedText(target, part.text ?? part.content);
-    });
-  };
-
-  if (Array.isArray(payload.choices)) {
-    payload.choices.forEach(choice => {
-      if (!choice || typeof choice !== 'object') return;
-      const delta = choice.delta || null;
-      if (delta && typeof delta === 'object') {
-        appendMergedText(state.reasoning, delta.reasoning_content);
-        appendMergedText(state.reasoning, delta.reasoning);
-        appendMergedText(state.text, delta.content);
-        if (delta.reasoning_content != null || delta.reasoning != null) state.hasReasoningDelta = true;
-        if (delta.content != null) state.hasTextDelta = true;
-      }
-      collectMessage(choice.message);
-    });
-  }
-
-  if (Array.isArray(payload.candidates)) {
-    payload.candidates.forEach(collectGeminiCandidate);
-  }
-
-  switch (payload.type) {
-    case 'content_block_delta':
-      collectAnthropicDelta(payload);
-      break;
-    case 'response.output_text.delta':
-    case 'response.refusal.delta':
-      appendMergedText(state.text, payload.delta);
-      state.hasTextDelta = true;
-      break;
-    case 'response.reasoning_text.delta':
-    case 'response.reasoning_summary_text.delta':
-    case 'response.reasoning.delta':
-      appendMergedText(state.reasoning, payload.delta);
-      state.hasReasoningDelta = true;
-      break;
-    case 'response.function_call_arguments.delta':
-      appendFunctionCallText(payload.output_index, payload.delta, true);
-      break;
-    case 'response.custom_tool_call_input.delta':
-      appendFunctionCallText(payload.output_index, payload.delta, true);
-      break;
-    case 'response.custom_tool_call_input.done':
-      if (!hasFunctionCallDeltaFor(payload.output_index)) {
-        appendFunctionCallText(payload.output_index, payload.input);
-      }
-      break;
-    case 'response.output_item.done':
-      collectOutputItem(payload.item, payload.output_index);
-      break;
-    default:
-      break;
-  }
-
-  if (Array.isArray(payload.output)) {
-    payload.output.forEach((item, index) => collectOutputItem(item, index));
-  }
-  if (payload.response && Array.isArray(payload.response.output)) {
-    payload.response.output.forEach((item, index) => collectOutputItem(item, index));
-  }
-}
-
-function parseSSEDataPayloads(body) {
-  const payloads = [];
-  let dataLines = [];
-
-  const flush = () => {
-    if (dataLines.length === 0) return;
-    const raw = dataLines.join('\n').trim();
-    dataLines = [];
-    if (!raw || raw === '[DONE]') return;
-    try {
-      payloads.push(JSON.parse(raw));
-    } catch {
-      // Non-JSON SSE data is not useful for merged LLM content.
-    }
-  };
-
-  String(body || '').replace(/\r\n/g, '\n').split('\n').forEach(line => {
-    if (line.startsWith('data:')) {
-      const value = line.slice(5);
-      dataLines.push(value.startsWith(' ') ? value.slice(1) : value);
-      return;
-    }
-    if (line === '') flush();
-  });
-  flush();
-
-  return payloads;
-}
-
-function composeDebugMergedResponse(data) {
-  let raw = String(data?.resp_body || '').replace(/\r\n/g, '\n');
-  if (!raw) return '';
-  const headerBreak = raw.indexOf('\n\n');
-  const firstLine = raw.split('\n', 1)[0] || '';
-  if (headerBreak !== -1 && /^HTTP\s+\d{3}\b/i.test(firstLine)) {
-    raw = raw.slice(headerBreak + 2).trimStart();
-  }
-
-  const state = {
-    reasoning: [],
-    text: [],
-    functionCalls: [],
-    hasReasoningDelta: false,
-    hasTextDelta: false,
-    hasFunctionCallDelta: false,
-    lastFunctionCallIndex: null,
-    functionCallDeltaIndexes: new Set()
-  };
-  const ssePayloads = parseSSEDataPayloads(raw);
-  if (ssePayloads.length > 0) {
-    ssePayloads.forEach(payload => collectMergedResponsePayload(payload, state));
-  } else {
-    try {
-      collectMergedResponsePayload(JSON.parse(raw), state);
-    } catch {
-      return formatJsonSafe(raw);
-    }
-  }
-
-  const sections = [];
-  [state.reasoning, state.text, state.functionCalls].forEach(bucket => {
-    const text = bucket.join('').trim();
-    if (text) sections.push(text);
-  });
-
-  return sections.join('\n\n') || formatJsonSafe(raw);
-}
-
-function getDebugMergedRenderMode(text) {
-  const trimmed = String(text || '').trim();
-  if (!trimmed) return 'text';
-  const isJson = (trimmed.startsWith('{') && trimmed.endsWith('}'))
-    || (trimmed.startsWith('[') && trimmed.endsWith(']'));
-  if (!isJson) return 'text';
-  try {
-    JSON.parse(trimmed);
-    return 'json';
-  } catch {
-    return 'text';
-  }
-}
-
 const ACTIVE_DEBUG_LOG_REFRESH_INTERVAL_MS = 1500;
 let activeDebugLogRefreshTimer = null;
 let activeDebugLogRefreshInFlight = false;
 let debugResponseMergedVisible = false;
+let debugLogWrapEnabled = true;
+let currentDebugLogData = null;
+let debugMergedSourceBody = null;
+let debugMergedLoading = false;
 
 async function showDebugLogModal(logId) {
   return showDebugLogModalFromUrl(`/admin/debug-logs/${logId}`, { activeRequestId: 0 });
@@ -2470,6 +2284,9 @@ async function showDebugLogModalFromUrl(url, opts = {}) {
   error.textContent = '';
   content.style.display = 'none';
   setDebugLogStatus(null);
+  currentDebugLogData = null;
+  debugMergedSourceBody = null;
+  debugMergedLoading = false;
   modal.classList.add('show');
 
   // Reset tabs
@@ -2479,6 +2296,7 @@ async function showDebugLogModalFromUrl(url, opts = {}) {
   document.getElementById('debugTabRequest').classList.add('active');
   document.getElementById('debugTabResponse').classList.remove('active');
   setDebugResponseMergedVisible(false);
+  applyDebugLogWrapMode();
   updateDebugResponseActionButtons();
 
   try {
@@ -2494,13 +2312,13 @@ async function showDebugLogModalFromUrl(url, opts = {}) {
     }
 
     const data = payload.data || {};
+    currentDebugLogData = data;
     loading.style.display = 'none';
     content.style.display = 'flex';
 
     window.setHighlightedCodeContent('debugReqRaw', composeDebugRawRequest(data), 'request');
     window.setHighlightedCodeContent('debugRespRaw', composeDebugRawResponse(data), 'response');
-    const mergedResponse = composeDebugMergedResponse(data);
-    window.setHighlightedCodeContent('debugRespMerged', mergedResponse, getDebugMergedRenderMode(mergedResponse));
+    resetDebugMergedResponse();
 
     // 如果是实时活跃请求，启动轮询
     const activeRequestId = Number(opts.activeRequestId);
@@ -2572,6 +2390,7 @@ async function refreshActiveDebugLogOnce(activeRequestId) {
       return;
     }
     const data = payload.data || {};
+    currentDebugLogData = data;
     updateDebugLogContentPreserveScroll(data);
   } catch (_) {
     // 网络抖动：忽略，下个 tick 继续
@@ -2583,8 +2402,11 @@ async function refreshActiveDebugLogOnce(activeRequestId) {
 function updateDebugLogContentPreserveScroll(data) {
   updateDebugPanePreserveScroll('debugReqRaw', composeDebugRawRequest(data), 'request');
   updateDebugPanePreserveScroll('debugRespRaw', composeDebugRawResponse(data), 'response');
-  const mergedResponse = composeDebugMergedResponse(data);
-  updateDebugPanePreserveScroll('debugRespMerged', mergedResponse, getDebugMergedRenderMode(mergedResponse));
+  if (debugResponseMergedVisible) {
+    void refreshDebugMergedResponse(data);
+  } else if (String(data?.resp_body || '') !== String(debugMergedSourceBody || '')) {
+    resetDebugMergedResponse();
+  }
 }
 
 function updateDebugPanePreserveScroll(targetId, text, mode) {
@@ -2592,18 +2414,37 @@ function updateDebugPanePreserveScroll(targetId, text, mode) {
   if (!pre) return;
   // 内容未变化则跳过，避免破坏选区与滚动
   const prevText = pre._rawText || '';
-  if (prevText === (text || '')) return;
+  const nextText = mode === 'markdown' ? mergedResponseRawText(text) : (text || '');
+  if (prevText === nextText) return;
 
   const stickToBottom = isScrolledToBottom(pre);
   const prevScrollTop = pre.scrollTop;
 
-  window.setHighlightedCodeContent(targetId, text || '', mode);
+  if (mode === 'markdown') {
+    window.MarkdownRenderer.renderResponse(targetId, text || { reasoning: '', content: '' });
+  } else {
+    window.setHighlightedCodeContent(targetId, text || '', mode);
+  }
 
   if (stickToBottom) {
     pre.scrollTop = pre.scrollHeight;
   } else {
     pre.scrollTop = prevScrollTop;
   }
+}
+
+function mergedResponseRawText(response) {
+  if (response && typeof response === 'object' && !Array.isArray(response)) {
+    return [
+      response.reasoning || response.thinking || '',
+      response.content ?? response.text ?? '',
+      response.tools ?? response.toolCalls ?? response.functionCalls ?? ''
+    ]
+      .map(value => String(value || '').trim())
+      .filter(Boolean)
+      .join('\n\n');
+  }
+  return String(response || '');
 }
 
 function isScrolledToBottom(el) {
@@ -2615,7 +2456,32 @@ function isScrolledToBottom(el) {
 function closeDebugLogModal() {
   stopActiveDebugLogPolling();
   setDebugLogStatus(null);
+  currentDebugLogData = null;
+  debugMergedSourceBody = null;
+  debugMergedLoading = false;
   document.getElementById('debugLogModal').classList.remove('show');
+}
+
+function updateDebugWrapButton() {
+  const wrapBtn = document.getElementById('debugWrapBtn');
+  if (!wrapBtn) return;
+  wrapBtn.classList.toggle('active', debugLogWrapEnabled);
+  wrapBtn.setAttribute('aria-pressed', debugLogWrapEnabled ? 'true' : 'false');
+  wrapBtn.dataset.i18n = debugLogWrapEnabled ? 'logs.debugWrap' : 'logs.debugNoWrap';
+  wrapBtn.textContent = (typeof t === 'function' ? t(wrapBtn.dataset.i18n) : '') ||
+    (debugLogWrapEnabled ? '换行' : '不换行');
+}
+
+function applyDebugLogWrapMode() {
+  document.querySelectorAll('#debugLogModal .upstream-pre').forEach(pre => {
+    pre.classList.toggle('upstream-pre--nowrap', !debugLogWrapEnabled);
+  });
+  updateDebugWrapButton();
+}
+
+function setDebugLogWrapEnabled(enabled) {
+  debugLogWrapEnabled = !!enabled;
+  applyDebugLogWrapMode();
 }
 
 function updateDebugResponseActionButtons() {
@@ -2651,6 +2517,39 @@ function setDebugResponseMergedVisible(visible) {
   }
 
   updateDebugResponseActionButtons();
+
+  if (debugResponseMergedVisible) {
+    void refreshDebugMergedResponse(currentDebugLogData);
+  }
+}
+
+function resetDebugMergedResponse() {
+  debugMergedSourceBody = null;
+  debugMergedLoading = false;
+  window.MarkdownRenderer.renderResponse('debugRespMerged', { reasoning: '', content: '' });
+}
+
+async function refreshDebugMergedResponse(data) {
+  if (!data || debugMergedLoading) return;
+  const sourceBody = String(data.resp_body || '');
+  if (debugMergedSourceBody === sourceBody) return;
+  debugMergedLoading = true;
+  window.MarkdownRenderer.renderResponse('debugRespMerged', {
+    reasoning: '',
+    content: (typeof t === 'function' ? t('common.loading') : '加载中...') || '加载中...',
+  });
+  try {
+    const merged = await window.MergedResponseClient.mergeUpstreamResponse(sourceBody);
+    debugMergedSourceBody = sourceBody;
+    updateDebugPanePreserveScroll('debugRespMerged', merged, 'markdown');
+  } catch (e) {
+    window.MarkdownRenderer.renderResponse('debugRespMerged', {
+      reasoning: '',
+      content: e?.message || '合并响应失败',
+    });
+  } finally {
+    debugMergedLoading = false;
+  }
 }
 
 // Tab switch + copy button delegation for debug log modal.
@@ -2670,6 +2569,12 @@ if (typeof document !== 'undefined' && typeof document.addEventListener === 'fun
     const mergeBtn = e.target.closest('#debugLogModal [data-action="merge-debug-response"]');
     if (mergeBtn) {
       setDebugResponseMergedVisible(!debugResponseMergedVisible);
+      return;
+    }
+
+    const wrapBtn = e.target.closest('#debugLogModal [data-action="toggle-debug-wrap"]');
+    if (wrapBtn) {
+      setDebugLogWrapEnabled(!debugLogWrapEnabled);
       return;
     }
 

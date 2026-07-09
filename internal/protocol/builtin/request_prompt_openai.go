@@ -124,38 +124,48 @@ func encodeOpenAIRequest(model string, conv conversation, stream bool) ([]byte, 
 		encoded.ReasoningContent = stringValue(message["reasoning_content"])
 		payload.Messages = append(payload.Messages, encoded)
 	}
+	encodedToolCount := 0
+	var webSearchOptions map[string]any
 	if len(conv.Tools) > 0 {
 		tools := make([]map[string]any, 0, len(conv.Tools))
 		for _, tool := range conv.Tools {
-			if tool.toolType() == "function" {
-				item := map[string]any{
-					"type": "function",
-					"function": map[string]any{
-						"name": tool.Name,
-					},
+			if tool.toolType() != "function" {
+				if isOpenAIWebSearchToolType(tool.toolType()) && webSearchOptions == nil {
+					webSearchOptions = openAIWebSearchOptions(tool.Options)
 				}
-				if tool.Description != "" {
-					item["function"].(map[string]any)["description"] = tool.Description
-				}
-				if anySchema, err := rawJSONToAny(tool.InputSchema); err == nil && anySchema != nil {
-					item["function"].(map[string]any)["parameters"] = anySchema
-				}
-				tools = append(tools, item)
 				continue
 			}
-			item := map[string]any{"type": tool.toolType()}
-			for key, value := range tool.Options {
-				item[key] = value
+			item := map[string]any{
+				"type": "function",
+				"function": map[string]any{
+					"name": tool.Name,
+				},
+			}
+			if tool.Description != "" {
+				item["function"].(map[string]any)["description"] = tool.Description
+			}
+			if anySchema, err := rawJSONToAny(tool.InputSchema); err == nil && anySchema != nil {
+				item["function"].(map[string]any)["parameters"] = anySchema
 			}
 			tools = append(tools, item)
 		}
+		if len(tools) > 0 {
+			encodedToolCount = len(tools)
+			var err error
+			payload.Tools, err = marshalStableJSON(tools)
+			if err != nil {
+				return nil, err
+			}
+		}
+	}
+	if webSearchOptions != nil {
 		var err error
-		payload.Tools, err = marshalStableJSON(tools)
+		payload.WebSearchOptions, err = marshalStableJSON(webSearchOptions)
 		if err != nil {
 			return nil, err
 		}
 	}
-	if !conv.ToolChoice.IsZero() {
+	if !conv.ToolChoice.IsZero() && encodedToolCount > 0 {
 		choice := encodeOpenAIToolChoice(conv.ToolChoice)
 		if choice != nil {
 			var err error
@@ -165,7 +175,7 @@ func encodeOpenAIRequest(model string, conv conversation, stream bool) ([]byte, 
 			}
 		}
 	}
-	if conv.ToolChoice.DisableParallel && len(conv.Tools) > 0 {
+	if conv.ToolChoice.DisableParallel && encodedToolCount > 0 {
 		f := false
 		payload.ParallelToolCalls = &f
 	}
@@ -193,14 +203,16 @@ func encodeOpenAIRequest(model string, conv conversation, stream bool) ([]byte, 
 	return marshalStableJSON(payload)
 }
 
-// normalizeOpenAIEffort 把 OpenAI reasoning_effort 枚举收敛到 Codex 接受的档位
-// （low/medium/high）。minimal 归入 low，auto 归入 medium。
+// normalizeOpenAIEffort 把 OpenAI reasoning_effort 枚举收敛到 Codex 接受的档位。
+// minimal 归入 low，auto 归入 medium。
 func normalizeOpenAIEffort(effort string) string {
 	switch effort {
 	case "minimal", "low":
 		return "low"
 	case "high":
 		return "high"
+	case "max", "xhigh":
+		return "xhigh"
 	case "auto", "medium":
 		return "medium"
 	default:
@@ -228,6 +240,8 @@ func anthropicThinkingToOpenAIEffort(thinking *anthropicThinkingConfig) string {
 		return ""
 	}
 	switch strings.ToLower(strings.TrimSpace(thinking.Type)) {
+	case "adaptive":
+		return normalizeOpenAIEffort(normalizeAnthropicOutputEffort(thinking.Effort))
 	case "enabled":
 		return mapAnthropicBudgetToOpenAIEffort(thinking.BudgetTokens)
 	case "disabled":
@@ -336,12 +350,48 @@ func encodeOpenAIToolChoice(choice conversationToolChoice) any {
 		return "required"
 	case "named":
 		if choice.toolType() != "function" {
-			return map[string]any{"type": choice.toolType()}
+			return nil
 		}
 		return map[string]any{"type": "function", "function": map[string]any{"name": choice.Name}}
 	default:
 		return nil
 	}
+}
+
+func isOpenAIWebSearchToolType(toolType string) bool {
+	switch normalizeRole(toolType) {
+	case "web_search", "web_search_preview":
+		return true
+	default:
+		return false
+	}
+}
+
+func openAIWebSearchOptions(options map[string]any) map[string]any {
+	out := map[string]any{}
+	if value, ok := options["search_context_size"]; ok {
+		out["search_context_size"] = value
+	}
+	if location, ok := options["user_location"].(map[string]any); ok {
+		out["user_location"] = openAIWebSearchUserLocation(location)
+	}
+	return out
+}
+
+func openAIWebSearchUserLocation(location map[string]any) map[string]any {
+	out := map[string]any{"type": "approximate"}
+	if typ := strings.TrimSpace(stringValue(location["type"])); typ != "" {
+		out["type"] = typ
+	}
+	if approximate, ok := location["approximate"].(map[string]any); ok {
+		out["approximate"] = approximate
+		return out
+	}
+	approximate := cloneMapWithoutKeys(location, "type")
+	if len(approximate) > 0 {
+		out["approximate"] = approximate
+	}
+	return out
 }
 
 func extractOpenAIContentParts(content any) ([]conversationPart, error) {

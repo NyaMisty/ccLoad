@@ -35,6 +35,7 @@ func DefineAPIKeysTable() *TableBuilder {
 		Column("channel_id INT NOT NULL").
 		Column("key_index INT NOT NULL").
 		Column("api_key VARCHAR(255) NOT NULL").
+		Column("note VARCHAR(512) NOT NULL DEFAULT ''").
 		Column("key_strategy VARCHAR(32) NOT NULL DEFAULT 'sequential'").
 		Column("cooldown_until BIGINT NOT NULL DEFAULT 0").
 		Column("cooldown_duration_ms BIGINT NOT NULL DEFAULT 0").
@@ -104,6 +105,7 @@ func DefineAuthTokensTable() *TableBuilder {
 		Column("cache_read_tokens_total BIGINT NOT NULL DEFAULT 0").
 		Column("cache_creation_tokens_total BIGINT NOT NULL DEFAULT 0").
 		Column("total_cost_usd DOUBLE NOT NULL DEFAULT 0.0").
+		Column("effective_cost_usd DOUBLE NOT NULL DEFAULT 0.0").
 		Column("cost_used_microusd BIGINT NOT NULL DEFAULT 0").
 		Column("cost_limit_microusd BIGINT NOT NULL DEFAULT 0").
 		Column("allowed_models VARCHAR(2000) NOT NULL DEFAULT ''").
@@ -161,8 +163,10 @@ func DefineLogsTable() *TableBuilder {
 		Column("client_ip VARCHAR(45) NOT NULL DEFAULT ''").    // 客户端IP地址（新增2025-12）
 		Column("base_url VARCHAR(500) NOT NULL DEFAULT ''").    // 请求使用的上游URL（多URL场景）
 		Column("service_tier VARCHAR(20) NOT NULL DEFAULT ''"). // OpenAI service_tier: priority/flex
+		Column("thinking_effort VARCHAR(32) NOT NULL DEFAULT ''").
 		Column("input_tokens INT NOT NULL DEFAULT 0").
 		Column("output_tokens INT NOT NULL DEFAULT 0").
+		Column("reasoning_tokens INT NOT NULL DEFAULT 0").
 		Column("cache_read_input_tokens INT NOT NULL DEFAULT 0").
 		Column("cache_creation_input_tokens INT NOT NULL DEFAULT 0"). // 5m+1h缓存总和（兼容字段）
 		Column("cache_5m_input_tokens INT NOT NULL DEFAULT 0").       // 5分钟缓存写入Token数（新增2025-12）

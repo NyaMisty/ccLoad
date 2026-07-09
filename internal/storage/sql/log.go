@@ -29,13 +29,14 @@ func scanLogEntry(scanner interface {
 	var baseURL sql.NullString
 	var actualModel sql.NullString
 	var serviceTier sql.NullString
-	var inputTokens, outputTokens, cacheReadTokens, cacheCreationTokens, cache5mTokens, cache1hTokens sql.NullInt64
+	var thinkingEffort sql.NullString
+	var inputTokens, outputTokens, reasoningTokens, cacheReadTokens, cacheCreationTokens, cache5mTokens, cache1hTokens sql.NullInt64
 	var cost sql.NullFloat64
 	var costMultiplier sql.NullFloat64
 
 	if err := scanner.Scan(&e.ID, &timeMs, &e.Model, &actualModel, &logSource, &e.ChannelID,
-		&e.StatusCode, &e.Message, &duration, &isStreamingInt, &firstByteTime, &apiKeyUsed, &apiKeyHash, &e.AuthTokenID, &clientIP, &baseURL, &serviceTier,
-		&inputTokens, &outputTokens, &cacheReadTokens, &cacheCreationTokens, &cache5mTokens, &cache1hTokens, &cost, &costMultiplier); err != nil {
+		&e.StatusCode, &e.Message, &duration, &isStreamingInt, &firstByteTime, &apiKeyUsed, &apiKeyHash, &e.AuthTokenID, &clientIP, &baseURL, &serviceTier, &thinkingEffort,
+		&inputTokens, &outputTokens, &reasoningTokens, &cacheReadTokens, &cacheCreationTokens, &cache5mTokens, &cache1hTokens, &cost, &costMultiplier); err != nil {
 		return nil, err
 	}
 
@@ -67,11 +68,17 @@ func scanLogEntry(scanner interface {
 	if serviceTier.Valid {
 		e.ServiceTier = serviceTier.String
 	}
+	if thinkingEffort.Valid {
+		e.ThinkingEffort = thinkingEffort.String
+	}
 	if inputTokens.Valid {
 		e.InputTokens = int(inputTokens.Int64)
 	}
 	if outputTokens.Valid {
 		e.OutputTokens = int(outputTokens.Int64)
+	}
+	if reasoningTokens.Valid {
+		e.ReasoningTokens = int(reasoningTokens.Int64)
 	}
 	if cacheReadTokens.Valid {
 		e.CacheReadInputTokens = int(cacheReadTokens.Int64)
@@ -151,42 +158,29 @@ func (s *SQLStore) AddLog(ctx context.Context, e *model.LogEntry) error {
 	if e.Time.IsZero() {
 		e.Time = model.JSONTime{Time: time.Now()}
 	}
-
-	// 清理单调时钟信息，确保时间格式标准化
-	cleanTime := e.Time.Round(0) // 移除单调时钟部分
-
-	// Unix时间戳：直接存储毫秒级Unix时间戳
-	timeMs := cleanTime.UnixMilli()
-	minuteBucket := timeMs / minuteMs
-
-	// API Key在写入时强制脱敏（2025-10-06）
-	// 设计原则：数据库中不应存储完整API Key，避免备份和日志导出时泄露
-	maskedKey := e.APIKeyUsed
-	apiKeyHash := util.HashAPIKey(e.APIKeyUsed)
-	if maskedKey != "" {
-		maskedKey = util.MaskAPIKey(maskedKey)
+	if e.DebugData != nil {
+		tx, err := s.db.BeginTx(ctx, nil)
+		if err != nil {
+			return err
+		}
+		defer func() { _ = tx.Rollback() }()
+		if err := insertLogsWithDebug(ctx, tx, []*model.LogEntry{e}); err != nil {
+			return err
+		}
+		return tx.Commit()
 	}
 
-	logSourceValue := model.NormalizeStoredLogSource(e.LogSource)
-
-	// 直接写入日志数据库（简化预编译语句缓存）
-	query := `
-		INSERT INTO logs(time, minute_bucket, model, actual_model, log_source, channel_id, status_code, message, duration, is_streaming, first_byte_time, api_key_used, api_key_hash, auth_token_id, client_ip, base_url, service_tier,
-			input_tokens, output_tokens, cache_read_input_tokens, cache_creation_input_tokens, cache_5m_input_tokens, cache_1h_input_tokens, cost, cost_multiplier)
-		VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-	`
-
-	_, err := s.db.ExecContext(ctx, query, timeMs, minuteBucket, e.Model, e.ActualModel, logSourceValue, e.ChannelID, e.StatusCode, e.Message, e.Duration, e.IsStreaming, e.FirstByteTime, maskedKey, apiKeyHash, e.AuthTokenID, e.ClientIP, e.BaseURL, e.ServiceTier,
-		e.InputTokens, e.OutputTokens, e.CacheReadInputTokens, e.CacheCreationInputTokens, e.Cache5mInputTokens, e.Cache1hInputTokens, e.Cost, normalizeCostMultiplier(e.CostMultiplier))
+	// 复用 logRowArgs 统一构造参数（脱敏、时间标准化等逻辑集中维护）
+	_, err := s.db.ExecContext(ctx, logsInsertColumns+logRowPlaceholders, logRowArgs(e)...)
 	return err
 }
 
-const logsInsertColumns = `INSERT INTO logs(time, minute_bucket, model, actual_model, log_source, channel_id, status_code, message, duration, is_streaming, first_byte_time, api_key_used, api_key_hash, auth_token_id, client_ip, base_url, service_tier,
-			input_tokens, output_tokens, cache_read_input_tokens, cache_creation_input_tokens, cache_5m_input_tokens, cache_1h_input_tokens, cost, cost_multiplier) VALUES `
+const logsInsertColumns = `INSERT INTO logs(time, minute_bucket, model, actual_model, log_source, channel_id, status_code, message, duration, is_streaming, first_byte_time, api_key_used, api_key_hash, auth_token_id, client_ip, base_url, service_tier, thinking_effort,
+			input_tokens, output_tokens, reasoning_tokens, cache_read_input_tokens, cache_creation_input_tokens, cache_5m_input_tokens, cache_1h_input_tokens, cost, cost_multiplier) VALUES `
 
-const logRowPlaceholders = `(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+const logRowPlaceholders = `(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
 
-const logRowParams = 25
+const logRowParams = 27
 
 // BatchAddLogs 批量写入日志（单事务，多值 INSERT 提升刷盘吞吐）
 // 设计：
@@ -344,8 +338,8 @@ func logRowArgs(e *model.LogEntry) []any {
 		model.NormalizeStoredLogSource(e.LogSource),
 		e.ChannelID, e.StatusCode, e.Message, e.Duration,
 		e.IsStreaming, e.FirstByteTime, maskedKey, apiKeyHash,
-		e.AuthTokenID, e.ClientIP, e.BaseURL, e.ServiceTier,
-		e.InputTokens, e.OutputTokens, e.CacheReadInputTokens, e.CacheCreationInputTokens,
+		e.AuthTokenID, e.ClientIP, e.BaseURL, e.ServiceTier, e.ThinkingEffort,
+		e.InputTokens, e.OutputTokens, e.ReasoningTokens, e.CacheReadInputTokens, e.CacheCreationInputTokens,
 		e.Cache5mInputTokens, e.Cache1hInputTokens, e.Cost,
 		normalizeCostMultiplier(e.CostMultiplier),
 	}
@@ -356,8 +350,8 @@ func (s *SQLStore) ListLogs(ctx context.Context, since time.Time, limit, offset 
 	// 使用查询构建器构建复杂查询
 	// 消除 N+1：渠道过滤/名称解析用一次批量查询完成
 	baseQuery := `
-			SELECT id, time, model, actual_model, log_source, channel_id, status_code, message, duration, is_streaming, first_byte_time, api_key_used, api_key_hash, auth_token_id, client_ip, base_url, service_tier,
-				input_tokens, output_tokens, cache_read_input_tokens, cache_creation_input_tokens, cache_5m_input_tokens, cache_1h_input_tokens, cost, cost_multiplier
+			SELECT id, time, model, actual_model, log_source, channel_id, status_code, message, duration, is_streaming, first_byte_time, api_key_used, api_key_hash, auth_token_id, client_ip, base_url, service_tier, thinking_effort,
+				input_tokens, output_tokens, reasoning_tokens, cache_read_input_tokens, cache_creation_input_tokens, cache_5m_input_tokens, cache_1h_input_tokens, cost, cost_multiplier
 			FROM logs`
 
 	// time字段现在是BIGINT毫秒时间戳，需要转换为Unix毫秒进行比较
@@ -438,8 +432,8 @@ func (s *SQLStore) CountLogs(ctx context.Context, since time.Time, filter *model
 // ListLogsRange 查询指定时间范围内的日志（支持精确日期范围如"昨日"）
 func (s *SQLStore) ListLogsRange(ctx context.Context, since, until time.Time, limit, offset int, filter *model.LogFilter) ([]*model.LogEntry, error) {
 	baseQuery := `
-		SELECT id, time, model, actual_model, log_source, channel_id, status_code, message, duration, is_streaming, first_byte_time, api_key_used, api_key_hash, auth_token_id, client_ip, base_url, service_tier,
-			input_tokens, output_tokens, cache_read_input_tokens, cache_creation_input_tokens, cache_5m_input_tokens, cache_1h_input_tokens, cost, cost_multiplier
+		SELECT id, time, model, actual_model, log_source, channel_id, status_code, message, duration, is_streaming, first_byte_time, api_key_used, api_key_hash, auth_token_id, client_ip, base_url, service_tier, thinking_effort,
+			input_tokens, output_tokens, reasoning_tokens, cache_read_input_tokens, cache_creation_input_tokens, cache_5m_input_tokens, cache_1h_input_tokens, cost, cost_multiplier
 		FROM logs`
 
 	sinceMs := since.UnixMilli()
@@ -607,9 +601,9 @@ func (s *SQLStore) ListLogsRangeWithCount(ctx context.Context, since, until time
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
-		qb := NewQueryBuilder(`SELECT id, time, model, actual_model, log_source, channel_id, status_code, message, duration, is_streaming, first_byte_time, api_key_used, api_key_hash, auth_token_id, client_ip, base_url, service_tier,
-			input_tokens, output_tokens, cache_read_input_tokens, cache_creation_input_tokens, cache_5m_input_tokens, cache_1h_input_tokens, cost, cost_multiplier
-		FROM logs`).
+		qb := NewQueryBuilder(`SELECT id, time, model, actual_model, log_source, channel_id, status_code, message, duration, is_streaming, first_byte_time, api_key_used, api_key_hash, auth_token_id, client_ip, base_url, service_tier, thinking_effort,
+			input_tokens, output_tokens, reasoning_tokens, cache_read_input_tokens, cache_creation_input_tokens, cache_5m_input_tokens, cache_1h_input_tokens, cost, cost_multiplier
+			FROM logs`).
 			Where("time >= ?", sinceMs).
 			Where("time <= ?", untilMs)
 		applySharedConditions(qb)

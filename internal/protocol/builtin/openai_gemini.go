@@ -15,6 +15,7 @@ type openAIChatRequest struct {
 	Stream              util.FlexibleBool   `json:"stream"`
 	Tools               json.RawMessage     `json:"tools,omitempty"`
 	ToolChoice          json.RawMessage     `json:"tool_choice,omitempty"`
+	WebSearchOptions    json.RawMessage     `json:"web_search_options,omitempty"`
 	ParallelToolCalls   *bool               `json:"parallel_tool_calls,omitempty"`
 	Temperature         *float64            `json:"temperature,omitempty"`
 	TopP                *float64            `json:"top_p,omitempty"`
@@ -146,7 +147,7 @@ func convertOpenAIRequestToGemini(model string, rawJSON []byte, _ bool) ([]byte,
 	if err != nil {
 		return nil, err
 	}
-	return encodeGeminiRequest(conv)
+	return encodeGeminiRequestForModel(model, conv)
 }
 
 func convertGeminiRequestToOpenAI(model string, rawJSON []byte, stream bool) ([]byte, error) {

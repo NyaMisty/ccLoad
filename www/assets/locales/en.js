@@ -37,7 +37,7 @@ window.I18N_LOCALES['en'] = Object.assign(window.I18N_LOCALES['en'] || {}, {
   'www.home.features.token.title': 'Local Token Count',
   'www.home.features.token.desc': '<5ms response, 93%+ accuracy, count tokens without API calls',
   'www.home.features.protocol.title': 'Protocol Transform',
-  'www.home.features.protocol.desc': 'Transform between Anthropic/OpenAI/Gemini/Codex, preserving sampling and thinking params',
+  'www.home.features.protocol.desc': 'Transform between Anthropic/OpenAI/Gemini/Codex, preserving sampling, thinking and built-in search intent',
   'www.home.features.detection.title': 'Soft Error Detection',
   'www.home.features.detection.desc': 'Detect errors disguised as HTTP 200, identify rate-limit markers in SSE streams',
   'www.home.features.proxy.title': 'Per-channel Proxy',
@@ -46,6 +46,8 @@ window.I18N_LOCALES['en'] = Object.assign(window.I18N_LOCALES['en'] || {}, {
   'www.home.features.dns.desc': 'Pin broken upstream hostnames to fixed IPs while preserving TLS SNI, certificates and Host headers',
   'www.home.features.quota.title': 'Quota-aware Cooldown',
   'www.home.features.quota.desc': 'Understand provider fixed-window quota responses and cool down the channel until the real reset time',
+  'www.home.features.autoupdate.title': 'Auto Updates',
+  'www.home.features.autoupdate.desc': 'Check for new releases every 12 hours by default, with the interval configurable from admin settings',
 
   // Home - Admin preview
   'www.home.admin.title': 'Not a black-box proxy',

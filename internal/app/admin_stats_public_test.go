@@ -7,7 +7,6 @@ import (
 	"time"
 
 	"ccLoad/internal/model"
-	"ccLoad/internal/util"
 	"ccLoad/internal/version"
 )
 
@@ -187,41 +186,6 @@ func TestAdminStats_PublicAndCooldownEndpoints(t *testing.T) {
 		}
 	})
 
-	t.Run("HandleCooldownStats", func(t *testing.T) {
-		until := time.Now().Add(2 * time.Minute)
-		if err := store.SetChannelCooldown(ctx, anth.ID, until); err != nil {
-			t.Fatalf("SetChannelCooldown failed: %v", err)
-		}
-		// Key 冷却写在 api_keys 表上，必须先有 Key 记录
-		if err := store.CreateAPIKeysBatch(ctx, []*model.APIKey{
-			{ChannelID: anth.ID, KeyIndex: 0, APIKey: "k0", KeyStrategy: model.KeyStrategySequential},
-		}); err != nil {
-			t.Fatalf("CreateAPIKeysBatch failed: %v", err)
-		}
-		if err := store.SetKeyCooldown(ctx, anth.ID, 0, until); err != nil {
-			t.Fatalf("SetKeyCooldown failed: %v", err)
-		}
-
-		c, w := newTestContext(t, newRequest(http.MethodGet, "/admin/cooldown/stats", nil))
-
-		server.HandleCooldownStats(c)
-		if w.Code != http.StatusOK {
-			t.Fatalf("status=%d, want %d, body=%s", w.Code, http.StatusOK, w.Body.String())
-		}
-
-		var resp struct {
-			Success bool `json:"success"`
-			Data    struct {
-				ChannelCooldowns int `json:"channel_cooldowns"`
-				KeyCooldowns     int `json:"key_cooldowns"`
-			} `json:"data"`
-		}
-		mustUnmarshalJSON(t, w.Body.Bytes(), &resp)
-		if !resp.Success || resp.Data.ChannelCooldowns != 1 || resp.Data.KeyCooldowns != 1 {
-			t.Fatalf("unexpected cooldown stats: %+v", resp)
-		}
-	})
-
 	t.Run("HandleGetChannelTypes", func(t *testing.T) {
 		c, w := newTestContext(t, newRequest(http.MethodGet, "/public/channel-types", nil))
 
@@ -236,12 +200,26 @@ func TestAdminStats_PublicAndCooldownEndpoints(t *testing.T) {
 		}
 
 		var resp struct {
-			Success bool                     `json:"success"`
-			Data    []util.ChannelTypeConfig `json:"data"`
+			Success bool             `json:"success"`
+			Data    []map[string]any `json:"data"`
 		}
 		mustUnmarshalJSON(t, w.Body.Bytes(), &resp)
 		if !resp.Success || len(resp.Data) == 0 {
 			t.Fatalf("unexpected channel types resp: %+v", resp)
+		}
+		for _, channelType := range resp.Data {
+			for _, field := range []string{"value", "display_name", "description"} {
+				value, ok := channelType[field].(string)
+				if !ok || value == "" {
+					t.Fatalf("channel type missing %s: %#v", field, channelType)
+				}
+			}
+			if _, ok := channelType["path_patterns"]; ok {
+				t.Fatalf("channel type leaked legacy path_patterns: %#v", channelType)
+			}
+			if _, ok := channelType["match_type"]; ok {
+				t.Fatalf("channel type leaked legacy match_type: %#v", channelType)
+			}
 		}
 	})
 

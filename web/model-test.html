@@ -18,10 +18,14 @@
   <script defer src="/web/assets/js/i18n.js?v=__VERSION__"></script>
   <script defer src="/web/assets/js/template-engine.js?v=__VERSION__"></script>
   <script defer src="/web/assets/js/ui.js?v=__VERSION__"></script>
-  <script defer src="/web/assets/js/sse-merge.js?v=__VERSION__"></script>
+  <script defer src="/web/assets/js/markdown-renderer.js?v=__VERSION__"></script>
+  <script defer src="/web/assets/js/merged-response-client.js?v=__VERSION__"></script>
+  <script defer src="/web/assets/js/upstream-detail-modal.js?v=__VERSION__"></script>
+  <script defer src="/web/assets/js/model-test-advanced-options.js?v=__VERSION__"></script>
   <script defer src="/web/assets/js/model-test.js?v=__VERSION__"></script>
   <script defer src="/web/assets/js/logs-channel-editor.js?v=__VERSION__"></script>
   <script src="/web/assets/js/marked.min.js?v=__VERSION__"></script>
+  <script src="/web/assets/js/purify.min.js?v=__VERSION__"></script>
   <script src="/web/assets/js/highlight.min.js?v=__VERSION__"></script>
 </head>
 <body>
@@ -84,6 +88,7 @@
               <input type="checkbox" id="chatStreamEnabled" class="control-checkbox control-checkbox--sm" checked>
               <span class="chat-control__label" data-i18n="modelTest.stream">流式</span>
             </label>
+            <button id="chatAdvancedOptionsBtn" type="button" class="btn btn-secondary chat-advanced-trigger" data-action="open-chat-advanced-options" data-i18n="modelTest.chat.advanced">高级</button>
             <div id="chatExportDropdown" class="chat-export-dropdown">
               <button id="chatExportTrigger" type="button" class="btn btn-secondary chat-export-trigger" data-action="toggle-chat-export-menu" aria-haspopup="true" aria-expanded="false">
                 <svg class="chat-export-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
@@ -131,23 +136,33 @@
                 </div>
               </label>
               <div id="protocolTransformContainer" class="model-test-control model-test-control--protocol">
-                <span class="model-test-control__label" data-i18n="modelTest.protocolTransform">协议转换</span>
-                <div id="protocolTransformOptions" class="channel-editor-radio-group" role="radiogroup" aria-label="协议转换"></div>
+                <span class="model-test-control__label" data-i18n="modelTest.protocolTransform">协议</span>
+                <div id="protocolTransformOptions" class="channel-editor-radio-group" role="radiogroup" aria-label="协议"></div>
               </div>
-              <div class="model-test-toolbar-toggles">
-                <label class="model-test-toggle">
-                  <input type="checkbox" id="streamEnabled" class="control-checkbox control-checkbox--sm">
-                  <span data-i18n="modelTest.stream">流式</span>
-                </label>
-                <label class="model-test-toggle">
-                  <span data-i18n="modelTest.concurrency">并发</span>
-                  <input type="number" id="concurrency" value="5" min="1" max="20" class="model-test-concurrency-input">
-                </label>
+              <div class="model-test-control model-test-control--content">
+                <label class="model-test-control__label" for="modelTestContent" data-i18n="modelTest.content">内容</label>
+                <div class="model-test-content-row">
+                  <input type="text" id="modelTestContent" value="" class="model-test-inline-input" data-i18n-placeholder="common.loading" placeholder="加载中...">
+                </div>
               </div>
-              <label class="model-test-control model-test-control--content">
-                <span class="model-test-control__label" data-i18n="modelTest.content">内容</span>
-                <input type="text" id="modelTestContent" value="" class="model-test-inline-input" data-i18n-placeholder="common.loading" placeholder="加载中...">
-              </label>
+              <div class="model-test-run-controls">
+                <div class="model-test-toolbar-toggles">
+                  <label class="model-test-toggle">
+                    <input type="checkbox" id="streamEnabled" class="control-checkbox control-checkbox--sm">
+                    <span data-i18n="modelTest.stream">流式</span>
+                  </label>
+                  <label class="model-test-toggle">
+                    <span data-i18n="modelTest.concurrency">并发</span>
+                    <input type="number" id="concurrency" value="5" min="1" max="20" class="model-test-concurrency-input">
+                  </label>
+                </div>
+                <div class="model-test-toolbar-section model-test-toolbar-section--actions model-test-content-actions">
+                  <button id="fetchModelsBtn" type="button" data-action="fetch-and-add-models" class="btn btn-secondary model-test-toolbar-btn" data-i18n="modelTest.fetchModels">获取模型</button>
+                  <button id="addModelsBtn" type="button" data-action="open-add-models-modal" class="btn btn-secondary model-test-toolbar-btn hidden" data-i18n="modelTest.addModels">添加模型</button>
+                  <button id="deleteModelsBtn" type="button" data-action="delete-selected-models" class="btn btn-secondary model-test-toolbar-btn model-test-toolbar-btn--danger" data-i18n="modelTest.deleteModels">删除模型</button>
+                  <button id="runTestBtn" type="button" data-action="run-model-tests" class="btn btn-primary model-test-toolbar-btn" data-i18n="modelTest.startTest">开始测试</button>
+                </div>
+              </div>
             </div>
             <div class="model-test-toolbar-section model-test-toolbar-section--meta">
               <label class="model-test-control model-test-control--name-filter">
@@ -177,12 +192,6 @@
                     <div class="model-test-response-head-inner">
                       <div class="model-test-response-head-line">
                         <span class="model-test-response-head-label" data-i18n="modelTest.responseContent">响应内容</span>
-                      </div>
-                      <div class="model-test-toolbar-section model-test-toolbar-section--actions model-test-head-actions">
-                        <button id="fetchModelsBtn" type="button" data-action="fetch-and-add-models" class="btn btn-secondary model-test-toolbar-btn" data-i18n="modelTest.fetchModels">获取模型</button>
-                        <button id="addModelsBtn" type="button" data-action="open-add-models-modal" class="btn btn-secondary model-test-toolbar-btn hidden" data-i18n="modelTest.addModels">添加模型</button>
-                        <button id="deleteModelsBtn" type="button" data-action="delete-selected-models" class="btn btn-secondary model-test-toolbar-btn model-test-toolbar-btn--danger" data-i18n="modelTest.deleteModels">删除模型</button>
-                        <button id="runTestBtn" type="button" data-action="run-model-tests" class="btn btn-primary model-test-toolbar-btn" data-i18n="modelTest.startTest">开始测试</button>
                       </div>
                     </div>
                   </th>
@@ -216,6 +225,7 @@
                   class="chat-tool-toggle chat-image-upload-btn"
                   data-action="select-chat-image"
                   data-i18n-title="modelTest.chat.uploadImage"
+                  data-i18n-aria-label="modelTest.chat.uploadImage"
                   title="上传图片"
                   aria-label="上传图片"
                 >
@@ -274,6 +284,49 @@
     </main>
   </div>
 
+  <!-- 对话高级选项弹窗 -->
+  <div id="chatAdvancedOptionsModal" class="modal">
+    <div class="modal-content modal-content--md chat-advanced-modal-content">
+      <div class="modal-header modal-header--compact">
+        <h2 class="modal-title" data-i18n="modelTest.chat.advancedTitle">高级选项</h2>
+        <button type="button" class="close-btn" data-action="close-chat-advanced-options" aria-label="Close">&times;</button>
+      </div>
+      <div class="chat-advanced-form">
+        <label class="chat-advanced-field chat-advanced-field--full">
+          <span class="chat-advanced-label" data-i18n="modelTest.chat.systemPrompt">提示词</span>
+          <textarea
+            id="chatAdvancedSystemPrompt"
+            class="chat-advanced-textarea"
+            rows="4"
+            spellcheck="false"
+            data-i18n-placeholder="modelTest.chat.systemPromptPlaceholder"
+            placeholder="追加到协议模板提示词后"
+          ></textarea>
+        </label>
+        <label class="chat-advanced-field">
+          <span class="chat-advanced-label" data-i18n="modelTest.chat.temperature">模型温度</span>
+          <input id="chatAdvancedTemperature" type="number" min="0" max="2" step="0.01" class="form-input chat-advanced-input" data-i18n-placeholder="modelTest.chat.emptyDefault" placeholder="留空使用默认">
+        </label>
+        <label class="chat-advanced-field">
+          <span class="chat-advanced-label" data-i18n="modelTest.chat.topP">Top-P</span>
+          <input id="chatAdvancedTopP" type="number" min="0" max="1" step="0.01" class="form-input chat-advanced-input" data-i18n-placeholder="modelTest.chat.emptyDefault" placeholder="留空使用默认">
+        </label>
+        <label class="chat-advanced-field">
+          <span class="chat-advanced-label" data-i18n="modelTest.chat.contextMessages">上下文数量</span>
+          <input id="chatAdvancedContextMessages" type="number" min="0" step="1" class="form-input chat-advanced-input" data-i18n-placeholder="modelTest.chat.contextMessagesPlaceholder" placeholder="0 或留空表示不限">
+        </label>
+        <label class="chat-advanced-field">
+          <span class="chat-advanced-label" data-i18n="modelTest.chat.maxTokens">最大 Token 数</span>
+          <input id="chatAdvancedMaxTokens" type="number" min="1" step="1" class="form-input chat-advanced-input" data-i18n-placeholder="modelTest.chat.emptyDefault" placeholder="留空使用默认">
+        </label>
+      </div>
+      <div class="confirm-actions confirm-actions--end">
+        <button type="button" class="btn btn-secondary" data-action="close-chat-advanced-options" data-i18n="common.cancel">取消</button>
+        <button type="button" class="btn btn-primary" data-action="save-chat-advanced-options" data-i18n="common.save">保存</button>
+      </div>
+    </div>
+  </div>
+
   <!-- 模型行模板 -->
   <template id="tpl-model-row">
     <tr class="mobile-card-row model-test-row" data-model="{{model}}" data-channel-id="{{channelId}}" data-cost-multiplier="{{costMultiplier}}">
@@ -324,24 +377,21 @@
     <div class="modal-content upstream-detail-modal-content">
       <div class="modal-header">
         <h2 class="modal-title" data-i18n="channels.test.upstreamDetail">上游请求/响应详情</h2>
-        <button type="button" class="close-btn" onclick="closeUpstreamDetailModal()">&times;</button>
+        <button type="button" class="close-btn" data-action="close-upstream-detail">&times;</button>
       </div>
       <div class="upstream-detail-tabs">
         <button type="button" class="upstream-tab active" data-tab="request" data-i18n="channels.test.tabRequest">Request</button>
         <button type="button" class="upstream-tab" data-tab="response" data-i18n="channels.test.tabResponse">Response</button>
+        <button type="button" id="upstreamWrapBtn" class="upstream-copy-btn upstream-wrap-btn active" data-action="toggle-upstream-wrap" data-i18n="logs.debugWrap" aria-pressed="true">换行</button>
         <button type="button" class="upstream-copy-btn upstream-copy-btn--tabs" data-copy-target="upstreamReqRaw" data-i18n="common.copy">复制</button>
         <button type="button" id="upstreamMergeBtn" class="upstream-copy-btn upstream-merge-btn" data-action="merge-upstream-response" data-i18n="logs.debugMerge" aria-pressed="false" hidden>合并</button>
       </div>
       <div id="upstreamTabRequest" class="upstream-tab-panel active">
-        <div class="upstream-field upstream-field--full">
-          <pre id="upstreamReqRaw" class="upstream-pre upstream-pre--full"></pre>
-        </div>
+        <pre id="upstreamReqRaw" class="upstream-pre upstream-pre--full"></pre>
       </div>
       <div id="upstreamTabResponse" class="upstream-tab-panel">
-        <div class="upstream-field upstream-field--full">
-          <pre id="upstreamRespRaw" class="upstream-pre upstream-pre--full"></pre>
-          <pre id="upstreamRespMerged" class="upstream-pre upstream-pre--full" hidden></pre>
-        </div>
+        <pre id="upstreamRespRaw" class="upstream-pre upstream-pre--full"></pre>
+        <div id="upstreamRespMerged" class="upstream-merged-markdown upstream-pre--full" hidden><div class="chat-message chat-message--assistant"><div class="chat-message-content"></div></div></div>
       </div>
     </div>
   </div>

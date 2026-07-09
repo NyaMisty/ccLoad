@@ -87,6 +87,7 @@ type fwResult struct {
 	// Token统计（2025-11新增，从SSE响应中提取）
 	InputTokens              int
 	OutputTokens             int
+	ReasoningTokens          int
 	CacheReadInputTokens     int
 	CacheCreationInputTokens int // 5m+1h缓存总和（兼容字段）
 	Cache5mInputTokens       int // 5分钟缓存写入Token数（新增2025-12）
@@ -115,6 +116,9 @@ type fwResult struct {
 	// OpenAI service_tier（2026-03新增）
 	// 响应中的 service_tier 字段决定计费倍率：priority=2x, flex=0.5x, default=1x
 	ServiceTier string
+
+	// ThinkingEffort 记录请求或上游响应声明的思考等级；上游响应非空时覆盖请求值。
+	ThinkingEffort string
 
 	// Debug日志数据（debug开启时填充，传递到日志写入管道）
 	DebugData *model.DebugLogEntry
@@ -149,6 +153,7 @@ type proxyRequestContext struct {
 	attemptIndex     int                  // 全局尝试次数计数器（每次尝试递增，用于前端显示）
 	baseURL          string               // 当前尝试使用的上游URL（多URL场景）
 	debugData        *model.DebugLogEntry // Debug日志数据（debug开启时填充）
+	thinkingEffort   string
 }
 
 // proxyResult 代理请求结果
@@ -314,21 +319,15 @@ func copyRequestHeaders(dst *http.Request, src http.Header) {
 	}
 }
 
-// injectAPIKeyHeaders 按路径类型注入API Key头（Gemini vs Claude）
+// injectAPIKeyHeaders 按运行时上游协议注入 API Key 头。
 // 参数简化：直接接受API Key字符串，由调用方从KeySelector获取
-func injectAPIKeyHeaders(req *http.Request, apiKey string, requestPath string) {
-	// 根据API类型设置不同的认证头（使用统一的渠道类型检测）
-	channelType := util.DetectChannelTypeFromPath(requestPath)
-
-	switch channelType {
+func injectAPIKeyHeaders(req *http.Request, apiKey string, upstreamProtocol string) {
+	switch strings.TrimSpace(strings.ToLower(upstreamProtocol)) {
 	case util.ChannelTypeGemini:
 		// Gemini API: 仅使用 x-goog-api-key
 		req.Header.Set("x-goog-api-key", apiKey)
-	case util.ChannelTypeOpenAI:
-		// OpenAI API: 仅使用 Authorization Bearer
-		req.Header.Set("Authorization", "Bearer "+apiKey)
 	default:
-		// Claude/Anthropic/Codex API: 同时设置两个头
+		// OpenAI/Claude/Anthropic/Codex API: 同时设置两个头
 		req.Header.Set("x-api-key", apiKey)
 		req.Header.Set("Authorization", "Bearer "+apiKey)
 	}
@@ -378,17 +377,16 @@ func ensureAnthropicVersionHeader(req *http.Request, upstreamType string) {
 	}
 }
 
-// maybeInjectAnyrouterAdaptiveThinking 为 anyrouter 渠道的 /v1/messages 请求注入 adaptive thinking。
-// Why: anyrouter 在上游侧要求显式声明 thinking.type=adaptive 才能启用自适应思考，缺失时行为不可预期。
-// How to apply: 仅对 Anthropic 渠道、名称含 anyrouter、路径为 /v1/messages 且 body 尚未声明 thinking 时生效。
-func maybeInjectAnyrouterAdaptiveThinking(cfg *model.Config, requestPath string, body []byte) []byte {
+// normalizeAnyrouterAdaptiveThinking 为 anyrouter 的 Anthropic /v1/messages 请求补齐 adaptive thinking。
+// 自动注入只针对 anyrouter；普通 Anthropic 渠道不做兜底改写。
+func normalizeAnyrouterAdaptiveThinking(cfg *model.Config, requestPath string, body []byte) []byte {
 	if len(body) == 0 || cfg == nil {
 		return body
 	}
 	if cfg.GetChannelType() != util.ChannelTypeAnthropic {
 		return body
 	}
-	if !strings.Contains(strings.ToLower(cfg.Name), "anyrouter") {
+	if !isAnyrouterChannel(cfg) {
 		return body
 	}
 	if requestPath != "/v1/messages" {
@@ -398,15 +396,67 @@ func maybeInjectAnyrouterAdaptiveThinking(cfg *model.Config, requestPath string,
 	if err := sonic.Unmarshal(body, &obj); err != nil {
 		return body
 	}
-	if _, ok := obj["thinking"]; ok {
-		return body
+	thinking, hasThinking := obj["thinking"]
+	if hasThinking {
+		thinkMap, ok := thinking.(map[string]any)
+		if !ok {
+			return body
+		}
+		typ, _ := thinkMap["type"].(string)
+		if typ != "enabled" {
+			return body
+		}
+		effort := "high"
+		if budget, ok := thinkMap["budget_tokens"].(float64); ok && budget > 0 {
+			effort = anthropicBudgetToEffort(int(budget))
+		}
+		obj["thinking"] = map[string]string{"type": "adaptive"}
+		setAnthropicOutputEffort(obj, effort)
+	} else {
+		obj["thinking"] = map[string]string{"type": "adaptive"}
+		setAnthropicOutputEffort(obj, "high")
 	}
-	obj["thinking"] = map[string]string{"type": "adaptive"}
 	newBody, err := sonic.Marshal(obj)
 	if err != nil {
 		return body
 	}
 	return newBody
+}
+
+func isAnyrouterChannel(cfg *model.Config) bool {
+	if cfg == nil {
+		return false
+	}
+	haystack := strings.ToLower(cfg.Name + "\n" + cfg.URL)
+	return strings.Contains(haystack, "anyrouter")
+}
+
+func setAnthropicOutputEffort(obj map[string]any, effort string) {
+	if effort == "" {
+		return
+	}
+	outputConfig, _ := obj["output_config"].(map[string]any)
+	if outputConfig == nil {
+		outputConfig = map[string]any{}
+		obj["output_config"] = outputConfig
+	}
+	if _, exists := outputConfig["effort"]; !exists {
+		outputConfig["effort"] = effort
+	}
+}
+
+// anthropicBudgetToEffort 把旧 Anthropic budget_tokens 映射成 output_config.effort 档位。
+func anthropicBudgetToEffort(budget int) string {
+	switch {
+	case budget >= 16384:
+		return "high"
+	case budget >= 4096:
+		return "medium"
+	case budget > 0:
+		return "low"
+	default:
+		return "medium"
+	}
 }
 
 // filterAndWriteResponseHeaders 过滤并写回响应头（DRY）
@@ -666,6 +716,92 @@ func isAnthropicBillingHeaderSystemBlock(raw json.RawMessage) bool {
 // 日志和字符串处理工具函数
 // ============================================================================
 
+func normalizeThinkingEffort(value string) string {
+	return strings.ToLower(strings.TrimSpace(value))
+}
+
+func extractThinkingEffortFromJSON(body []byte) string {
+	if len(body) == 0 {
+		return ""
+	}
+	var payload map[string]any
+	if err := sonic.Unmarshal(body, &payload); err != nil {
+		return ""
+	}
+	return extractThinkingEffortFromPayload(payload)
+}
+
+func extractThinkingEffortFromPayload(payload map[string]any) string {
+	if payload == nil {
+		return ""
+	}
+
+	if response, ok := payload["response"].(map[string]any); ok {
+		if effort := extractThinkingEffortFromPayload(response); effort != "" {
+			return effort
+		}
+	}
+	if message, ok := payload["message"].(map[string]any); ok {
+		if effort := extractThinkingEffortFromPayload(message); effort != "" {
+			return effort
+		}
+	}
+
+	for _, key := range []string{"reasoning_effort", "thinking_effort", "thinkingLevel", "thinking_level"} {
+		if effort := stringMapValue(payload, key); effort != "" {
+			return normalizeThinkingEffort(effort)
+		}
+	}
+
+	if reasoning, ok := payload["reasoning"].(map[string]any); ok {
+		if effort := firstStringMapValue(reasoning, "effort", "level", "thinkingLevel", "thinking_level", "type"); effort != "" {
+			return normalizeThinkingEffort(effort)
+		}
+	}
+
+	if outputConfig, ok := payload["output_config"].(map[string]any); ok {
+		if effort := firstStringMapValue(outputConfig, "effort", "level", "thinkingLevel", "thinking_level", "type"); effort != "" {
+			return normalizeThinkingEffort(effort)
+		}
+	}
+
+	if thinkingConfig, ok := payload["thinkingConfig"].(map[string]any); ok {
+		if effort := firstStringMapValue(thinkingConfig, "thinkingLevel", "thinking_level", "effort", "level"); effort != "" {
+			return normalizeThinkingEffort(effort)
+		}
+	}
+	if generationConfig, ok := payload["generationConfig"].(map[string]any); ok {
+		if effort := extractThinkingEffortFromPayload(generationConfig); effort != "" {
+			return effort
+		}
+	}
+
+	if thinking, ok := payload["thinking"].(map[string]any); ok {
+		if effort := firstStringMapValue(thinking, "effort", "level", "thinkingLevel", "thinking_level", "type"); effort != "" {
+			return normalizeThinkingEffort(effort)
+		}
+	}
+
+	return ""
+}
+
+func firstStringMapValue(values map[string]any, keys ...string) string {
+	for _, key := range keys {
+		if value := stringMapValue(values, key); value != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+func stringMapValue(values map[string]any, key string) string {
+	value, ok := values[key].(string)
+	if !ok {
+		return ""
+	}
+	return strings.TrimSpace(value)
+}
+
 // logEntryParams 日志条目构建参数（避免多个 string 参数顺序混淆）
 type logEntryParams struct {
 	RequestModel   string // 客户端请求的原始模型名称
@@ -685,6 +821,7 @@ type logEntryParams struct {
 	CostMultiplier float64              // 渠道成本倍率快照（0=免费，<0 视为 1）
 	AttemptIndex   int32                // 重试尝试次数（1-based，全局累计；瞬态，不持久化）
 	RequestID      int64                // 所属请求链 ID（activeReqID；瞬态，仅用于缓存关联）
+	ThinkingEffort string
 }
 
 // buildLogEntry 构建日志条目（消除重复代码，遵循DRY原则）
@@ -706,6 +843,7 @@ func buildLogEntry(p logEntryParams) *model.LogEntry {
 		ClientIP:    p.ClientIP,
 		BaseURL:     p.BaseURL,
 	}
+	entry.ThinkingEffort = normalizeThinkingEffort(p.ThinkingEffort)
 
 	// 成本倍率快照：0 表示免费渠道；负数兜底为 1（保护存量数据）
 	if p.CostMultiplier >= 0 {
@@ -763,6 +901,7 @@ func buildLogEntry(p logEntryParams) *model.LogEntry {
 		// Token统计（2025-11新增，从SSE响应中提取）
 		entry.InputTokens = res.InputTokens
 		entry.OutputTokens = res.OutputTokens
+		entry.ReasoningTokens = res.ReasoningTokens
 		entry.CacheReadInputTokens = res.CacheReadInputTokens
 		entry.CacheCreationInputTokens = res.CacheCreationInputTokens
 		entry.Cache5mInputTokens = res.Cache5mInputTokens
@@ -780,6 +919,11 @@ func buildLogEntry(p logEntryParams) *model.LogEntry {
 		entry.Message = "unknown"
 	}
 
+	if p.Result != nil {
+		if effort := normalizeThinkingEffort(p.Result.ThinkingEffort); effort != "" {
+			entry.ThinkingEffort = effort
+		}
+	}
 	entry.DebugData = p.DebugData
 	entry.AttemptIndex = p.AttemptIndex
 	entry.RequestID = p.RequestID

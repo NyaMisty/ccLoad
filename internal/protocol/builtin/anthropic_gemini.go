@@ -21,6 +21,7 @@ type anthropicMessagesRequest struct {
 	MaxTokens     int                       `json:"max_tokens"`
 	Metadata      map[string]string         `json:"metadata"`
 	Thinking      *anthropicThinkingConfig  `json:"thinking,omitempty"`
+	OutputConfig  *anthropicOutputConfig    `json:"output_config,omitempty"`
 	Temperature   *float64                  `json:"temperature,omitempty"`
 	TopP          *float64                  `json:"top_p,omitempty"`
 	TopK          *int                      `json:"top_k,omitempty"`
@@ -30,6 +31,11 @@ type anthropicMessagesRequest struct {
 type anthropicThinkingConfig struct {
 	Type         string `json:"type,omitempty"`
 	BudgetTokens int    `json:"budget_tokens,omitempty"`
+	Effort       string `json:"-"`
+}
+
+type anthropicOutputConfig struct {
+	Effort string `json:"effort,omitempty"`
 }
 
 type anthropicMessageContent struct {
@@ -88,7 +94,7 @@ type anthropicToGeminiStreamState struct {
 	blockIgnored   bool // for redacted_thinking and future block types that should be silently ignored
 }
 
-func convertAnthropicRequestToGemini(_ string, rawJSON []byte, _ bool) ([]byte, error) {
+func convertAnthropicRequestToGemini(model string, rawJSON []byte, _ bool) ([]byte, error) {
 	var req anthropicMessagesRequest
 	if err := sonic.Unmarshal(rawJSON, &req); err != nil {
 		return nil, err
@@ -98,7 +104,7 @@ func convertAnthropicRequestToGemini(_ string, rawJSON []byte, _ bool) ([]byte, 
 	if err != nil {
 		return nil, err
 	}
-	return encodeGeminiRequest(conv)
+	return encodeGeminiRequestForModel(model, conv)
 }
 
 func convertGeminiRequestToAnthropic(model string, rawJSON []byte, stream bool) ([]byte, error) {

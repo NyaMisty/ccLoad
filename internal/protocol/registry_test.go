@@ -58,6 +58,65 @@ func TestRegistry_TranslateRequest_AnthropicToGemini(t *testing.T) {
 	}
 }
 
+func TestRegistry_TranslateRequest_AnthropicToGemini3_UsesThinkingLevel(t *testing.T) {
+	reg := protocol.NewRegistry()
+	builtin.Register(reg)
+
+	raw := []byte(`{
+		"model":"gpt-5",
+		"messages":[{"role":"user","content":[{"type":"text","text":"think hard"}]}],
+		"thinking":{"type":"adaptive","display":"summarized"},
+		"output_config":{"effort":"max"}
+	}`)
+	got, err := reg.TranslateRequest(protocol.Anthropic, protocol.Gemini, "gemini-3.5-flash", raw, true)
+	if err != nil {
+		t.Fatalf("TranslateRequest failed: %v", err)
+	}
+	var body map[string]any
+	if err := json.Unmarshal(got, &body); err != nil {
+		t.Fatalf("unmarshal translated request failed: %v", err)
+	}
+	generationConfig, ok := body["generationConfig"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected generationConfig, got: %s", got)
+	}
+	thinkingConfig, ok := generationConfig["thinkingConfig"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected thinkingConfig, got: %s", got)
+	}
+	if thinkingConfig["thinkingLevel"] != "high" {
+		t.Fatalf("thinkingLevel=%v, want high; body=%s", thinkingConfig["thinkingLevel"], got)
+	}
+	if _, ok := thinkingConfig["thinkingBudget"]; ok {
+		t.Fatalf("Gemini 3 thinkingConfig must not include thinkingBudget: %s", got)
+	}
+	if thinkingConfig["includeThoughts"] != true {
+		t.Fatalf("expected includeThoughts=true, body=%s", got)
+	}
+}
+
+func TestRegistry_TranslateRequest_OpenAIToAnthropic_MapsXHighToClaudeMax(t *testing.T) {
+	reg := protocol.NewRegistry()
+	builtin.Register(reg)
+
+	raw := []byte(`{"model":"gpt-5.5","messages":[{"role":"user","content":"think hard"}],"reasoning_effort":"xhigh"}`)
+	got, err := reg.TranslateRequest(protocol.OpenAI, protocol.Anthropic, "claude-sonnet-4-6", raw, true)
+	if err != nil {
+		t.Fatalf("TranslateRequest failed: %v", err)
+	}
+	var body map[string]any
+	if err := json.Unmarshal(got, &body); err != nil {
+		t.Fatalf("unmarshal translated request failed: %v", err)
+	}
+	outputConfig, ok := body["output_config"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected output_config, got: %s", got)
+	}
+	if outputConfig["effort"] != "max" {
+		t.Fatalf("output_config.effort=%v, want max; body=%s", outputConfig["effort"], got)
+	}
+}
+
 func TestRegistry_TranslateResponseNonStream_GeminiToAnthropic(t *testing.T) {
 	reg := protocol.NewRegistry()
 	builtin.Register(reg)
@@ -858,30 +917,19 @@ func TestRegistry_TranslateResponseNonStream_OpenAIToAnthropic(t *testing.T) {
 }
 
 func TestRegistry_TranslateResponseStream_OpenAIToAnthropic(t *testing.T) {
-	reg := protocol.NewRegistry()
-	builtin.Register(reg)
-
 	rawReq := []byte(`{"model":"gpt-4o","messages":[{"role":"user","content":[{"type":"text","text":"hello"}]}],"stream":true}`)
 	translatedReq := []byte(`{"model":"gpt-4o","messages":[{"role":"user","content":"hello"}],"stream":true}`)
 
-	var state any
-	chunks, err := reg.TranslateResponseStream(context.Background(), protocol.OpenAI, protocol.Anthropic, "gpt-4o", rawReq, translatedReq, []byte("data: {\"id\":\"chatcmpl_1\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hello\"},\"finish_reason\":null}]}\n\n"), &state)
-	if err != nil {
-		t.Fatalf("TranslateResponseStream failed: %v", err)
-	}
-	joined := string(bytes.Join(chunks, nil))
-	if !strings.Contains(joined, "event: message_start") || !strings.Contains(joined, "event: content_block_delta") || !strings.Contains(joined, `"text":"hello"`) {
-		t.Fatalf("unexpected translated stream chunks: %#v", chunks)
-	}
-
-	done, err := reg.TranslateResponseStream(context.Background(), protocol.OpenAI, protocol.Anthropic, "gpt-4o", rawReq, translatedReq, []byte("data: [DONE]\n\n"), &state)
-	if err != nil {
-		t.Fatalf("TranslateResponseStream done failed: %v", err)
-	}
-	doneJoined := string(bytes.Join(done, nil))
-	if !strings.Contains(doneJoined, "event: message_delta") || !strings.Contains(doneJoined, "event: message_stop") {
-		t.Fatalf("unexpected anthropic done chunks: %#v", done)
-	}
+	assertAnthropicStreamTextTranslation(
+		t,
+		protocol.OpenAI,
+		"gpt-4o",
+		rawReq,
+		translatedReq,
+		"data: {\"id\":\"chatcmpl_1\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hello\"},\"finish_reason\":null}]}\n\n",
+		"data: [DONE]\n\n",
+		"hello",
+	)
 }
 
 func TestRegistry_TranslateResponseStream_OpenAIToAnthropic_EventHeaderAndResponsesEvents(t *testing.T) {
@@ -899,19 +947,7 @@ func TestRegistry_TranslateResponseStream_OpenAIToAnthropic_EventHeaderAndRespon
 			"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"model\":\"gpt-5.5\",\"usage\":{\"input_tokens\":3,\"output_tokens\":5,\"total_tokens\":8}}}\n\n",
 	}
 
-	var state any
-	var allOutput bytes.Buffer
-	for _, chunk := range chunks {
-		out, err := reg.TranslateResponseStream(context.Background(), protocol.OpenAI, protocol.Anthropic, "gpt-5.5", nil, nil, []byte(chunk), &state)
-		if err != nil {
-			t.Fatalf("TranslateResponseStream failed: %v", err)
-		}
-		for _, b := range out {
-			allOutput.Write(b)
-		}
-	}
-
-	result := allOutput.String()
+	result := translateResponseStreamChunks(t, reg, protocol.OpenAI, protocol.Anthropic, "gpt-5.5", chunks...)
 	if !strings.Contains(result, `"text":"hello"`) {
 		t.Fatalf("expected responses text delta in Anthropic output, got:\n%s", result)
 	}
@@ -1153,30 +1189,19 @@ func TestRegistry_TranslateResponseNonStream_CodexToGemini_StringArguments(t *te
 }
 
 func TestRegistry_TranslateResponseStream_CodexToAnthropic(t *testing.T) {
-	reg := protocol.NewRegistry()
-	builtin.Register(reg)
-
 	rawReq := []byte(`{"model":"gpt-5-codex","messages":[{"role":"user","content":[{"type":"text","text":"hello"}]}],"stream":true}`)
 	translatedReq := []byte(`{"model":"gpt-5-codex","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]}],"stream":true}`)
 
-	var state any
-	chunks, err := reg.TranslateResponseStream(context.Background(), protocol.Codex, protocol.Anthropic, "gpt-5-codex", rawReq, translatedReq, []byte("event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"hello\"}\n\n"), &state)
-	if err != nil {
-		t.Fatalf("TranslateResponseStream failed: %v", err)
-	}
-	joined := string(bytes.Join(chunks, nil))
-	if !strings.Contains(joined, "event: message_start") || !strings.Contains(joined, "event: content_block_delta") || !strings.Contains(joined, `"text":"hello"`) {
-		t.Fatalf("unexpected translated stream chunks: %#v", chunks)
-	}
-
-	done, err := reg.TranslateResponseStream(context.Background(), protocol.Codex, protocol.Anthropic, "gpt-5-codex", rawReq, translatedReq, []byte("event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"model\":\"gpt-5-codex\",\"status\":\"completed\",\"usage\":{\"input_tokens\":3,\"output_tokens\":5,\"total_tokens\":8}}}\n\n"), &state)
-	if err != nil {
-		t.Fatalf("TranslateResponseStream done failed: %v", err)
-	}
-	doneJoined := string(bytes.Join(done, nil))
-	if !strings.Contains(doneJoined, "event: message_delta") || !strings.Contains(doneJoined, "event: message_stop") {
-		t.Fatalf("unexpected anthropic done chunks: %#v", done)
-	}
+	assertAnthropicStreamTextTranslation(
+		t,
+		protocol.Codex,
+		"gpt-5-codex",
+		rawReq,
+		translatedReq,
+		"event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"hello\"}\n\n",
+		"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"model\":\"gpt-5-codex\",\"status\":\"completed\",\"usage\":{\"input_tokens\":3,\"output_tokens\":5,\"total_tokens\":8}}}\n\n",
+		"hello",
+	)
 }
 
 func TestRegistry_TranslateRequest_OpenAIToCodex(t *testing.T) {
@@ -1272,31 +1297,39 @@ func TestRegistry_TranslateRequest_CodexToOpenAI(t *testing.T) {
 	}
 }
 
-func TestRegistry_TranslateRequest_CodexToOpenAI_BuiltinWebSearch(t *testing.T) {
+func TestRegistry_TranslateRequest_CodexToOpenAI_MapsBuiltinWebSearchToOptions(t *testing.T) {
 	reg := protocol.NewRegistry()
 	builtin.Register(reg)
 
-	raw := []byte(`{"model":"gpt-4o","tools":[{"type":"web_search","user_location":{"type":"approximate","country":"US"}}],"tool_choice":{"type":"web_search"},"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]}]}`)
+	raw := []byte(`{"model":"gpt-4o","tools":[{"type":"web_search","search_context_size":"high","user_location":{"type":"approximate","country":"US"}}],"tool_choice":{"type":"web_search"},"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]}]}`)
 	got, err := reg.TranslateRequest(protocol.Codex, protocol.OpenAI, "gpt-4o", raw, false)
 	if err != nil {
 		t.Fatalf("TranslateRequest failed: %v", err)
 	}
-	var req struct {
-		Tools      []map[string]any `json:"tools"`
-		ToolChoice map[string]any   `json:"tool_choice"`
-	}
+	var req map[string]any
 	if err := json.Unmarshal(got, &req); err != nil {
 		t.Fatalf("unmarshal translated request: %v", err)
 	}
-	if len(req.Tools) != 1 || req.Tools[0]["type"] != "web_search" {
-		t.Fatalf("unexpected builtin tools: %+v", req.Tools)
+	searchOptions, ok := req["web_search_options"].(map[string]any)
+	if !ok {
+		t.Fatalf("web_search_options missing or invalid: %s", got)
 	}
-	location, ok := req.Tools[0]["user_location"].(map[string]any)
-	if !ok || location["country"] != "US" || location["type"] != "approximate" {
-		t.Fatalf("unexpected builtin tool options: %+v", req.Tools[0])
+	if gotSize := searchOptions["search_context_size"]; gotSize != "high" {
+		t.Fatalf("search_context_size = %#v, want high; body=%s", gotSize, got)
 	}
-	if req.ToolChoice["type"] != "web_search" {
-		t.Fatalf("unexpected builtin tool choice: %+v", req.ToolChoice)
+	location, ok := searchOptions["user_location"].(map[string]any)
+	if !ok || location["type"] != "approximate" {
+		t.Fatalf("user_location missing or invalid: %#v; body=%s", searchOptions["user_location"], got)
+	}
+	approximate, ok := location["approximate"].(map[string]any)
+	if !ok || approximate["country"] != "US" {
+		t.Fatalf("user_location.approximate missing or invalid: %#v; body=%s", location["approximate"], got)
+	}
+	if _, ok := req["tools"]; ok {
+		t.Fatalf("OpenAI chat search must use web_search_options, not tools: %s", got)
+	}
+	if _, ok := req["tool_choice"]; ok {
+		t.Fatalf("OpenAI chat search must not reuse web_search tool_choice: %s", got)
 	}
 }
 

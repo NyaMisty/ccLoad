@@ -199,10 +199,53 @@ func TestBuildLogEntry_StreamDiagMsg(t *testing.T) {
 func TestAppendRetryStrategyToMessageUsesCompactDisplay(t *testing.T) {
 	t.Parallel()
 
-	got := appendRetryStrategyToMessage("ok", "strip_codex_encrypted_tool_search")
-	want := "ok [strip_codex_encrypted_tool_search]"
+	got := appendRetryStrategyToMessage("ok", "strip_codex_encrypted_content,strip_codex_thinking")
+	want := "ok [strip_codex_encrypted_content,strip_codex_thinking]"
 	if got != want {
 		t.Fatalf("appendRetryStrategyToMessage()=%q, want %q", got, want)
+	}
+}
+
+func TestExtractThinkingEffortPrefersOutputConfigEffortOverThinkingType(t *testing.T) {
+	t.Parallel()
+
+	got := extractThinkingEffortFromJSON([]byte(`{
+		"thinking": {"type": "disabled"},
+		"output_config": {"effort": "high"},
+		"stream": true
+	}`))
+	if got != "high" {
+		t.Fatalf("thinking_effort=%q, want high", got)
+	}
+}
+
+func TestExtractThinkingEffortReadsCodexReasoningEffort(t *testing.T) {
+	t.Parallel()
+
+	got := extractThinkingEffortFromJSON([]byte(`{
+		"reasoning": {"effort": "xhigh"},
+		"stream": true
+	}`))
+	if got != "xhigh" {
+		t.Fatalf("thinking_effort=%q, want xhigh", got)
+	}
+}
+
+func TestBuildLogEntry_CopiesReasoningTokens(t *testing.T) {
+	t.Parallel()
+
+	entry := buildLogEntry(logEntryParams{
+		RequestModel: "gpt-5-codex",
+		StatusCode:   http.StatusOK,
+		Result: &fwResult{
+			InputTokens:     10,
+			OutputTokens:    20,
+			ReasoningTokens: 1234,
+		},
+	})
+
+	if entry.ReasoningTokens != 1234 {
+		t.Fatalf("reasoning_tokens=%d, want 1234", entry.ReasoningTokens)
 	}
 }
 
@@ -356,14 +399,6 @@ func TestIsLikelyText(t *testing.T) {
 	}
 	if isLikelyText(notText) {
 		t.Fatal("expected binary data to be not likely text")
-	}
-}
-
-func TestFormatModelDisplayName(t *testing.T) {
-	t.Parallel()
-
-	if got := formatModelDisplayName("gemini-2.5-flash-20250101"); got != "Gemini 2.5 Flash" {
-		t.Fatalf("unexpected display name: %q", got)
 	}
 }
 
@@ -849,4 +884,115 @@ func TestStripAnthropicProtocolHeaders(t *testing.T) {
 			}
 		})
 	}
+}
+
+func anyrouterAnthropicCfg() *model.Config {
+	return &model.Config{Name: "anyrouter-claude", URL: "https://anyrouter.top", ChannelType: util.ChannelTypeAnthropic}
+}
+
+func TestNormalizeAnyrouterAdaptiveThinking(t *testing.T) {
+	t.Parallel()
+
+	decode := func(body []byte) map[string]any {
+		var obj map[string]any
+		if err := json.Unmarshal(body, &obj); err != nil {
+			t.Fatalf("unmarshal: %v", err)
+		}
+		return obj
+	}
+	thinkingType := func(obj map[string]any) string {
+		tm, _ := obj["thinking"].(map[string]any)
+		if tm == nil {
+			return ""
+		}
+		s, _ := tm["type"].(string)
+		return s
+	}
+	outputEffort := func(obj map[string]any) string {
+		oc, _ := obj["output_config"].(map[string]any)
+		if oc == nil {
+			return ""
+		}
+		s, _ := oc["effort"].(string)
+		return s
+	}
+
+	t.Run("anyrouter without thinking → inject adaptive", func(t *testing.T) {
+		body := []byte(`{"model":"claude-opus-4-8","messages":[]}`)
+		got := decode(normalizeAnyrouterAdaptiveThinking(anyrouterAnthropicCfg(), "/v1/messages", body))
+		if thinkingType(got) != "adaptive" {
+			t.Fatalf("thinking.type want adaptive, got %q", thinkingType(got))
+		}
+		if outputEffort(got) != "high" {
+			t.Fatalf("output_config.effort want high, got %q", outputEffort(got))
+		}
+	})
+
+	t.Run("anyrouter thinking.type=enabled → patch to adaptive + output_config.effort", func(t *testing.T) {
+		body := []byte(`{"model":"claude-opus-4-8","thinking":{"type":"enabled","budget_tokens":4096}}`)
+		got := decode(normalizeAnyrouterAdaptiveThinking(anyrouterAnthropicCfg(), "/v1/messages", body))
+		if thinkingType(got) != "adaptive" {
+			t.Fatalf("thinking.type want adaptive, got %q", thinkingType(got))
+		}
+		if outputEffort(got) != "medium" {
+			t.Fatalf("output_config.effort want medium, got %q", outputEffort(got))
+		}
+	})
+
+	t.Run("budget_tokens=16384 → high effort", func(t *testing.T) {
+		body := []byte(`{"model":"claude-opus-4-8","thinking":{"type":"enabled","budget_tokens":16384}}`)
+		got := decode(normalizeAnyrouterAdaptiveThinking(anyrouterAnthropicCfg(), "/v1/messages", body))
+		if outputEffort(got) != "high" {
+			t.Fatalf("want high, got %q", outputEffort(got))
+		}
+	})
+
+	t.Run("missing budget_tokens → high effort", func(t *testing.T) {
+		body := []byte(`{"model":"claude-opus-4-8","thinking":{"type":"enabled"}}`)
+		got := decode(normalizeAnyrouterAdaptiveThinking(anyrouterAnthropicCfg(), "/v1/messages", body))
+		if outputEffort(got) != "high" {
+			t.Fatalf("want high, got %q", outputEffort(got))
+		}
+	})
+
+	t.Run("thinking.type=adaptive → unchanged", func(t *testing.T) {
+		body := []byte(`{"model":"claude-opus-4-8","thinking":{"type":"adaptive"}}`)
+		got := decode(normalizeAnyrouterAdaptiveThinking(anyrouterAnthropicCfg(), "/v1/messages", body))
+		if thinkingType(got) != "adaptive" {
+			t.Fatalf("want adaptive unchanged, got %q", thinkingType(got))
+		}
+		if outputEffort(got) != "" {
+			t.Fatalf("output_config should not be added when already adaptive, got %q", outputEffort(got))
+		}
+	})
+
+	t.Run("anyrouter URL is enough even when channel name does not contain anyrouter", func(t *testing.T) {
+		cfg := &model.Config{Name: "regular-channel", URL: "https://anyrouter.top", ChannelType: util.ChannelTypeAnthropic}
+		body := []byte(`{"model":"claude-opus-4-8","thinking":{"type":"enabled","budget_tokens":1024}}`)
+		got := decode(normalizeAnyrouterAdaptiveThinking(cfg, "/v1/messages", body))
+		if thinkingType(got) != "adaptive" {
+			t.Fatalf("thinking.type want adaptive, got %q", thinkingType(got))
+		}
+		if outputEffort(got) != "low" {
+			t.Fatalf("output_config.effort want low, got %q", outputEffort(got))
+		}
+	})
+
+	t.Run("regular anthropic channel → no fallback normalization", func(t *testing.T) {
+		cfg := &model.Config{Name: "regular-channel", URL: "https://api.anthropic.com", ChannelType: util.ChannelTypeAnthropic}
+		body := []byte(`{"model":"claude-opus-4-8","thinking":{"type":"enabled","budget_tokens":1024}}`)
+		got := decode(normalizeAnyrouterAdaptiveThinking(cfg, "/v1/messages", body))
+		if thinkingType(got) != "enabled" {
+			t.Fatalf("regular anthropic channel should keep existing thinking.type, got %q", thinkingType(got))
+		}
+	})
+
+	t.Run("non-anthropic channel → no injection", func(t *testing.T) {
+		cfg := &model.Config{Name: "anyrouter", ChannelType: "openai"}
+		body := []byte(`{"model":"gpt-4o","messages":[]}`)
+		got := decode(normalizeAnyrouterAdaptiveThinking(cfg, "/v1/messages", body))
+		if thinkingType(got) != "" {
+			t.Fatalf("non-anthropic should not inject thinking, got %q", thinkingType(got))
+		}
+	})
 }

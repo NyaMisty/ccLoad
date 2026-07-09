@@ -140,6 +140,9 @@ func ensureLogsNewColumns(ctx context.Context, db *sql.DB, dialect Dialect) erro
 		if err := ensureLogsServiceTierMySQL(ctx, db); err != nil {
 			return err
 		}
+		if err := ensureLogsThinkingEffortMySQL(ctx, db); err != nil {
+			return err
+		}
 		return ensureLogsLogSourceMySQL(ctx, db)
 	}
 	// SQLite: 使用PRAGMA table_info检查列
@@ -160,6 +163,8 @@ func ensureLogsColumnsSQLite(ctx context.Context, db *sql.DB) error {
 		{name: "api_key_hash", definition: "TEXT NOT NULL DEFAULT ''"}, // API Key SHA256（用于精确定位 key_index）
 		{name: "base_url", definition: "TEXT NOT NULL DEFAULT ''"},     // 请求使用的上游URL（多URL场景）
 		{name: "service_tier", definition: "TEXT NOT NULL DEFAULT ''"}, // OpenAI service_tier: priority/flex
+		{name: "thinking_effort", definition: "TEXT NOT NULL DEFAULT ''"},
+		{name: "reasoning_tokens", definition: "INTEGER NOT NULL DEFAULT 0"},
 	}); err != nil {
 		return err
 	}
@@ -294,6 +299,13 @@ func ensureLogsMinuteBucketMySQL(ctx context.Context, db *sql.DB) error {
 func ensureLogsActualModelMySQL(ctx context.Context, db *sql.DB) error {
 	return ensureMySQLColumns(ctx, db, "logs", []mysqlColumnDef{
 		{name: "actual_model", definition: "VARCHAR(191) NOT NULL DEFAULT '' COMMENT '实际转发的模型(空表示未重定向)'"},
+	})
+}
+
+func ensureLogsThinkingEffortMySQL(ctx context.Context, db *sql.DB) error {
+	return ensureMySQLColumns(ctx, db, "logs", []mysqlColumnDef{
+		{name: "thinking_effort", definition: "VARCHAR(32) NOT NULL DEFAULT '' COMMENT '请求或上游返回的思考等级'"},
+		{name: "reasoning_tokens", definition: "INT NOT NULL DEFAULT 0 COMMENT '思考/推理Token数'"},
 	})
 }
 
@@ -516,4 +528,60 @@ func ensureAPIKeysDisabled(ctx context.Context, db *sql.DB, dialect Dialect) err
 	return ensureColumn(ctx, db, dialect, "api_keys", "disabled",
 		"TINYINT NOT NULL DEFAULT 0",
 		"INTEGER NOT NULL DEFAULT 0")
+}
+
+func ensureAPIKeysNote(ctx context.Context, db *sql.DB, dialect Dialect) error {
+	return ensureColumn(ctx, db, dialect, "api_keys", "note",
+		"VARCHAR(512) NOT NULL DEFAULT ''",
+		"TEXT NOT NULL DEFAULT ''")
+}
+
+// ensureAuthTokensEffectiveCost 确保auth_tokens表有effective_cost_usd字段（2026-07新增）
+func ensureAuthTokensEffectiveCost(ctx context.Context, db *sql.DB, dialect Dialect) error {
+	if err := ensureColumn(ctx, db, dialect, "auth_tokens", "effective_cost_usd",
+		"DOUBLE NOT NULL DEFAULT 0.0",
+		"REAL NOT NULL DEFAULT 0.0"); err != nil {
+		return err
+	}
+
+	// 从 logs 回填历史数据（一次性）
+	const marker = "auth_tokens_effective_cost_backfill"
+	if hasMigration(ctx, db, marker) {
+		return nil
+	}
+
+	// 用 logs 表的 SUM(cost * cost_multiplier) 回填，按 token 聚合
+	// 防御性检查：logs 表可能尚未创建（迁移顺序依赖）
+	hasLogs := false
+	if dialect == DialectMySQL {
+		var count int
+		if err := db.QueryRowContext(ctx,
+			"SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='logs'",
+		).Scan(&count); err == nil && count > 0 {
+			hasLogs = true
+		}
+	} else {
+		var name string
+		if err := db.QueryRowContext(ctx,
+			"SELECT name FROM sqlite_master WHERE type='table' AND name='logs'",
+		).Scan(&name); err == nil {
+			hasLogs = true
+		}
+	}
+
+	if hasLogs {
+		_, err := db.ExecContext(ctx, `
+			UPDATE auth_tokens SET effective_cost_usd = COALESCE((
+				SELECT SUM(COALESCE(l.cost, 0.0) * COALESCE(l.cost_multiplier, 1))
+				FROM logs l
+				WHERE l.auth_token_id = auth_tokens.id
+				  AND l.status_code >= 200 AND l.status_code < 300
+			), 0.0)
+		`)
+		if err != nil {
+			return fmt.Errorf("backfill effective_cost_usd: %w", err)
+		}
+	}
+
+	return recordMigration(ctx, db, marker, dialect)
 }

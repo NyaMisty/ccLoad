@@ -130,6 +130,55 @@ func TestSSEUsageParser_StreamOutputIgnoresHeartbeat(t *testing.T) {
 	}
 }
 
+// [PATCH] TestSSEUsageParser_JSONOnlyErrorFrame 复现不规范上游 bug：
+// 上游只发 `data: {"type":"error",...}` 而不带 `event: error` 行（如 sub2api）。
+// 修复前：errorType 为空 → 漏判 → hasStreamOutput=true、lastError=nil → 200/0token 假成功不重试。
+// 修复后：isErrorPayload 兜底识别 → lastError 被设置、不计为流输出 → 触发现有重试逻辑。
+func TestSSEUsageParser_JSONOnlyErrorFrame(t *testing.T) {
+	parser := newSSEUsageParser("anthropic")
+	// 先来几个 ping，再来一个无 event 行的 JSON error 帧
+	stream := "data: {\"type\": \"ping\"}\n\n" +
+		"data: {\"type\": \"ping\"}\n\n" +
+		"data: {\"type\":\"error\",\"error\":{\"type\":\"rate_limit_error\",\"message\":\"Concurrency limit exceeded for account, please retry later\"}}\n\n"
+	if err := parser.Feed([]byte(stream)); err != nil {
+		t.Fatalf("Feed失败: %v", err)
+	}
+	if parser.HasStreamOutput() {
+		t.Fatalf("JSON-only error frame must not count as stream output")
+	}
+	if parser.GetLastError() == nil {
+		t.Fatalf("JSON-only error frame must be captured as lastError for retry")
+	}
+}
+
+// [PATCH] TestSSEUsageParser_JSONOnlyErrorFrameNestedOnly 覆盖只有 error 对象、无顶层 type 的格式。
+func TestSSEUsageParser_JSONOnlyErrorFrameNestedOnly(t *testing.T) {
+	parser := newSSEUsageParser("openai")
+	if err := parser.Feed([]byte("data: {\"error\":{\"message\":\"upstream boom\",\"type\":\"server_error\"}}\n\n")); err != nil {
+		t.Fatalf("Feed失败: %v", err)
+	}
+	if parser.GetLastError() == nil {
+		t.Fatalf("nested error object must be captured as lastError")
+	}
+}
+
+// [PATCH] TestSSEUsageParser_NormalContentNotMisflaggedAsError 确保正常内容不被误判为 error。
+func TestSSEUsageParser_NormalContentNotMisflaggedAsError(t *testing.T) {
+	parser := newSSEUsageParser("anthropic")
+	// 正常文本增量 + 一个 error 字段为 null 的帧，都不应被判成 error
+	stream := "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n" +
+		"data: {\"type\":\"message_delta\",\"error\":null,\"usage\":{\"output_tokens\":5}}\n\n"
+	if err := parser.Feed([]byte(stream)); err != nil {
+		t.Fatalf("Feed失败: %v", err)
+	}
+	if parser.GetLastError() != nil {
+		t.Fatalf("normal content must not be flagged as error, got: %s", parser.GetLastError())
+	}
+	if !parser.HasStreamOutput() {
+		t.Fatalf("normal content delta must count as stream output")
+	}
+}
+
 // ============================================================================
 // 边界测试：分块读取（真实SSE流场景）
 // ============================================================================
@@ -321,6 +370,22 @@ data: {"type":"response.completed","sequence_number":28,"response":{"id":"resp_0
 	`
 
 	feedAndAssertUsage(t, newSSEUsageParser("codex"), sseData, 4293, 17, 6016, 0)
+}
+
+func TestSSEUsageParser_CodexReasoningTokens(t *testing.T) {
+	sseData := `event: response.completed
+data: {"type":"response.completed","response":{"usage":{"input_tokens":10309,"input_tokens_details":{"cached_tokens":6016},"output_tokens":1234,"output_tokens_details":{"reasoning_tokens":987},"total_tokens":11543}}}
+
+`
+
+	parser := newSSEUsageParser("codex")
+	if err := parser.Feed([]byte(sseData)); err != nil {
+		t.Fatalf("Feed失败: %v", err)
+	}
+
+	if got := parser.GetReasoningTokens(); got != 987 {
+		t.Fatalf("reasoning tokens=%d, want 987", got)
+	}
 }
 
 func TestSSEUsageParser_RecoversAfterOversizedEvent(t *testing.T) {
@@ -662,6 +727,69 @@ func TestSSEUsageParser_GeminiThoughtsTokenCount(t *testing.T) {
 	if output != 150 {
 		t.Errorf("OutputTokens = %d, 期望 150 (candidatesTokenCount + thoughtsTokenCount)", output)
 	}
+	if got := parser.GetReasoningTokens(); got != 100 {
+		t.Fatalf("reasoning tokens=%d, want 100", got)
+	}
+}
+
+func TestSSEUsageParser_GeminiReasoningTokenAliases(t *testing.T) {
+	tests := []struct {
+		name       string
+		payload    string
+		want       int
+		wantOutput int
+	}{
+		{
+			name:       "snake case usage metadata",
+			payload:    `{"usage_metadata":{"prompt_token_count":100,"candidates_token_count":20,"thoughts_token_count":333,"total_token_count":453}}`,
+			want:       333,
+			wantOutput: 353,
+		},
+		{
+			name:       "total thought tokens",
+			payload:    `{"usage":{"promptTokenCount":100,"candidatesTokenCount":20,"totalThoughtTokens":444,"totalTokenCount":564}}`,
+			want:       444,
+			wantOutput: 464,
+		},
+		{
+			name:       "snake total thought tokens",
+			payload:    `{"usage":{"prompt_token_count":100,"candidates_token_count":20,"total_thought_tokens":555,"total_token_count":675}}`,
+			want:       555,
+			wantOutput: 575,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			parser := newSSEUsageParser("gemini")
+			if err := parser.Feed([]byte("data: " + tt.payload + "\n\n")); err != nil {
+				t.Fatalf("Feed失败: %v", err)
+			}
+			_, output, _, _ := parser.GetUsage()
+			if output != tt.wantOutput {
+				t.Fatalf("output tokens=%d, want %d", output, tt.wantOutput)
+			}
+			if got := parser.GetReasoningTokens(); got != tt.want {
+				t.Fatalf("reasoning tokens=%d, want %d", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestSSEUsageParser_AnthropicThinkingTokens(t *testing.T) {
+	sseData := `event: message_delta
+data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":333,"output_tokens_details":{"thinking_tokens":222}}}
+
+`
+
+	parser := newSSEUsageParser("anthropic")
+	if err := parser.Feed([]byte(sseData)); err != nil {
+		t.Fatalf("Feed失败: %v", err)
+	}
+
+	if got := parser.GetReasoningTokens(); got != 222 {
+		t.Fatalf("reasoning tokens=%d, want 222", got)
+	}
 }
 
 func TestSSEUsageParser_GeminiCandidatesZeroFallback(t *testing.T) {
@@ -805,6 +933,32 @@ func TestJSONUsageParser_CacheCreationDetailed_Mixed(t *testing.T) {
 	}
 	if parser.Cache1hInputTokens != 200 {
 		t.Errorf("Cache1hInputTokens = %d, 期望 200", parser.Cache1hInputTokens)
+	}
+}
+
+func TestJSONUsageParser_OpenAIResponsesCacheCreationUsesWritePricing(t *testing.T) {
+	jsonData := `{
+		"usage": {
+			"input_tokens": 100,
+			"output_tokens": 20,
+			"cache_creation_input_tokens": 80
+		}
+	}`
+
+	parser := newJSONUsageParser("openai")
+	if err := parser.Feed([]byte(jsonData)); err != nil {
+		t.Fatalf("Feed失败: %v", err)
+	}
+
+	_, _, _, cacheCreation := parser.GetUsage()
+	if cacheCreation != 80 {
+		t.Errorf("CacheCreationInputTokens = %d, 期望 80", cacheCreation)
+	}
+	if parser.Cache5mInputTokens != 80 {
+		t.Errorf("Cache5mInputTokens = %d, 期望 80", parser.Cache5mInputTokens)
+	}
+	if parser.Cache1hInputTokens != 0 {
+		t.Errorf("Cache1hInputTokens = %d, 期望 0", parser.Cache1hInputTokens)
 	}
 }
 

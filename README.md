@@ -70,6 +70,7 @@ ccLoad handles those cases with:
 - 💬 **Conversational Model Testing** - Channel/model/chat testing modes with image upload, reasoning level, built-in search, and chat export
 - 🔍 **Debug Logs** - Upstream request/response raw data capture with sensitive header masking, essential for troubleshooting
 - 🕐 **Scheduled Checks** - Background periodic channel availability probing, auto-detect failed channels
+- 🔄 **Auto Updates** - Checks for new releases every 12 hours by default, configurable from the admin settings page
 - 🧩 **Custom Request Rules** - Per-channel HTTP header & JSON body rewriting (remove/override/append), with auth header protection, CRLF guard, and capacity caps
 - 🎛️ **Log Column Customization** - Show/hide table columns per preference, settings persist in browser localStorage
 
@@ -371,7 +372,7 @@ EXPOSE 7860
 
 With pre-built images, updates are simple:
 
-**Auto Update**:
+**Image Refresh**:
 - When new version image (`ghcr.io/caidaoli/ccload:latest`) is released
 - Click "Factory rebuild" in Space settings to pull latest image
 - Or wait for Hugging Face auto-restart (typically after 48 hours)
@@ -386,7 +387,7 @@ git push
 **Version Pinning** (Optional):
 To lock specific version, modify Dockerfile:
 ```dockerfile
-FROM ghcr.io/caidaoli/ccload:2.19.0  # Specify version
+FROM ghcr.io/caidaoli/ccload:v2.44.1  # Specify version
 ENV TZ=Asia/Shanghai
 ENV PORT=7860
 ENV SQLITE_PATH=/tmp/ccload.db
@@ -620,7 +621,7 @@ The "Advanced" button in the channel editor opens a secondary modal that lets yo
 }
 ```
 
-> **Interaction with built-in logic**: Custom rules run **after** the anyrouter `anthropic-beta` injection, so they can override or remove the beta flag. The anyrouter adaptive-thinking injection detects a user-provided `thinking` field and leaves it untouched. Authentication headers remain unmodifiable at all times.
+> **Interaction with built-in logic**: Custom rules run **after** the anyrouter `anthropic-beta` injection and anyrouter adaptive-thinking fallback, so they can override or remove those fields. Generated Anthropic requests use `thinking.type=adaptive` plus `output_config.effort` for thinking depth; anyrouter `/v1/messages` additionally fills missing thinking and normalizes legacy `thinking.type=enabled`. Authentication headers remain unmodifiable at all times.
 
 ### Batch Data Management
 
@@ -862,8 +863,13 @@ These settings have been migrated to database, managed via Web interface `/web/s
 | `health_score_update_interval` | `30` | Success rate cache update interval (seconds) |
 | `health_min_confident_sample` | `20` | Confidence sample threshold (full penalty at this sample size) |
 | `channel_check_interval_hours` | `0` | Scheduled channel check interval (hours, 0=disabled) |
+| `auto_update_interval_hours` | `12` | Auto-update check interval (hours, 0=disabled, minimum enabled value is 1) |
 
 Per-protocol timeouts apply to the runtime upstream protocol: if a transformed request is forwarded to OpenAI, ccLoad reads `openai_*_timeout`; when that value is `0`, it falls back to the global timeout.
+
+#### Auto Updates
+
+ccLoad supports in-process auto updates. It checks GitHub Releases every 12 hours by default and prepares a verified newer binary when available. The interval can be changed from the Web admin settings page via `auto_update_interval_hours`; set it to `0` to disable automatic update checks.
 
 #### Health Score Sorting
 
@@ -925,9 +931,9 @@ Project supports multi-arch Docker images:
 - **Image Registry**: `ghcr.io/caidaoli/ccload`
 - **Available Tags**:
   - `latest` - Latest stable version
-  - `2.19.0` - Specific version number
-  - `2.19` - Major.minor version
-  - `2` - Major version
+  - `v2.44.1` - Specific release tag, matching the GitHub Release tag
+
+The official GHCR runtime image is Alpine-based. On container startup, it downloads the latest Linux release binary from GitHub Releases; after ccLoad starts, further update checks are handled by ccLoad's own auto-update mechanism. The default check interval is 12 hours and can be changed with `auto_update_interval_hours` in the Web admin settings.
 
 ### Image Tag Guide
 
@@ -936,7 +942,7 @@ Project supports multi-arch Docker images:
 docker pull ghcr.io/caidaoli/ccload:latest
 
 # Pull specific version
-docker pull ghcr.io/caidaoli/ccload:2.19.0
+docker pull ghcr.io/caidaoli/ccload:v2.44.1
 
 # Specify architecture (Docker usually auto-selects)
 docker pull --platform linux/amd64 ghcr.io/caidaoli/ccload:latest
@@ -1070,6 +1076,20 @@ Project uses GitHub Actions for automated CI/CD:
 ## 🤝 Contributing
 
 Issues and Pull Requests welcome!
+
+### Development Checks
+
+Use `sonic` for Go commands. Before sending a change, run the checks that match the touched area:
+
+```bash
+go test -tags sonic ./internal/...
+make race-fast      # high-value race subset
+make race           # full race suite
+make verify-web     # frontend node:test checks
+golangci-lint run ./...
+```
+
+`make race-fast` keeps the common race-sensitive packages fast enough for local iteration; use `make race` before larger or concurrency-sensitive changes. Override `RACE_P` or `RACE_PARALLEL` only when the machine needs a different parallelism cap.
 
 ### Troubleshooting
 

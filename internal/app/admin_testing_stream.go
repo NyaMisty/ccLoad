@@ -7,7 +7,6 @@ import (
 	"io"
 	"math"
 	"net/http"
-	neturl "net/url"
 	"strings"
 	"time"
 
@@ -71,6 +70,7 @@ func (s *Server) HandleChannelChat(c *gin.Context) {
 	}
 
 	// 模型重定向
+	originalModel := testReq.Model
 	if redirectModel, ok := cfg.GetRedirectModel(testReq.Model); ok && redirectModel != "" {
 		testReq.Model = redirectModel
 	}
@@ -103,10 +103,10 @@ func (s *Server) HandleChannelChat(c *gin.Context) {
 
 	var lastResult map[string]any
 	for idx, entry := range orderedURLs {
-		attempt := s.streamChatWithURL(c, cfg, keySelection.apiKey, &testReq, clientProtocol, entry.url)
+		attempt := s.streamChatWithURL(c, cfg, keySelection.apiKey, &testReq, clientProtocol, entry.url, originalModel)
 		if attempt.handled {
 			// Write chat log from stream result
-			s.writeChatStreamLog(c, cfg, &testReq, keySelection.apiKey, attempt.streamResult)
+			s.writeChatStreamLog(c, cfg, &testReq, keySelection.apiKey, attempt.streamResult, originalModel)
 			return
 		}
 		lastResult = attempt.result
@@ -125,6 +125,7 @@ func (s *Server) HandleChannelChat(c *gin.Context) {
 
 	if lastResult != nil {
 		writeChatErrorEvent(c, chatErrorMessageFromResult(lastResult))
+		s.persistDetectionLog(c.Request.Context(), detectionLogFromResult(cfg, model.LogSourceManualChat, originalModel, testReq.Model, keySelection.apiKey, c.ClientIP(), 0, testReq.ThinkingEffort, lastResult))
 		return
 	}
 	writeChatErrorEvent(c, "渠道测试失败: 未找到可用URL")
@@ -143,6 +144,10 @@ type chatStreamResult struct {
 	usageParser      *sseUsageParser
 	model            string
 	channelType      string
+	statusCode       int
+	requestThinking  string
+	errorResult      map[string]any
+	debugData        *model.DebugLogEntry
 }
 
 func chatSummaryEventChunk(sr *chatStreamResult, testReq *testutil.TestChannelRequest) []byte {
@@ -162,6 +167,9 @@ func chatSummaryEventChunk(sr *chatStreamResult, testReq *testutil.TestChannelRe
 		input, output, cacheRead, cacheCreation := sr.usageParser.GetUsage()
 		summary["input_tokens"] = input
 		summary["output_tokens"] = output
+		if reasoningTokens := sr.usageParser.GetReasoningTokens(); reasoningTokens > 0 {
+			summary["reasoning_tokens"] = reasoningTokens
+		}
 		summary["cache_read"] = cacheRead
 		summary["cache_create"] = cacheCreation
 
@@ -199,6 +207,7 @@ func (s *Server) streamChatWithURL(
 	apiKey string,
 	testReq *testutil.TestChannelRequest,
 	clientProtocol, selectedURL string,
+	originalModel string,
 ) chatURLAttemptResult {
 	req, requestPlan, cancel, err := s.buildTestUpstreamRequest(c.Request.Context(), cfg, apiKey, testReq, clientProtocol, selectedURL)
 	if err != nil {
@@ -206,13 +215,21 @@ func (s *Server) streamChatWithURL(
 		return chatURLAttemptResult{handled: true}
 	}
 	defer cancel()
+	requestThinking := testRequestThinkingEffort(testReq, requestPlan)
 
 	start := time.Now()
 	resp, err := s.doUpstreamRequest(cfg, req)
 	if err != nil {
-		return chatURLAttemptResult{result: chatRequestErrorResult(start, testReq, requestPlan.timeout, err)}
+		result := chatRequestErrorResult(start, testReq, requestPlan.timeout, err)
+		if requestThinking != "" {
+			result["thinking_effort"] = requestThinking
+		}
+		return chatURLAttemptResult{result: attachTestDebugData(requestPlan, nil, result)}
 	}
 	defer func() { _ = resp.Body.Close() }()
+	if requestPlan.debugCapture != nil {
+		requestPlan.debugCapture.wrapResponseBody(resp)
+	}
 
 	contentType := resp.Header.Get("Content-Type")
 	isSSE := strings.Contains(strings.ToLower(contentType), "text/event-stream")
@@ -220,27 +237,34 @@ func (s *Server) streamChatWithURL(
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 8*1024))
 		msg := extractChatUpstreamError(resp.StatusCode, body)
-		return chatURLAttemptResult{result: map[string]any{
+		result := map[string]any{
 			"success":                false,
 			"status_code":            resp.StatusCode,
+			"is_streaming":           testReq.Stream,
 			"duration_ms":            time.Since(start).Milliseconds(),
 			"error":                  msg,
 			"raw_response":           string(body),
 			"upstream_response_body": string(body),
 			"response_headers":       flattenHeader(resp.Header),
-		}}
+		}
+		if requestThinking != "" {
+			result["thinking_effort"] = requestThinking
+		}
+		return chatURLAttemptResult{result: attachTestDebugData(requestPlan, resp, result)}
 	}
 
 	if !isSSE {
-		s.streamChatNonStreamResponse(c, resp, requestPlan, testReq, contentType, start, cfg)
+		s.streamChatNonStreamResponse(c, resp, requestPlan, testReq, contentType, start, cfg, apiKey, requestThinking, originalModel)
 		return chatURLAttemptResult{handled: true}
 	}
 
 	sr := &chatStreamResult{
-		start:       start,
-		usageParser: newSSEUsageParser(cfg.GetChannelType()),
-		model:       testReq.Model,
-		channelType: cfg.GetChannelType(),
+		start:           start,
+		usageParser:     newSSEUsageParser(cfg.GetChannelType()),
+		model:           testReq.Model,
+		channelType:     cfg.GetChannelType(),
+		statusCode:      resp.StatusCode,
+		requestThinking: requestThinking,
 	}
 
 	firstContentMarked := false
@@ -263,6 +287,10 @@ func (s *Server) streamChatWithURL(
 	}
 	if streamErr != nil {
 		result := chatRequestErrorResult(start, testReq, requestPlan.timeout, streamErr)
+		if _, ok := result["status_code"]; !ok && resp.StatusCode > 0 {
+			result["status_code"] = resp.StatusCode
+		}
+		sr.errorResult = result
 		writeChatErrorEvent(c, chatErrorMessageFromResult(result))
 	}
 
@@ -270,15 +298,24 @@ func (s *Server) streamChatWithURL(
 	if summaryChunk := chatSummaryEventChunk(sr, testReq); len(summaryChunk) > 0 {
 		writeChatFrontendChunks(c, summaryChunk)
 	}
+	if requestPlan.debugCapture != nil {
+		sr.debugData = requestPlan.debugCapture.buildEntry(resp)
+	}
 	return chatURLAttemptResult{handled: true, streamResult: sr}
 }
 
 func chatRequestErrorResult(start time.Time, testReq *testutil.TestChannelRequest, timeout *channelTestTimeout, err error) map[string]any {
+	isStream := testReq != nil && testReq.Stream
+
 	if errors.Is(err, ErrChannelRPMExceeded) {
-		return channelRPMExceededTestResult(start, channelRPMRetryAfter(err))
+		result := channelRPMExceededTestResult(start, channelRPMRetryAfter(err))
+		result["is_streaming"] = isStream
+		return result
 	}
 	if errors.Is(err, ErrChannelConcurrencyExceeded) {
-		return channelConcurrencyExceededTestResult(start, err)
+		result := channelConcurrencyExceededTestResult(start, err)
+		result["is_streaming"] = isStream
+		return result
 	}
 
 	errorMsg := "网络请求失败: " + err.Error()
@@ -303,9 +340,10 @@ func chatRequestErrorResult(start time.Time, testReq *testutil.TestChannelReques
 	}
 
 	result := map[string]any{
-		"success":     false,
-		"error":       errorMsg,
-		"duration_ms": time.Since(start).Milliseconds(),
+		"success":      false,
+		"error":        errorMsg,
+		"duration_ms":  time.Since(start).Milliseconds(),
+		"is_streaming": isStream,
 	}
 	if statusCode > 0 {
 		result["status_code"] = statusCode
@@ -334,6 +372,9 @@ func (s *Server) streamChatNonStreamResponse(
 	contentType string,
 	start time.Time,
 	cfg *model.Config,
+	apiKey string,
+	requestThinking string,
+	originalModel string,
 ) {
 	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
@@ -346,13 +387,18 @@ func (s *Server) streamChatNonStreamResponse(
 	}
 
 	result := map[string]any{
-		"success":     resp.StatusCode >= 200 && resp.StatusCode < 300,
-		"status_code": resp.StatusCode,
+		"success":      resp.StatusCode >= 200 && resp.StatusCode < 300,
+		"status_code":  resp.StatusCode,
+		"is_streaming": false,
+	}
+	if requestThinking != "" {
+		result["thinking_effort"] = requestThinking
 	}
 	result = s.parseTestNonStreamResponse(c.Request.Context(), requestPlan, testReq, resp, contentType, start, respBody, result)
+	result = attachTestDebugData(requestPlan, resp, result)
 	writeChatNonStreamResult(c, result)
 	writeChatNonStreamSummary(c, result)
-	s.persistDetectionLog(c.Request.Context(), detectionLogFromResult(cfg, model.LogSourceManualChat, testReq.Model, testReq.Model, "", c.ClientIP(), 0, result))
+	s.persistDetectionLog(c.Request.Context(), detectionLogFromResult(cfg, model.LogSourceManualChat, originalModel, testReq.Model, apiKey, c.ClientIP(), 0, requestThinking, result))
 }
 
 func writeChatNonStreamResult(c *gin.Context, result map[string]any) {
@@ -403,6 +449,9 @@ func writeChatNonStreamSummary(c *gin.Context, result map[string]any) {
 		if v, ok := usage["output_tokens"]; ok {
 			summary["output_tokens"] = v
 		}
+		if v, ok := usage["reasoning_tokens"]; ok {
+			summary["reasoning_tokens"] = v
+		}
 		if v, ok := usage["cache_read_input_tokens"]; ok {
 			summary["cache_read"] = v
 		}
@@ -430,13 +479,23 @@ func writeChatNonStreamSummary(c *gin.Context, result map[string]any) {
 	writeChatFrontendChunks(c, []byte("data: "+string(jsonBytes)+"\n\n"))
 }
 
-func (s *Server) writeChatStreamLog(c *gin.Context, cfg *model.Config, testReq *testutil.TestChannelRequest, apiKey string, sr *chatStreamResult) {
+func (s *Server) writeChatStreamLog(c *gin.Context, cfg *model.Config, testReq *testutil.TestChannelRequest, apiKey string, sr *chatStreamResult, originalModel string) {
 	if sr == nil {
 		return
 	}
 	result := map[string]any{
-		"success":     true,
-		"duration_ms": time.Since(sr.start).Milliseconds(),
+		"success":      true,
+		"status_code":  sr.statusCode,
+		"is_streaming": true,
+		"duration_ms":  time.Since(sr.start).Milliseconds(),
+		"message":      "ok",
+	}
+	if sr.errorResult != nil {
+		result = sr.errorResult
+		result["is_streaming"] = true
+		if _, ok := result["status_code"]; !ok && sr.statusCode > 0 {
+			result["status_code"] = sr.statusCode
+		}
 	}
 	if !sr.firstContentTime.IsZero() {
 		result["first_byte_duration_ms"] = sr.firstContentTime.Sub(sr.start).Milliseconds()
@@ -444,17 +503,25 @@ func (s *Server) writeChatStreamLog(c *gin.Context, cfg *model.Config, testReq *
 	if sr.usageParser != nil {
 		input, output, cacheRead, cacheCreation := sr.usageParser.GetUsage()
 		cache5m, cache1h, _ := sr.usageParser.GetCacheBreakdown()
-		if input+output+cacheRead+cacheCreation > 0 {
+		reasoningTokens := sr.usageParser.GetReasoningTokens()
+		if input+output+cacheRead+cacheCreation+reasoningTokens > 0 {
 			result["usage"] = map[string]any{
 				"input_tokens": input, "output_tokens": output,
+				"reasoning_tokens":        reasoningTokens,
 				"cache_read_input_tokens": cacheRead, "cache_creation_input_tokens": cacheCreation,
 			}
 		}
 		if input+output+cacheRead > 0 {
 			result["cost_usd"] = util.CalculateCostDetailed(testReq.Model, input, output, cacheRead, cache5m, cache1h) + sr.usageParser.GetToolCostUSD()
 		}
+		if effort := sr.usageParser.GetThinkingEffort(); effort != "" {
+			result["thinking_effort"] = effort
+		}
 	}
-	s.persistDetectionLog(c.Request.Context(), detectionLogFromResult(cfg, model.LogSourceManualChat, testReq.Model, testReq.Model, apiKey, c.ClientIP(), 0, result))
+	if sr.debugData != nil {
+		result["debug_data"] = sr.debugData
+	}
+	s.persistDetectionLog(c.Request.Context(), detectionLogFromResult(cfg, model.LogSourceManualChat, originalModel, testReq.Model, apiKey, c.ClientIP(), 0, sr.requestThinking, result))
 }
 
 // streamChatNative 原生协议时把上游 SSE 实时透传给前端（提取 delta 文本）。
@@ -470,7 +537,7 @@ func streamChatNativeWithFirstContent(c *gin.Context, body io.Reader, onFirstCon
 		},
 		func(rawEvent []byte) ([][]byte, error) {
 			chunks := chatFrontendChunksFromSSEEventWithState(rawEvent, frontendState)
-			if len(chunks) > 0 && onFirstContent != nil {
+			if chatFrontendChunksHaveVisibleContent(chunks) && onFirstContent != nil {
 				onFirstContent()
 			}
 			return chunks, nil
@@ -483,13 +550,6 @@ func streamChatTranslated(c *gin.Context, resp *http.Response, requestPlan *chan
 	var state any
 	frontendState := &chatFrontendStreamState{}
 	ctx := c.Request.Context()
-
-	// anyrouter 注入
-	if requestPlan.upstreamProtocol == "anthropic" {
-		if parsed, err := neturl.Parse(requestPlan.fullURL); err == nil && strings.HasSuffix(parsed.Path, "/v1/messages") {
-			requestPlan.requestBody = maybeInjectAnyrouterAdaptiveThinking(&model.Config{}, "/v1/messages", requestPlan.requestBody)
-		}
-	}
 
 	src := readerWithCloser{Reader: resp.Body, Closer: resp.Body}
 	return streamTransformSSEEvents(ctx, src, c.Writer,
@@ -517,7 +577,7 @@ func streamChatTranslated(c *gin.Context, resp *http.Response, requestPlan *chan
 			for _, chunk := range translated {
 				chunks = append(chunks, chatFrontendChunksFromSSEEventWithState(chunk, frontendState)...)
 			}
-			if len(chunks) > 0 && onFirstContent != nil {
+			if chatFrontendChunksHaveVisibleContent(chunks) && onFirstContent != nil {
 				onFirstContent()
 			}
 			return chunks, nil
@@ -531,6 +591,11 @@ func chatFrontendChunksFromSSEEvent(rawEvent []byte) [][]byte {
 
 type chatFrontendStreamState struct {
 	thinkTagOpen bool
+}
+
+type chatTextDeltaPart struct {
+	kind string
+	text string
 }
 
 func chatFrontendChunksFromSSEEventWithState(rawEvent []byte, state *chatFrontendStreamState) [][]byte {
@@ -576,28 +641,73 @@ func chatFrontendChunksFromSSEEventWithState(rawEvent []byte, state *chatFronten
 	return chunks
 }
 
+func chatFrontendChunksHaveVisibleContent(chunks [][]byte) bool {
+	for _, chunk := range chunks {
+		if chatFrontendChunkHasVisibleContent(chunk) {
+			return true
+		}
+	}
+	return false
+}
+
+func chatFrontendChunkHasVisibleContent(chunk []byte) bool {
+	for _, line := range strings.Split(string(chunk), "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "data:") {
+			continue
+		}
+		payload := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+		if payload == "" || payload == "[DONE]" {
+			continue
+		}
+		var obj map[string]any
+		if err := sonic.Unmarshal([]byte(payload), &obj); err != nil {
+			continue
+		}
+		if delta, _ := obj["delta"].(string); delta != "" {
+			return true
+		}
+		if thinking, _ := obj["thinking_delta"].(string); thinking != "" {
+			return true
+		}
+	}
+	return false
+}
+
 func chatChunksFromTextDelta(delta string, state *chatFrontendStreamState) [][]byte {
+	chunks := make([][]byte, 0, 1)
+	for _, part := range splitChatTextDeltaParts(delta, state) {
+		if part.kind == "thinking" {
+			chunks = appendNonEmptyThinkingChunk(chunks, part.text)
+		} else {
+			chunks = appendNonEmptyDeltaChunk(chunks, part.text)
+		}
+	}
+	return chunks
+}
+
+func splitChatTextDeltaParts(delta string, state *chatFrontendStreamState) []chatTextDeltaPart {
 	if state == nil {
 		if thinking, text := splitThinkTaggedText(delta); thinking != "" {
-			chunks := [][]byte{chatThinkingEventChunk(thinking)}
+			parts := []chatTextDeltaPart{{kind: "thinking", text: thinking}}
 			if text != "" {
-				chunks = append(chunks, chatDeltaEventChunk(text))
+				parts = append(parts, chatTextDeltaPart{kind: "text", text: text})
 			}
-			return chunks
+			return parts
 		}
-		return [][]byte{chatDeltaEventChunk(delta)}
+		return []chatTextDeltaPart{{kind: "text", text: delta}}
 	}
 
-	chunks := make([][]byte, 0, 1)
+	parts := make([]chatTextDeltaPart, 0, 1)
 	remaining := delta
 	for remaining != "" {
 		if state.thinkTagOpen {
 			closeIdx, closeLen := findThinkCloseTag(remaining)
 			if closeIdx < 0 {
-				chunks = appendNonEmptyThinkingChunk(chunks, remaining)
-				return chunks
+				parts = appendNonEmptyChatTextPart(parts, "thinking", remaining)
+				return parts
 			}
-			chunks = appendNonEmptyThinkingChunk(chunks, remaining[:closeIdx])
+			parts = appendNonEmptyChatTextPart(parts, "thinking", remaining[:closeIdx])
 			remaining = remaining[closeIdx+closeLen:]
 			state.thinkTagOpen = false
 			continue
@@ -605,14 +715,21 @@ func chatChunksFromTextDelta(delta string, state *chatFrontendStreamState) [][]b
 
 		openIdx, openLen := findThinkOpenTag(remaining)
 		if openIdx < 0 {
-			chunks = appendNonEmptyDeltaChunk(chunks, remaining)
-			return chunks
+			parts = appendNonEmptyChatTextPart(parts, "text", remaining)
+			return parts
 		}
-		chunks = appendNonEmptyDeltaChunk(chunks, remaining[:openIdx])
+		parts = appendNonEmptyChatTextPart(parts, "text", remaining[:openIdx])
 		remaining = remaining[openIdx+openLen:]
 		state.thinkTagOpen = true
 	}
-	return chunks
+	return parts
+}
+
+func appendNonEmptyChatTextPart(parts []chatTextDeltaPart, kind, text string) []chatTextDeltaPart {
+	if text == "" {
+		return parts
+	}
+	return append(parts, chatTextDeltaPart{kind: kind, text: text})
 }
 
 func appendNonEmptyThinkingChunk(chunks [][]byte, text string) [][]byte {

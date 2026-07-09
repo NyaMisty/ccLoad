@@ -319,25 +319,6 @@ func (s *Server) getChannelTypesMapCached(ctx context.Context) (map[int64]string
 	return channelTypes, nil
 }
 
-// HandleCooldownStats 获取当前冷却状态监控指标
-// GET /admin/cooldown/stats
-func (s *Server) HandleCooldownStats(c *gin.Context) {
-	// 优先走缓存层，缓存不可用时自动降级到数据库查询
-	channelCooldowns, _ := s.getAllChannelCooldowns(c.Request.Context())
-	keyCooldowns, _ := s.getAllKeyCooldowns(c.Request.Context())
-
-	var keyCount int
-	for _, m := range keyCooldowns {
-		keyCount += len(m)
-	}
-
-	response := gin.H{
-		"channel_cooldowns": len(channelCooldowns),
-		"key_cooldowns":     keyCount,
-	}
-	RespondJSON(c, http.StatusOK, response)
-}
-
 // HandleGetChannelTypes 获取渠道类型配置(公开端点,前端动态加载)
 // GET /public/channel-types
 // 编译时常量，浏览器缓存24小时减少HF Spaces等高延迟环境的网络往返
@@ -378,15 +359,27 @@ func (s *Server) HandleGetModels(c *gin.Context) {
 	channelType := c.Query("channel_type")
 	logFilter := &model.LogFilter{LogSource: model.LogSourceProxy}
 
-	models, err := s.store.GetDistinctModels(c.Request.Context(), since, until, channelType, logFilter)
-	if err != nil {
-		RespondError(c, http.StatusInternalServerError, err)
+	var (
+		models                 []string
+		channels               []model.ChannelNameID
+		wg                     sync.WaitGroup
+		modelsErr, channelsErr error
+	)
+
+	wg.Go(func() {
+		models, modelsErr = s.store.GetDistinctModels(c.Request.Context(), since, until, channelType, logFilter)
+	})
+	wg.Go(func() {
+		channels, channelsErr = s.store.GetDistinctChannels(c.Request.Context(), since, until, channelType, logFilter)
+	})
+	wg.Wait()
+
+	if modelsErr != nil {
+		RespondError(c, http.StatusInternalServerError, modelsErr)
 		return
 	}
-
-	channels, err := s.store.GetDistinctChannels(c.Request.Context(), since, until, channelType, logFilter)
-	if err != nil {
-		RespondError(c, http.StatusInternalServerError, err)
+	if channelsErr != nil {
+		RespondError(c, http.StatusInternalServerError, channelsErr)
 		return
 	}
 

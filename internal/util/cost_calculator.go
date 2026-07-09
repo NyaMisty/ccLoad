@@ -19,11 +19,11 @@ type ModelPricing struct {
 	HasCacheReadPrice  bool    // 是否使用显式缓存读取价格；false 时按模型系列倍率回退计算
 
 	// 缓存读取 token 是否参与高/低档选择。
-	// MiMo 系列按「input + cache_read」总量分档（缓存读也走高档价），需置 true；
+	// MiMo / Grok 等系列按「input + cache_read」总量分档（缓存读也走高档价），需置 true；
 	// Gemini 长上下文分档只看非缓存 prompt size，缓存读不得推高分档，保持 false。
 	CacheReadCountsTowardTier bool
 
-	// 长上下文定价（>200k tokens，Claude/Gemini）
+	// 长上下文定价（>200k tokens，Claude/Gemini/xAI）
 	// 如果为0，表示无分段定价，使用InputPrice/OutputPrice
 	InputPriceHigh  float64 // 高上下文输入价格（$/1M tokens, >200k context）
 	OutputPriceHigh float64 // 高上下文输出价格（$/1M tokens, >200k context）
@@ -88,6 +88,22 @@ var (
 		{MaxInputTokens: 128_000, InputPrice: 0.75, OutputPrice: 3.75},
 		{MaxInputTokens: 200_000, InputPrice: 1.20, OutputPrice: 6.00},
 	}
+
+	grok45Pricing = ModelPricing{
+		InputPrice: 2.00, OutputPrice: 6.00, CacheReadPrice: 0.50, HasCacheReadPrice: true,
+		InputPriceHigh: 4.00, OutputPriceHigh: 12.00, CacheReadPriceHigh: 1.00,
+		CacheReadCountsTowardTier: true,
+	}
+	grok420Pricing = ModelPricing{
+		InputPrice: 1.25, OutputPrice: 2.50, CacheReadPrice: 0.20, HasCacheReadPrice: true,
+		InputPriceHigh: 2.50, OutputPriceHigh: 5.00, CacheReadPriceHigh: 0.40,
+		CacheReadCountsTowardTier: true,
+	}
+	grokBuildPricing = ModelPricing{
+		InputPrice: 1.00, OutputPrice: 2.00, CacheReadPrice: 0.20, HasCacheReadPrice: true,
+		InputPriceHigh: 2.00, OutputPriceHigh: 4.00, CacheReadPriceHigh: 0.40,
+		CacheReadCountsTowardTier: true,
+	}
 )
 
 // ImageGenerationToolUsage 是 Responses image_generation 工具返回的 token 用量。
@@ -147,6 +163,7 @@ var imageGenerationFallbackCostByModel = map[string]imageGenerationFallbackPrici
 // - Gemini: https://ai.google.dev/gemini-api/docs/pricing
 var basePricing = map[string]ModelPricing{
 	// ========== Claude 模型 ==========
+	"claude-sonnet-5":   {InputPrice: 3.00, OutputPrice: 15.00}, // 同 claude-sonnet-4-6
 	"claude-sonnet-4-6": {InputPrice: 3.00, OutputPrice: 15.00}, // 全1M窗口统一价格
 	"claude-sonnet-4-5": {
 		InputPrice: 3.00, OutputPrice: 15.00,
@@ -176,6 +193,10 @@ var basePricing = map[string]ModelPricing{
 	"claude-haiku":  {InputPrice: 1.00, OutputPrice: 5.00},
 
 	// ========== OpenAI GPT-5系列 ==========
+	"gpt-5.6":       {InputPrice: 5.00, OutputPrice: 30.00},
+	"gpt-5.6-sol":   {InputPrice: 5.00, OutputPrice: 30.00},
+	"gpt-5.6-terra": {InputPrice: 2.50, OutputPrice: 15.00},
+	"gpt-5.6-luna":  {InputPrice: 1.00, OutputPrice: 6.00},
 	"gpt-5.5": {
 		InputPrice: 5.00, OutputPrice: 30.00,
 		InputPriceHigh: 10.00, OutputPriceHigh: 45.00, // >272K context; 2× gpt-5.4
@@ -284,9 +305,10 @@ var basePricing = map[string]ModelPricing{
 	"gemini-1.5-flash":      {InputPrice: 0.20, OutputPrice: 0.60},
 
 	// ========== 智谱 GLM 模型 ==========
-	// 来源：用户提供的价格表截图（2026-03）
+	// 来源：https://docs.z.ai/guides/overview/pricing
 	"glm-5":               {InputPrice: 1.00, OutputPrice: 3.20, CacheReadPrice: 0.20, HasCacheReadPrice: true},
-	"glm-5.1":             {InputPrice: 1.00, OutputPrice: 3.20, CacheReadPrice: 0.20, HasCacheReadPrice: true},
+	"glm-5.2":             {InputPrice: 1.40, OutputPrice: 4.40, CacheReadPrice: 0.26, HasCacheReadPrice: true},
+	"glm-5.1":             {InputPrice: 1.40, OutputPrice: 4.40, CacheReadPrice: 0.26, HasCacheReadPrice: true},
 	"glm-5-turbo":         {InputPrice: 1.20, OutputPrice: 4.00, CacheReadPrice: 0.24, HasCacheReadPrice: true},
 	"glm-5-code":          {InputPrice: 1.20, OutputPrice: 5.00, CacheReadPrice: 0.30, HasCacheReadPrice: true},
 	"glm-4.7":             {InputPrice: 0.60, OutputPrice: 2.20, CacheReadPrice: 0.11, HasCacheReadPrice: true},
@@ -325,6 +347,12 @@ var basePricing = map[string]ModelPricing{
 	"mimo-v2-omni":    {InputPrice: 0.40, OutputPrice: 2.00, CacheReadPrice: 0.08, HasCacheReadPrice: true},
 	"mimo-v2.5-flash": {InputPrice: 0.10, OutputPrice: 0.30, CacheReadPrice: 0.01, HasCacheReadPrice: true},
 	"mimo-v2-flash":   {InputPrice: 0.10, OutputPrice: 0.30, CacheReadPrice: 0.01, HasCacheReadPrice: true},
+
+	// ========== Cerebras 模型 ==========
+	// 来源：https://inference-docs.cerebras.ai/resources/pricing
+	"zai-glm-4.7":           {InputPrice: 2.25, OutputPrice: 2.75},
+	"gemma-4-31b":           {InputPrice: 0.99, OutputPrice: 1.49},
+	"cerebras-gpt-oss-120b": {InputPrice: 0.35, OutputPrice: 0.75},
 
 	// ========== Moonshot AI / Kimi 模型 ==========
 	// 来源: https://api.pricepertoken.com/api/provider-pricing-history/?provider=moonshotai
@@ -537,32 +565,38 @@ var basePricing = map[string]ModelPricing{
 	"deepseek-prover-v2":            {InputPrice: 0.50, OutputPrice: 2.18},
 
 	// ========== xAI Grok 模型 ==========
-	// 来源: https://api.pricepertoken.com/api/provider-pricing-history/?provider=xai
-	"grok-4.3":                   {InputPrice: 1.25, OutputPrice: 2.50, CacheReadPrice: 0.20, HasCacheReadPrice: true},
-	"grok-4.20":                  {InputPrice: 1.25, OutputPrice: 2.50, CacheReadPrice: 0.20, HasCacheReadPrice: true},
-	"grok-4.20-beta":             {InputPrice: 2.00, OutputPrice: 6.00, CacheReadPrice: 0.20, HasCacheReadPrice: true},
-	"grok-4.20-multi-agent":      {InputPrice: 2.00, OutputPrice: 6.00, CacheReadPrice: 0.20, HasCacheReadPrice: true},
-	"grok-4.20-multi-agent-beta": {InputPrice: 2.00, OutputPrice: 6.00, CacheReadPrice: 0.20, HasCacheReadPrice: true},
-	"grok-4.1-fast":              {InputPrice: 0.20, OutputPrice: 0.50, CacheReadPrice: 0.05, HasCacheReadPrice: true},
-	"grok-4":                     {InputPrice: 3.00, OutputPrice: 15.00, CacheReadPrice: 0.75, HasCacheReadPrice: true},
-	"grok-4-fast":                {InputPrice: 0.20, OutputPrice: 0.50, CacheReadPrice: 0.05, HasCacheReadPrice: true},
-	"grok-build-0.1":             {InputPrice: 1.00, OutputPrice: 2.00, CacheReadPrice: 0.20, HasCacheReadPrice: true},
-	"grok-3":                     {InputPrice: 3.00, OutputPrice: 15.00, CacheReadPrice: 0.75, HasCacheReadPrice: true},
-	"grok-3-beta":                {InputPrice: 3.00, OutputPrice: 15.00, CacheReadPrice: 0.75, HasCacheReadPrice: true},
-	"grok-3-mini":                {InputPrice: 0.30, OutputPrice: 0.50, CacheReadPrice: 0.075, HasCacheReadPrice: true},
-	"grok-3-mini-beta":           {InputPrice: 0.30, OutputPrice: 0.50, CacheReadPrice: 0.075, HasCacheReadPrice: true},
-	"grok-2":                     {InputPrice: 2.00, OutputPrice: 10.00},
-	"grok-2-1212":                {InputPrice: 2.00, OutputPrice: 10.00},
-	"grok-2-vision-1212":         {InputPrice: 2.00, OutputPrice: 10.00},
-	"grok-2-mini":                {InputPrice: 0.20, OutputPrice: 0.50},
-	"grok-code-fast-1":           {InputPrice: 0.20, OutputPrice: 1.50, CacheReadPrice: 0.02, HasCacheReadPrice: true},
-	"grok-vision-beta":           {InputPrice: 5.00, OutputPrice: 15.00},
+	// 来源: https://docs.x.ai/developers/pricing
+	"grok-4.5":                     grok45Pricing,
+	"grok-4.3":                     grok420Pricing,
+	"grok-4.20":                    grok420Pricing,
+	"grok-4.20-0309-reasoning":     grok420Pricing,
+	"grok-4.20-0309-non-reasoning": grok420Pricing,
+	"grok-4.20-multi-agent-0309":   grok420Pricing,
+	"grok-4.20-beta":               grok420Pricing,
+	"grok-4.20-multi-agent":        grok420Pricing,
+	"grok-4.20-multi-agent-beta":   grok420Pricing,
+	"grok-4.1-fast":                {InputPrice: 0.20, OutputPrice: 0.50, CacheReadPrice: 0.05, HasCacheReadPrice: true},
+	"grok-4":                       {InputPrice: 3.00, OutputPrice: 15.00, CacheReadPrice: 0.75, HasCacheReadPrice: true},
+	"grok-4-fast":                  {InputPrice: 0.20, OutputPrice: 0.50, CacheReadPrice: 0.05, HasCacheReadPrice: true},
+	"grok-build-0.1":               grokBuildPricing,
+	"grok-3":                       {InputPrice: 3.00, OutputPrice: 15.00, CacheReadPrice: 0.75, HasCacheReadPrice: true},
+	"grok-3-beta":                  {InputPrice: 3.00, OutputPrice: 15.00, CacheReadPrice: 0.75, HasCacheReadPrice: true},
+	"grok-3-mini":                  {InputPrice: 0.30, OutputPrice: 0.50, CacheReadPrice: 0.075, HasCacheReadPrice: true},
+	"grok-3-mini-beta":             {InputPrice: 0.30, OutputPrice: 0.50, CacheReadPrice: 0.075, HasCacheReadPrice: true},
+	"grok-2":                       {InputPrice: 2.00, OutputPrice: 10.00},
+	"grok-2-1212":                  {InputPrice: 2.00, OutputPrice: 10.00},
+	"grok-2-vision-1212":           {InputPrice: 2.00, OutputPrice: 10.00},
+	"grok-2-mini":                  {InputPrice: 0.20, OutputPrice: 0.50},
+	"grok-code-fast":               grokBuildPricing,
+	"grok-code-fast-1":             grokBuildPricing,
+	"grok-vision-beta":             {InputPrice: 5.00, OutputPrice: 15.00},
 
 	// xAI Grok 图像生成模型（按张计费，非token计费）
-	// 来源: https://docs.x.ai/developers/models
-	"grok-2-image-1212":      {FixedCostPerRequest: 0.07},
-	"grok-imagine-image":     {FixedCostPerRequest: 0.02},
-	"grok-imagine-image-pro": {FixedCostPerRequest: 0.07},
+	// 来源: https://docs.x.ai/developers/pricing
+	"grok-2-image-1212":          {FixedCostPerRequest: 0.07},
+	"grok-imagine-image":         {FixedCostPerRequest: 0.02},
+	"grok-imagine-image-quality": {FixedCostPerRequest: 0.05},
+	"grok-imagine-image-pro":     {FixedCostPerRequest: 0.07},
 
 	// ========== MiniMax 模型 ==========
 	// 来源: https://api.pricepertoken.com/api/provider-pricing-history/?provider=minimax
@@ -573,6 +607,10 @@ var basePricing = map[string]ModelPricing{
 	"minimax-m2.1":   {InputPrice: 0.29, OutputPrice: 0.95, CacheReadPrice: 0.03, HasCacheReadPrice: true},
 	"minimax-m2.5":   {InputPrice: 0.15, OutputPrice: 0.90, CacheReadPrice: 0.027, HasCacheReadPrice: true},
 	"minimax-m2.7":   {InputPrice: 0.279, OutputPrice: 1.20, CacheReadPrice: 0.059, HasCacheReadPrice: true},
+	"minimax-m3": {
+		InputPrice: 0.30, OutputPrice: 1.20, CacheReadPrice: 0.06, HasCacheReadPrice: true,
+		InputPriceHigh: 0.60, OutputPriceHigh: 2.40, CacheReadPriceHigh: 0.12,
+	},
 
 	// ========== 美团 LongCat 模型 ==========
 	// 来源: https://api.pricepertoken.com/api/provider-pricing-history/?provider=meituan
@@ -673,7 +711,14 @@ var modelAliases = map[string]string{
 	"deepseek-v3": "deepseek-chat",
 
 	// xAI 别名
-	"grok-beta": "grok-3",
+	"grok-4.3-latest":       "grok-4.3",
+	"grok-4.5-latest":       "grok-4.5",
+	"grok-beta":             "grok-3",
+	"grok-build-latest":     "grok-4.5",
+	"grok-code-fast":        "grok-build-0.1",
+	"grok-code-fast-1":      "grok-build-0.1",
+	"grok-code-fast-1-0825": "grok-build-0.1",
+	"grok-latest":           "grok-4.3",
 
 	// Qwen 别名（常见命名变体）
 	"qwen-3.5-plus":                  "qwen3.5-plus",
@@ -722,9 +767,9 @@ const (
 	// 参考：https://docs.claude.com/en/docs/about-claude/pricing
 	cacheReadMultiplierOpus = 0.1
 
-	// cacheWrite5mMultiplier 5分钟缓存写入价格倍数（相对于基础input价格）
-	// 5m Cache Write = Input Price × 1.25 (25%溢价)
-	// 仅适用于Claude模型（OpenAI不支持cache_creation）
+	// cacheWrite5mMultiplier 缓存写入价格倍数（相对于基础input价格）
+	// Cache Write = Input Price × 1.25 (25%溢价)
+	// 适用于 Anthropic 5m cache write 和 OpenAI cache_creation_input_tokens。
 	// 参考：https://platform.claude.com/docs/en/build-with-claude/prompt-caching
 	cacheWrite5mMultiplier = 1.25
 
@@ -746,6 +791,10 @@ const (
 	// gpt54TierThreshold GPT-5.4 系列分档阈值（tokens）
 	// 参考：<=272K 与 >272K context length
 	gpt54TierThreshold = 272_000
+
+	// minimaxM3TierThreshold MiniMax-M3 分档阈值（tokens）
+	// 参考：<=512K 与 >512K input tokens
+	minimaxM3TierThreshold = 512_000
 )
 
 func getTierThresholdForModel(model string) int {
@@ -754,6 +803,8 @@ func getTierThresholdForModel(model string) int {
 	case strings.HasPrefix(lowerModel, "gpt-5.5"),
 		strings.HasPrefix(lowerModel, "gpt-5.4"):
 		return gpt54TierThreshold
+	case strings.HasPrefix(lowerModel, "minimax-m3"):
+		return minimaxM3TierThreshold
 	case strings.HasPrefix(lowerModel, "qwen3.5-plus"),
 		strings.HasPrefix(lowerModel, "qwen-3.5-plus"),
 		strings.HasPrefix(lowerModel, "qwen3.6-plus"),
@@ -815,7 +866,7 @@ func CalculateCostDetailed(model string, inputTokens, outputTokens, cacheReadTok
 	// 注意:价格是per 1M tokens,需要除以1,000,000
 	cost := 0.0
 
-	// 分段定价逻辑（当前用于 Gemini / Qwen / MiMo 系列）
+	// 分段定价逻辑（当前用于 Gemini / Qwen / MiMo / MiniMax-M3 系列）
 	// 默认仅按非缓存输入判断；仅 MiMo 这类「input + cache_read 总量分档」的模型
 	// （CacheReadCountsTowardTier=true）才把缓存读计入分档。Gemini 长上下文只看
 	// 非缓存 prompt size，缓存读不得推高分档（否则 256K 缓存读会误触高档 input 价）。
@@ -965,9 +1016,13 @@ func isOpenAIModel(model string) bool {
 }
 
 // serviceTierModels 列出支持 priority/flex service_tier 的 OpenAI 模型。
-// 来源：OpenAI 官方 Pricing 页 Priority 表（2026-03-06）。
+// 来源：OpenAI 官方 Pricing 页 Priority 表；GPT-5.6 预览公告明确支持 API priority processing。
 // 注意：gpt-5.4-pro 虽在表中出现但价格列为空，不算支持。
 var serviceTierModels = map[string]bool{
+	"gpt-5.6":           true,
+	"gpt-5.6-sol":       true,
+	"gpt-5.6-terra":     true,
+	"gpt-5.6-luna":      true,
 	"gpt-5.5":           true,
 	"gpt-5.4":           true,
 	"gpt-5.4-mini":      true,
@@ -1142,7 +1197,7 @@ func getOpenAICacheMultiplier(model string) float64 {
 // 桶内顺序就是匹配优先级。
 var fuzzyPrefixes = []string{
 	// Claude模型（按版本降序，具体版本优先，通用兜底在最后）
-	"claude-sonnet-4-6", "claude-sonnet-4-5", "claude-haiku-4-5", "claude-opus-4-6", "claude-opus-4-5", "claude-opus-4-1",
+	"claude-sonnet-5", "claude-sonnet-4-6", "claude-sonnet-4-5", "claude-haiku-4-5", "claude-opus-4-6", "claude-opus-4-5", "claude-opus-4-1",
 	"claude-sonnet-4-0", "claude-opus-4-0", "claude-3-7-sonnet",
 	"claude-3-5-sonnet", "claude-3-5-haiku",
 	"claude-3-opus", "claude-3-sonnet", "claude-3-haiku",
@@ -1155,6 +1210,7 @@ var fuzzyPrefixes = []string{
 	"gemini-1.5-pro", "gemini-1.5-flash",
 
 	// OpenAI GPT系列（更长的前缀优先，避免gpt-4o-legacy被gpt-4o截断）
+	"gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.6",
 	"gpt-5-pro", "gpt-5-nano", "gpt-5-mini", "gpt-5.4-pro", "gpt-5.4-mini", "gpt-5.4-nano", "gpt-5.4", "gpt-5",
 	"gpt-4.1-nano", "gpt-4.1-mini", "gpt-4.1",
 	"gpt-4o-legacy", "gpt-4o-mini", "gpt-4o", // legacy必须在gpt-4o之前
@@ -1220,16 +1276,18 @@ var fuzzyPrefixes = []string{
 	"deepseek-prover-v2",
 
 	// xAI Grok模型（长前缀优先）
-	"grok-4.20-multi-agent-beta", "grok-4.20-multi-agent", "grok-4.20-beta", "grok-4.20",
+	"grok-4.5",
+	"grok-4.20-multi-agent-0309", "grok-4.20-multi-agent-beta", "grok-4.20-multi-agent",
+	"grok-4.20-0309-non-reasoning", "grok-4.20-0309-reasoning", "grok-4.20-beta", "grok-4.20",
 	"grok-4.3", "grok-4.1-fast", "grok-4.1", "grok-4-fast", "grok-4",
 	"grok-build-0.1",
 	"grok-3-mini-beta", "grok-3-mini", "grok-3-beta", "grok-3",
 	"grok-2-vision-1212", "grok-2-image-1212", "grok-2-1212", "grok-2-mini", "grok-2",
-	"grok-imagine-image-pro", "grok-imagine-image",
-	"grok-code-fast-1", "grok-vision-beta",
+	"grok-imagine-image-quality", "grok-imagine-image-pro", "grok-imagine-image",
+	"grok-code-fast-1", "grok-code-fast", "grok-vision-beta",
 
 	// MiniMax模型
-	"minimax-m2.7", "minimax-m2.5", "minimax-m2.1", "minimax-m2-her", "minimax-m2", "minimax-m1", "minimax-01",
+	"minimax-m3", "minimax-m2.7", "minimax-m2.5", "minimax-m2.1", "minimax-m2-her", "minimax-m2", "minimax-m1", "minimax-01",
 
 	// 美团 LongCat模型（长前缀优先）
 	"longcat-flash-chat-2602-exp", "longcat-flash-chat:free", "longcat-flash-chat",

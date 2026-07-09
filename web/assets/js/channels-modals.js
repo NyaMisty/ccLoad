@@ -136,55 +136,6 @@ function getSelectedProtocolTransformMode() {
   return window.ChannelProtocolConfig.normalizeProtocolTransformMode(selected);
 }
 
-const MODEL_TABLE_ROW_LIMITS = Object.freeze({
-  totalBudget: 14,
-  maxUrlRows: 3,
-  maxKeyRows: 4,
-  minModelRows: 7,
-  maxModelRows: 12
-});
-
-function normalizeOccupiedTableRows(count, maxRows) {
-  const rows = Number(count);
-  if (!Number.isFinite(rows) || rows <= 0) return 1;
-  return Math.min(Math.ceil(rows), maxRows);
-}
-
-function calculateModelTableVisibleRows(urlCount, keyCount) {
-  const urlRows = normalizeOccupiedTableRows(urlCount, MODEL_TABLE_ROW_LIMITS.maxUrlRows);
-  const keyRows = normalizeOccupiedTableRows(keyCount, MODEL_TABLE_ROW_LIMITS.maxKeyRows);
-  const availableRows = MODEL_TABLE_ROW_LIMITS.totalBudget - urlRows - keyRows;
-
-  return Math.max(
-    MODEL_TABLE_ROW_LIMITS.minModelRows,
-    Math.min(MODEL_TABLE_ROW_LIMITS.maxModelRows, availableRows)
-  );
-}
-
-function getCurrentVisibleKeyRowCount() {
-  if (typeof getVisibleKeyIndices === 'function') {
-    return getVisibleKeyIndices().length;
-  }
-  if (typeof inlineKeyTableData !== 'undefined' && Array.isArray(inlineKeyTableData)) {
-    return inlineKeyTableData.length;
-  }
-  return 1;
-}
-
-function syncChannelModelTableRows() {
-  const container = document.querySelector('#redirectTableBody')?.closest('.inline-table-container');
-  if (!container) return;
-
-  const urlCount = typeof inlineURLTableData !== 'undefined' && Array.isArray(inlineURLTableData)
-    ? inlineURLTableData.length
-    : 1;
-  const keyCount = getCurrentVisibleKeyRowCount();
-  const rows = calculateModelTableVisibleRows(urlCount, keyCount);
-
-  container.style.setProperty('--channel-model-visible-rows', String(rows));
-  container.dataset.visibleRows = String(rows);
-}
-
 async function syncScheduledCheckVisibility() {
   const scheduledCheckWrapper = document.getElementById('channelScheduledCheckEnabledWrapper');
   const scheduledCheckModelWrapper = document.getElementById('channelScheduledCheckModelWrapper');
@@ -310,8 +261,6 @@ async function handleChannelSaveSuccess({ isNewChannel, newChannelType, savedCha
     });
     return;
   }
-
-  clearChannelsCache();
 
   const hasFilters = typeof filters !== 'undefined' && filters;
   const currentType = hasFilters ? filters.channelType : 'all';
@@ -450,7 +399,7 @@ async function showAddModal() {
   renderInlineURLTable();
   clearChannelDuplicateHint();
 
-  inlineKeyTableData = [''];
+  inlineKeyTableData = [makeInlineKeyRow()];
   inlineKeyVisible = true;
   document.getElementById('inlineEyeIcon').style.display = 'none';
   document.getElementById('inlineEyeOffIcon').style.display = 'block';
@@ -460,6 +409,7 @@ async function showAddModal() {
 
   resetChannelFormDirty();
   document.getElementById('channelModal').classList.add('show');
+  scheduleChannelEditorTableSizingSync();
 }
 
 async function editChannel(id) {
@@ -501,9 +451,8 @@ async function editChannel(id) {
     };
   });
 
-  inlineKeyTableData = apiKeys.map(k => k.api_key || k);
-  if (inlineKeyTableData.length === 0) {
-    inlineKeyTableData = [''];
+  setInlineKeyTableDataFromAPI(apiKeys);
+  if (inlineKeyTableData.length === 1 && !inlineKeyTableData[0].api_key) {
     currentChannelKeyCooldowns = [];
   }
 
@@ -547,6 +496,7 @@ async function editChannel(id) {
 
   resetChannelFormDirty();
   document.getElementById('channelModal').classList.add('show');
+  scheduleChannelEditorTableSizingSync();
 }
 
 async function fetchEditableChannelKeys(id) {
@@ -704,8 +654,9 @@ async function saveChannel(event) {
     return;
   }
 
-  const validKeys = inlineKeyTableData.filter(k => k && k.trim());
-  if (validKeys.length === 0) {
+  const validKeyRows = getValidInlineKeyRows();
+  const validKeys = validKeyRows.map(row => row.api_key);
+  if (validKeyRows.length === 0) {
     alert(window.t('channels.atLeastOneKey'));
     return;
   }
@@ -748,6 +699,7 @@ async function saveChannel(event) {
     name: document.getElementById('channelName').value.trim(),
     url: validURLs.join('\n'),
     api_key: validKeys.join(','),
+    api_keys: validKeyRows.map(row => ({ api_key: row.api_key, note: row.note || '' })),
     channel_type: channelType,
     protocol_transform_mode: getSelectedProtocolTransformMode(),
     protocol_transforms: getSelectedProtocolTransforms(channelType),
@@ -848,7 +800,6 @@ async function confirmDelete() {
       channelsCurrentPage = 1;
     }
     if (typeof saveChannelsFilters === 'function') saveChannelsFilters();
-    clearChannelsCache();
     await reloadChannelsList();
     if (window.showSuccess) {
       if (type === 'batch') {
@@ -964,7 +915,6 @@ async function toggleChannel(id, enabled) {
       body: JSON.stringify({ enabled })
     });
     if (!resp.success) throw new Error(resp.error || window.t('common.failed'));
-    clearChannelsCache();
     if (window.showSuccess) window.showSuccess(enabled ? window.t('channels.channelEnabled') : window.t('channels.channelDisabled'));
   } catch (e) {
     rollbackLocalChange();
@@ -1155,7 +1105,6 @@ async function batchSetSelectedChannelsEnabled(enabled) {
     const data = resp.data || {};
     selectedChannelIds.clear();
     if (typeof saveChannelsFilters === 'function') saveChannelsFilters();
-    clearChannelsCache();
     await reloadChannelsList();
 
     if (window.showSuccess) {
@@ -1379,7 +1328,6 @@ async function batchRefreshSelectedChannels(mode) {
 
   selectedChannelIds.clear();
   if (typeof saveChannelsFilters === 'function') saveChannelsFilters();
-  clearChannelsCache();
   await reloadChannelsList();
   updateBatchChannelSelectionUI();
 }
@@ -1421,10 +1369,7 @@ async function copyChannel(id, name) {
     console.error('Failed to fetch API Keys', e);
   }
 
-  inlineKeyTableData = apiKeys.map(k => k.api_key || k);
-  if (inlineKeyTableData.length === 0) {
-    inlineKeyTableData = [''];
-  }
+  setInlineKeyTableDataFromAPI(apiKeys);
 
   inlineKeyVisible = true;
   document.getElementById('inlineEyeIcon').style.display = 'none';
@@ -1465,6 +1410,7 @@ async function copyChannel(id, name) {
 
   resetChannelFormDirty();
   document.getElementById('channelModal').classList.add('show');
+  scheduleChannelEditorTableSizingSync();
 }
 
 function generateCopyName(originalName) {
@@ -1783,7 +1729,6 @@ function renderRedirectTable() {
   // 计数所有有效模型（只要有模型名称就算）
   const validCount = redirectTableData.filter(r => r.model && r.model.trim()).length;
   countSpan.textContent = validCount;
-  syncChannelModelTableRows();
   syncScheduledCheckModelState();
 
   // 初始化事件委托（仅一次）
@@ -1800,6 +1745,7 @@ function renderRedirectTable() {
       // 降级：模板不存在时使用简单HTML
       tbody.innerHTML = `<tr><td colspan="4" style="padding: 20px; text-align: center; color: var(--neutral-500);">${window.t('channels.noModelConfig')}</td></tr>`;
     }
+    syncChannelEditorTableSizing();
     return;
   }
 
@@ -1808,6 +1754,7 @@ function renderRedirectTable() {
 
   if (visibleIndices.length === 0) {
     tbody.innerHTML = `<tr><td colspan="4" style="padding: 20px; text-align: center; color: var(--neutral-500);">${window.t('channels.noMatchingModels')}</td></tr>`;
+    syncChannelEditorTableSizing();
     return;
   }
 
@@ -1820,6 +1767,7 @@ function renderRedirectTable() {
 
   tbody.innerHTML = '';
   tbody.appendChild(fragment);
+  syncChannelEditorTableSizing();
 
   // 更新全选复选框和批量删除按钮状态
   updateSelectAllModelsCheckbox();
@@ -2052,9 +2000,7 @@ function areModelRowsEqual(left, right) {
 async function fetchModelsFromAPI() {
   const channelUrl = getValidInlineURLs()[0] || '';
   const channelType = document.querySelector('input[name="channelType"]:checked')?.value || 'anthropic';
-  const firstValidKey = inlineKeyTableData
-    .map(key => (key || '').trim())
-    .filter(Boolean)[0];
+  const firstValidKey = (getValidInlineKeyRows()[0] || {}).api_key || '';
 
   if (!channelUrl) {
     if (window.showError) {
@@ -2133,6 +2079,7 @@ const COMMON_MODELS = {
   anthropic: [
     'claude-haiku-4-5-20251001',
     'claude-opus-4-8',
+    'claude-sonnet-5',
     'claude-sonnet-4-6',
   ],
   codex: [

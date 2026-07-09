@@ -10,7 +10,6 @@ let selectedModelIndices = new Set(); // 选中的模型索引集合
 let currentModelFilter = ''; // 模型名称筛选关键字
 let defaultTestContent = 'When was Claude 3.5 Sonnet released?'; // Default test content (loaded from settings)
 let channelStatsRange = 'today'; // 渠道统计时间范围（从设置加载）
-let channelsCache = {}; // 按类型缓存渠道数据: {type: channels[]}（已弃用，保留 clearChannelsCache 兼容调用方）
 let selectedChannelIds = new Set(); // 选中的渠道ID（字符串，避免数字/字符串混用）
 let channelsCurrentPage = 1;
 let channelsPageSize = parseInt(localStorage.getItem('channels.pageSize'), 10) || 20;
@@ -53,7 +52,7 @@ const VIRTUAL_SCROLL_CONFIG = {
   ROW_HEIGHT: 40,           // 每行高度（像素）
   BUFFER_SIZE: 5,           // 上下缓冲区行数（减少滚动时的闪烁）
   ENABLE_THRESHOLD: 50,     // 启用虚拟滚动的阈值（Key数量）
-  CONTAINER_HEIGHT: 250     // 容器固定高度（像素）
+  CONTAINER_HEIGHT: 250     // 容器高度兜底值（像素）
 };
 
 let virtualScrollState = {
@@ -62,13 +61,9 @@ let virtualScrollState = {
   visibleStart: 0,
   visibleEnd: 0,
   rafId: null,
+  resizeObserver: null,
   filteredIndices: [] // 存储筛选后的索引列表（支持状态筛选）
 };
-
-// 清除渠道缓存（在增删改操作后调用）
-function clearChannelsCache() {
-  channelsCache = {};
-}
 
 function humanizeMS(ms) {
   let s = Math.ceil(ms / 1000);
@@ -94,39 +89,6 @@ function formatCompactNumber(num) {
   if (abs >= 1_000_000) return (num / 1_000_000).toFixed(1).replace(/\.0$/, '') + 'M';
   if (abs >= 1_000) return (num / 1_000).toFixed(1).replace(/\.0$/, '') + 'K';
   return num.toString();
-}
-
-function formatSuccessRate(success, total) {
-  if (success === null || success === undefined || total === null || total === undefined) return '--';
-  const succ = Number(success);
-  const ttl = Number(total);
-  if (!Number.isFinite(succ) || !Number.isFinite(ttl) || ttl <= 0) return '--';
-  return ((succ / ttl) * 100).toFixed(1) + '%';
-}
-
-function formatAvgFirstByte(value) {
-  if (value === null || value === undefined) return '--';
-  const num = Number(value);
-  if (!Number.isFinite(num) || num <= 0) return '--';
-  return num.toFixed(2) + window.t('common.seconds');
-}
-
-function formatCostValue(cost, effectiveCost) {
-  if (cost === null || cost === undefined) return '--';
-  const num = Number(cost);
-  if (!Number.isFinite(num)) return '--';
-  if (num === 0) return '$0.00';
-  if (num < 0) return '--';
-  if (effectiveCost !== undefined && effectiveCost !== null) {
-    return formatCostPair(num, effectiveCost);
-  }
-  return formatCost(num);
-}
-
-function getStatsRangeLabel(range) {
-  return window.getRangeLabel
-    ? window.getRangeLabel(range)
-    : window.t('index.timeRange.today');
 }
 
 function formatTimestampForFilename() {

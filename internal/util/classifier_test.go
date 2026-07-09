@@ -871,6 +871,12 @@ func TestClassify400Error(t *testing.T) {
 			reason:       "包含 api key 特征应判定为 Key 级错误",
 		},
 		{
+			name:         "gemini_api_key_not_valid",
+			responseBody: []byte(`{"error":{"code":400,"message":"API key not valid. Please pass a valid API key.","status":"INVALID_ARGUMENT"}}`),
+			expected:     ErrorLevelKey,
+			reason:       "Gemini 无效 API Key 应判定为 Key 级错误并触发 Key 冷却",
+		},
+		{
 			name:         "generic_message_mentions_api_key",
 			responseBody: []byte(`{"error": {"message": "Gateway rejected request; check API key configuration in dashboard"}}`),
 			expected:     ErrorLevelChannel,
@@ -1054,3 +1060,67 @@ func TestClientStatusFor(t *testing.T) {
 }
 
 // IsRetryableStatus 已移除：重试决策不应依赖静态状态码表，而应依赖 errorLevel/shouldRetry 等语义信息。
+
+func TestClassifyHTTPResponseWithMeta_UsageLimitReached(t *testing.T) {
+	t.Parallel()
+
+	t.Run("resets_in_seconds in error object", func(t *testing.T) {
+		body := []byte(`{"error":{"type":"usage_limit_reached","message":"The usage limit has been reached","resets_in_seconds":7260}}`)
+		result := ClassifyHTTPResponseWithMeta(429, nil, body)
+		if result.Level != ErrorLevelKey {
+			t.Fatalf("Level: got %v, want ErrorLevelKey", result.Level)
+		}
+		if !result.HasKeyCooldownUntil {
+			t.Fatal("expected HasKeyCooldownUntil")
+		}
+		if result.KeyCooldownReason != "USAGE_LIMIT_REACHED" {
+			t.Fatalf("reason: got %q, want USAGE_LIMIT_REACHED", result.KeyCooldownReason)
+		}
+		duration := time.Until(result.KeyCooldownUntil)
+		if duration < 7250*time.Second || duration > 7270*time.Second {
+			t.Fatalf("cooldown duration=%v, want about 7260s", duration)
+		}
+	})
+
+	t.Run("resets_at unix timestamp in error object", func(t *testing.T) {
+		resetsAt := time.Now().Add(2 * time.Hour).Unix()
+		body := []byte(`{"error":{"type":"usage_limit_reached","message":"The usage limit has been reached","resets_at":` +
+			fmt.Sprintf("%d", resetsAt) + `}}`)
+		result := ClassifyHTTPResponseWithMeta(429, nil, body)
+		if result.Level != ErrorLevelKey {
+			t.Fatalf("Level: got %v, want ErrorLevelKey", result.Level)
+		}
+		if !result.HasKeyCooldownUntil {
+			t.Fatal("expected HasKeyCooldownUntil")
+		}
+		cooldownDiff := result.KeyCooldownUntil.Unix() - resetsAt
+		if cooldownDiff < -2 || cooldownDiff > 2 {
+			t.Fatalf("cooldownUntil=%d, want resets_at=%d", result.KeyCooldownUntil.Unix(), resetsAt)
+		}
+	})
+
+	t.Run("resets_in_seconds takes priority over resets_at", func(t *testing.T) {
+		body := []byte(`{"error":{"type":"usage_limit_reached","message":"limit","resets_in_seconds":600,"resets_at":9999999999}}`)
+		result := ClassifyHTTPResponseWithMeta(429, nil, body)
+		if !result.HasKeyCooldownUntil {
+			t.Fatal("expected HasKeyCooldownUntil")
+		}
+		duration := time.Until(result.KeyCooldownUntil)
+		if duration < 590*time.Second || duration > 610*time.Second {
+			t.Fatalf("cooldown duration=%v, want about 600s (resets_in_seconds should win)", duration)
+		}
+	})
+
+	t.Run("no reset info falls back to 30 minutes", func(t *testing.T) {
+		body := []byte(`{"error":{"type":"usage_limit_reached","message":"The usage limit has been reached"}}`)
+		before := time.Now()
+		result := ClassifyHTTPResponseWithMeta(429, nil, body)
+		if !result.HasKeyCooldownUntil {
+			t.Fatal("expected HasKeyCooldownUntil")
+		}
+		duration := result.KeyCooldownUntil.Sub(before)
+		if duration < 29*time.Minute+55*time.Second || duration > 30*time.Minute+5*time.Second {
+			t.Fatalf("cooldown duration=%v, want about 30m", duration)
+		}
+	})
+}

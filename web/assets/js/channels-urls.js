@@ -230,9 +230,6 @@ function renderInlineURLTable() {
 
   updateSelectAllURLsCheckbox();
   updateURLBatchDeleteButton();
-  if (typeof syncChannelModelTableRows === 'function') {
-    syncChannelModelTableRows();
-  }
 }
 
 function setInlineURLTableData(rawURL) {
@@ -393,7 +390,7 @@ async function testInlineURL(index, buttonElement) {
     return;
   }
 
-  const firstKey = (inlineKeyTableData[0] || '').trim();
+  const firstKey = (getValidInlineKeyRows()[0] || {}).api_key || '';
   if (!firstKey) {
     alert(window.t('channels.emptyKeyCannotTest'));
     return;

@@ -42,6 +42,7 @@ type Store interface {
 	GetAllAPIKeys(ctx context.Context) (map[int64][]*model.APIKey, error)
 	CreateAPIKeysBatch(ctx context.Context, keys []*model.APIKey) error
 	UpdateAPIKeysStrategy(ctx context.Context, channelID int64, strategy string) error
+	UpdateAPIKeyNotes(ctx context.Context, channelID int64, notesByIndex map[int]string) error
 	SetAPIKeyDisabled(ctx context.Context, channelID int64, keyIndex int, disabled bool) error
 	DeleteAPIKey(ctx context.Context, channelID int64, keyIndex int) error
 	CompactKeyIndices(ctx context.Context, channelID int64, removedIndex int) error
@@ -97,7 +98,7 @@ type Store interface {
 	UpdateAuthToken(ctx context.Context, token *model.AuthToken) error
 	DeleteAuthToken(ctx context.Context, id int64) error
 	UpdateTokenLastUsed(ctx context.Context, tokenHash string, now time.Time) error
-	UpdateTokenStats(ctx context.Context, tokenHash string, isSuccess bool, duration float64, isStreaming bool, firstByteTime float64, promptTokens int64, completionTokens int64, cacheReadTokens int64, cacheCreationTokens int64, costUSD float64) error
+	UpdateTokenStats(ctx context.Context, tokenHash string, isSuccess bool, duration float64, isStreaming bool, firstByteTime float64, promptTokens int64, completionTokens int64, cacheReadTokens int64, cacheCreationTokens int64, costUSD float64, effectiveCostUSD float64) error
 	GetAuthTokenStatsInRange(ctx context.Context, startTime, endTime time.Time) (map[int64]*model.AuthTokenRangeStats, error)
 	FillAuthTokenRPMStats(ctx context.Context, stats map[int64]*model.AuthTokenRangeStats, startTime, endTime time.Time, isToday bool) error
 

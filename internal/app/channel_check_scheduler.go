@@ -12,8 +12,8 @@ import (
 
 const defaultChannelCheckIntervalHours = 0
 
-func normalizeChannelCheckIntervalHours(hours int) int {
-	if hours < 0 {
+func normalizeChannelCheckIntervalHours(hours float64) float64 {
+	if hours <= 0 {
 		return 0
 	}
 	return hours
@@ -136,7 +136,7 @@ func (s *Server) runScheduledChannelChecks(ctx context.Context) error {
 		}
 		requestedModel := req.Model
 		result := s.executeChannelTest(ctx, cfg, keyIndex, apiKey, req)
-		s.persistDetectionLog(ctx, detectionLogFromResult(cfg, model.LogSourceScheduledCheck, requestedModel, req.Model, apiKey, "", 0, result))
+		s.persistDetectionLog(ctx, detectionLogFromResult(cfg, model.LogSourceScheduledCheck, requestedModel, req.Model, apiKey, "", 0, req.ThinkingEffort, result))
 		logScheduledChannelCheckResult(cfg, keyIndex, req.Model, result)
 	}
 

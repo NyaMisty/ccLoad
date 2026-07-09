@@ -89,13 +89,17 @@ func (s *Server) buildProxyRequest(
 	// 1. 构建完整 URL
 	upstreamURL := buildUpstreamURL(baseURL, requestPath, rawQuery)
 
-	// 1.5 anyrouter 渠道：为 /v1/messages 自动注入 adaptive thinking
-	body = maybeInjectAnyrouterAdaptiveThinking(cfg, requestPath, body)
+	// 1.5 anyrouter Anthropic thinking 兜底归一
+	body = normalizeAnyrouterAdaptiveThinking(cfg, requestPath, body)
 
 	// 1.6 自定义请求体规则（仅对 JSON body 生效）
 	body = applyBodyRules(hdr.Get("Content-Type"), body, cfg.BodyRules())
 
-	// 1.7 Codex Responses 缓存提示：向 body 注入 prompt_cache_key
+	// 1.7 Codex Responses 入站历史归一：tool_search_*.arguments 必须是对象；
+	// anyrouter/new-api 不接受 tool_search_* 历史项，发出前直接清理。
+	body = prepareCodexResponsesBodyForUpstream(cfg, protocol.Protocol(runtimeUpstreamProtocol(reqCtx, cfg)), requestPath, body)
+
+	// 1.8 Codex Responses 缓存提示：向 body 注入 prompt_cache_key
 	codexSessionID := resolveCodexSessionHint(reqCtx, body, apiKey, hdr)
 	if codexSessionID != "" {
 		body = injectCodexPromptCacheKey(body, codexSessionID)
@@ -111,7 +115,7 @@ func (s *Server) buildProxyRequest(
 	copyRequestHeaders(req, hdr)
 
 	// 4. 注入认证头
-	injectAPIKeyHeaders(req, apiKey, requestPath)
+	injectAPIKeyHeaders(req, apiKey, runtimeUpstreamProtocol(reqCtx, cfg))
 
 	// 5. anyrouter渠道：确保anthropic-beta包含context-1m
 	if cfg.GetChannelType() == util.ChannelTypeAnthropic &&
@@ -235,11 +239,12 @@ func (s *Server) handleErrorResponse(
 	duration := reqCtx.Duration().Seconds()
 
 	return &fwResult{
-		Status:        resp.StatusCode,
-		Header:        hdrClone,
-		Body:          rb,
-		FirstByteTime: readStats.firstByteSec,
-		StreamDiagMsg: diagMsg,
+		Status:         resp.StatusCode,
+		Header:         hdrClone,
+		Body:           rb,
+		FirstByteTime:  readStats.firstByteSec,
+		StreamDiagMsg:  diagMsg,
+		ThinkingEffort: extractThinkingEffortFromJSON(rb),
 	}, duration, nil
 }
 
@@ -778,8 +783,10 @@ func (s *Server) handleSuccessResponse(
 	var streamComplete bool
 	if parser != nil {
 		result.InputTokens, result.OutputTokens, result.CacheReadInputTokens, result.CacheCreationInputTokens = parser.GetUsage()
+		result.ReasoningTokens = parser.GetReasoningTokens()
 		result.Cache5mInputTokens, result.Cache1hInputTokens, result.ServiceTier = parser.GetCacheBreakdown()
 		result.ToolCostUSD = parser.GetToolCostUSD()
+		result.ThinkingEffort = parser.GetThinkingEffort()
 
 		if errorEvent := parser.GetLastError(); errorEvent != nil {
 			result.SSEErrorEvent = errorEvent
@@ -882,10 +889,12 @@ func (s *Server) handleTranslatedNonStreamSuccessResponse(
 		ResponseCommitted: true,
 	}
 	result.InputTokens, result.OutputTokens, result.CacheReadInputTokens, result.CacheCreationInputTokens = parser.GetUsage()
+	result.ReasoningTokens = parser.GetReasoningTokens()
 	result.Cache5mInputTokens = parser.Cache5mInputTokens
 	result.Cache1hInputTokens = parser.Cache1hInputTokens
 	result.ServiceTier = parser.ServiceTier
 	result.ToolCostUSD = parser.GetToolCostUSD()
+	result.ThinkingEffort = parser.GetThinkingEffort()
 
 	return result, reqCtx.Duration().Seconds(), nil
 }
@@ -969,10 +978,12 @@ func (s *Server) handleTranslatedStreamSuccessResponse(
 		ResponseCommitted: deferredWriter.Committed(),
 	}
 	result.InputTokens, result.OutputTokens, result.CacheReadInputTokens, result.CacheCreationInputTokens = parser.GetUsage()
+	result.ReasoningTokens = parser.GetReasoningTokens()
 	result.Cache5mInputTokens = parser.Cache5mInputTokens
 	result.Cache1hInputTokens = parser.Cache1hInputTokens
 	result.ServiceTier = parser.ServiceTier
 	result.ToolCostUSD = parser.GetToolCostUSD()
+	result.ThinkingEffort = parser.GetThinkingEffort()
 	result.SSEErrorEvent = parser.GetLastError()
 	streamComplete := parser.IsStreamComplete() || translatedComplete
 
@@ -1455,6 +1466,7 @@ func (s *Server) forwardAttempt(
 	// 转发请求（传递实际的API Key字符串和观测回调）
 	// [FIX] 2026-01: 使用传入的 requestPath（可能已替换模型名）而非 reqCtx.requestPath
 	upstreamProtocol := protocol.Protocol(cfg.ResolveUpstreamProtocol(string(reqCtx.clientProtocol)))
+	bodyToSend = prepareCodexResponsesBodyForUpstream(cfg, upstreamProtocol, requestPath, bodyToSend)
 	plan, err := protocol.BuildTransformPlan(
 		reqCtx.clientProtocol,
 		upstreamProtocol,
@@ -1486,7 +1498,13 @@ func (s *Server) forwardAttempt(
 	}
 
 	forceReturnClient := false
-	if retryBody, retryStrategy, ok := codexRetryBodyFor400(upstreamProtocol, cfg, plan, res); ok {
+	retryStrategies := make([]string, 0, 2)
+	for {
+		retryBody, retryStrategy, ok := codexRetryBodyFor400(upstreamProtocol, cfg, plan, res)
+		if !ok || hasRetryStrategy(retryStrategies, retryStrategy) {
+			break
+		}
+		retryStrategies = append(retryStrategies, retryStrategy)
 		retryPlan := plan
 		retryPlan.TranslatedBody = retryBody
 		res, duration, err = s.forwardOnceAsync(ctx, cfg, selectedKey, reqCtx.requestMethod,
@@ -1495,9 +1513,14 @@ func (s *Server) forwardAttempt(
 			reqCtx.debugData = res.DebugData
 		}
 		if err == nil && res != nil && res.Status >= 200 && res.Status < 300 {
-			res.RetryStrategy = retryStrategy
+			res.RetryStrategy = strings.Join(retryStrategies, ",")
+			break
 		}
 		forceReturnClient = true
+		plan = retryPlan
+		if err != nil || res == nil {
+			break
+		}
 	}
 
 	// 处理网络错误或异常响应（如空响应）
@@ -1604,8 +1627,8 @@ func codexRetryBodyFor400(
 		}
 	}
 	if shouldRetryAnyrouterCodexInvalidResponsesRequest(upstreamProtocol, cfg, res) {
-		if retryBody, ok := codexBodyWithoutEncryptedContentAndToolSearch(plan.TranslatedBody); ok {
-			return retryBody, "strip_codex_encrypted_tool_search", true
+		if retryBody, ok := codexBodyWithoutEncryptedContent(plan.TranslatedBody); ok {
+			return retryBody, "strip_codex_encrypted_content", true
 		}
 	}
 	if shouldRetryCodexUnsupportedThinking(upstreamProtocol, res) {
@@ -1614,6 +1637,15 @@ func codexRetryBodyFor400(
 		}
 	}
 	return nil, "", false
+}
+
+func hasRetryStrategy(strategies []string, strategy string) bool {
+	for _, existing := range strategies {
+		if existing == strategy {
+			return true
+		}
+	}
+	return false
 }
 
 func shouldRetryCodexUnsupportedThinking(upstreamProtocol protocol.Protocol, res *fwResult) bool {
@@ -1769,31 +1801,137 @@ func filterCodexThinkingIncludes(root map[string]any) bool {
 	return true
 }
 
-func codexBodyWithoutEncryptedContentAndToolSearch(body []byte) ([]byte, bool) {
+func prepareCodexResponsesBodyForUpstream(cfg *model.Config, upstreamProtocol protocol.Protocol, requestPath string, body []byte) []byte {
+	if upstreamProtocol != protocol.Codex ||
+		protocol.DetectRequestFamily(requestPath) != protocol.RequestFamilyResponses {
+		return body
+	}
+	if normalized, ok := normalizeCodexToolSearchInputItems(body); ok {
+		body = normalized
+	}
+	if isAnyrouterChannel(cfg) {
+		if stripped, ok := codexBodyWithoutToolSearchOnlyInputItems(body); ok {
+			return stripped
+		}
+	}
+	return body
+}
+
+func normalizeCodexToolSearchInputItems(body []byte) ([]byte, bool) {
+	var root map[string]any
+	if err := sonic.Unmarshal(body, &root); err != nil {
+		return nil, false
+	}
+	input, ok := root["input"].([]any)
+	if !ok {
+		return nil, false
+	}
+
+	changed := false
+	filtered := make([]any, 0, len(input))
+	for _, item := range input {
+		obj, ok := item.(map[string]any)
+		if !ok {
+			filtered = append(filtered, item)
+			continue
+		}
+		typ, _ := obj["type"].(string)
+		if !strings.HasPrefix(typ, "tool_search_") {
+			filtered = append(filtered, item)
+			continue
+		}
+		rawArgs, hasArgs := obj["arguments"]
+		if !hasArgs {
+			filtered = append(filtered, item)
+			continue
+		}
+		if _, ok := rawArgs.(map[string]any); ok {
+			filtered = append(filtered, item)
+			continue
+		}
+		argsString, ok := rawArgs.(string)
+		if !ok {
+			changed = true
+			continue
+		}
+
+		var decoded any
+		if err := sonic.Unmarshal([]byte(argsString), &decoded); err != nil {
+			changed = true
+			continue
+		}
+		argsObject, ok := decoded.(map[string]any)
+		if !ok {
+			changed = true
+			continue
+		}
+		obj["arguments"] = argsObject
+		changed = true
+		filtered = append(filtered, item)
+	}
+	if !changed {
+		return nil, false
+	}
+
+	root["input"] = filtered
+	normalized, err := sonic.Marshal(root)
+	if err != nil {
+		return nil, false
+	}
+	return normalized, true
+}
+
+func codexBodyWithoutToolSearchOnlyInputItems(body []byte) ([]byte, bool) {
+	return codexBodyWithoutInputItems(body, func(typ string) bool {
+		return strings.HasPrefix(typ, "tool_search_")
+	})
+}
+
+func codexBodyWithoutInputItems(body []byte, shouldDrop func(string) bool) ([]byte, bool) {
+	var root map[string]any
+	if err := sonic.Unmarshal(body, &root); err != nil {
+		return nil, false
+	}
+
+	input, ok := root["input"].([]any)
+	if !ok {
+		return nil, false
+	}
+
+	filtered := make([]any, 0, len(input))
+	removed := false
+	for _, item := range input {
+		obj, ok := item.(map[string]any)
+		if !ok {
+			filtered = append(filtered, item)
+			continue
+		}
+		typ, _ := obj["type"].(string)
+		if shouldDrop(typ) {
+			removed = true
+			continue
+		}
+		filtered = append(filtered, item)
+	}
+	if !removed {
+		return nil, false
+	}
+
+	root["input"] = filtered
+	retryBody, err := sonic.Marshal(root)
+	if err != nil {
+		return nil, false
+	}
+	return retryBody, true
+}
+
+func codexBodyWithoutEncryptedContent(body []byte) ([]byte, bool) {
 	var root map[string]any
 	if err := sonic.Unmarshal(body, &root); err != nil {
 		return nil, false
 	}
 
 	removed := removeEncryptedContentFields(root)
-	if input, ok := root["input"].([]any); ok {
-		filtered := make([]any, 0, len(input))
-		for _, item := range input {
-			obj, ok := item.(map[string]any)
-			if !ok {
-				filtered = append(filtered, item)
-				continue
-			}
-			typ, _ := obj["type"].(string)
-			// compaction 是 Codex 客户端 fork 线程时的空占位项，new-api 校验不识别
-			if strings.HasPrefix(typ, "tool_search_") || typ == "compaction" {
-				removed = true
-				continue
-			}
-			filtered = append(filtered, item)
-		}
-		root["input"] = filtered
-	}
 	if !removed {
 		return nil, false
 	}

@@ -360,16 +360,6 @@
     return el;
   }
 
-  // 新版本图标（小圆点）
-  function iconNewVersion() {
-    const el = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
-    el.setAttribute('viewBox', '0 0 8 8');
-    el.setAttribute('fill', 'var(--success-500)');
-    el.style.cssText = 'width: 8px; height: 8px; margin-left: 4px;';
-    el.innerHTML = '<circle cx="4" cy="4" r="4"/>';
-    return el;
-  }
-
   // ---- 活动请求指示器（脉冲 + 角标 + favicon/标题）----
   // 全站唯一轮询源：拉取完整 payload 后自己消费 count，同时推送 data 给订阅者（如 logs.js）
   const ACTIVE_POLL_MS = 2000;
@@ -381,6 +371,12 @@
   let _lastBadgeCount = -1;      // 去重：仅数量变化时重绘 favicon
   const _activeDataListeners = [];  // 订阅者回调列表
   let _lastActiveData = null;       // 最近一次推送的数据（新订阅者立即获得，规避时序竞争）
+  const ACTIVE_TITLE_FLASH_MS = 900;
+  let _activeTitleBase = '';
+  let _activeTitleTimer = null;
+  let _activeTitleVisible = false;
+  let _activeTitleCount = 0;
+  let _faviconPulseOn = false;
 
   function brandBadgeLabel(count) {
     return count > 999 ? '999+' : String(count);
@@ -412,10 +408,12 @@
     img.src = '/web/favicon.svg';
   }
 
-  // 在 favicon 右上角画橙色数字角标
-  function drawFaviconBadge(count) {
+  // 在 favicon 右上角画呼吸色点 + 数字角标
+  function drawFaviconBadge(count, pulseOn = false) {
     if (!_faviconBase) return;
-    const S = 64, r = 12, cx = 50, cy = 14, ring = 2; // 小角标：不遮挡 CC 字母
+    const S = 64, cx = 50, cy = 14; // 小角标：不遮挡 CC 字母
+    const r = pulseOn ? 13 : 11;
+    const halo = pulseOn ? 18 : 15;
     const canvas = document.createElement('canvas');
     canvas.width = S; canvas.height = S;
     const ctx = canvas.getContext('2d');
@@ -424,11 +422,15 @@
     ctx.drawImage(_faviconBase, 0, 0, S, S);
 
     const text = faviconBadgeLabel(count);
-    // 外描边：先画大白圆再画橙圆，保留完整橙区给文字（避免居中描边吃掉内部空间）
-    ctx.beginPath(); ctx.arc(cx, cy, r + ring, 0, Math.PI * 2);
+    ctx.beginPath(); ctx.arc(cx, cy, halo, 0, Math.PI * 2);
+    ctx.fillStyle = pulseOn ? 'rgba(249, 115, 22, 0.28)' : 'rgba(249, 115, 22, 0.12)';
+    ctx.fill();
+
+    // 外描边：先画白圆再画橙圆，保留完整橙区给文字（避免居中描边吃掉内部空间）
+    ctx.beginPath(); ctx.arc(cx, cy, r + 2, 0, Math.PI * 2);
     ctx.fillStyle = '#ffffff'; ctx.fill();
     ctx.beginPath(); ctx.arc(cx, cy, r, 0, Math.PI * 2);
-    ctx.fillStyle = '#f97316'; ctx.fill();
+    ctx.fillStyle = pulseOn ? '#fb923c' : '#f97316'; ctx.fill();
 
     // 字号按位数两档自适应（1~9 单字符 / 9+ 双字符）
     const fs = text.length >= 2 ? 14 : 18;
@@ -449,7 +451,71 @@
     if (_origFaviconHref !== null) getFaviconLink().href = _origFaviconHref;
   }
 
+  function redrawActiveFavicon() {
+    if (_activeTitleCount > 0) {
+      ensureFaviconBase(() => drawFaviconBadge(_activeTitleCount, _faviconPulseOn));
+    }
+  }
+
+  function activeTitleLabel(count) {
+    const label = brandBadgeLabel(count);
+    const fallback = `请求中[${label}]-`;
+    if (typeof t === 'function') {
+      const translated = t('nav.activeRequestsTitle', { count: label });
+      return translated && translated !== 'nav.activeRequestsTitle' ? translated : fallback;
+    }
+    return fallback;
+  }
+
+  function activeTitleText() {
+    return `${activeTitleLabel(_activeTitleCount)}${_activeTitleBase}`;
+  }
+
+  function showActiveTitle() {
+    document.title = activeTitleText();
+    _activeTitleVisible = true;
+  }
+
+  function restoreActiveTitle() {
+    if (_activeTitleTimer !== null) {
+      clearInterval(_activeTitleTimer);
+      _activeTitleTimer = null;
+    }
+    _activeTitleVisible = false;
+    if (_activeTitleBase) document.title = _activeTitleBase;
+  }
+
+  function updateActiveTitle(count) {
+    if (_activeTitleTimer === null) {
+      _activeTitleBase = document.title || _activeTitleBase || '';
+    }
+    _activeTitleCount = count;
+
+    if (count <= 0) {
+      restoreActiveTitle();
+      return;
+    }
+
+    if (_activeTitleTimer === null) {
+      showActiveTitle();
+      _activeTitleTimer = setInterval(() => {
+        _faviconPulseOn = !_faviconPulseOn;
+        redrawActiveFavicon();
+        if (_activeTitleVisible) {
+          document.title = _activeTitleBase;
+          _activeTitleVisible = false;
+          return;
+        }
+        showActiveTitle();
+      }, ACTIVE_TITLE_FLASH_MS);
+      return;
+    }
+
+    if (_activeTitleVisible) showActiveTitle();
+  }
+
   function updateActiveIndicator(count) {
+    _activeTitleCount = count;
     // 页面内 logo：脉冲 + 角标
     if (_activeWrap) {
       _activeWrap.classList.toggle('is-active', count > 0);
@@ -458,9 +524,15 @@
     // 标签页 favicon 角标（仅在数量变化时重绘，省 toDataURL 开销）
     if (count !== _lastBadgeCount) {
       _lastBadgeCount = count;
-      if (count > 0) ensureFaviconBase(() => drawFaviconBadge(count));
-      else restoreFavicon();
+      if (count > 0) {
+        _faviconPulseOn = false;
+        redrawActiveFavicon();
+      } else {
+        _faviconPulseOn = false;
+        restoreFavicon();
+      }
     }
+    updateActiveTitle(count);
   }
 
   async function pollActiveRequests() {
@@ -1075,11 +1147,37 @@
     return el;
   }
 
-  async function initAuthTokenFilter(options = {}) {
-    if (typeof window.loadAuthTokensIntoSelect !== 'function') return [];
+  function fillAuthTokenSelect(selectId, tokens, opts) {
+    const o = opts || {};
+    const select = document.getElementById(selectId);
+    if (select && tokens.length > 0) {
+      select.innerHTML = `<option value="">${window.t('stats.allTokens')}</option>`;
+      tokens.forEach(token => {
+        const option = document.createElement('option');
+        option.value = token.id;
+        option.textContent = token.description || `${o.tokenPrefix || 'Token #'}${token.id}`;
+        select.appendChild(option);
+      });
+      if (o.restoreValue) select.value = o.restoreValue;
+    }
+  }
 
+  async function initAuthTokenFilter(options = {}) {
     const selectId = options.selectId;
     if (!selectId) return [];
+
+    if (Array.isArray(options.preloadedTokens)) {
+      fillAuthTokenSelect(selectId, options.preloadedTokens, options.loadOptions);
+      const el = document.getElementById(selectId);
+      if (!el) return options.preloadedTokens;
+      el.value = options.value || '';
+      if (typeof options.onChange === 'function') {
+        el.addEventListener('change', options.onChange);
+      }
+      return options.preloadedTokens;
+    }
+
+    if (typeof window.loadAuthTokensIntoSelect !== 'function') return [];
 
     const tokens = await window.loadAuthTokensIntoSelect(selectId, options.loadOptions);
     const el = document.getElementById(selectId);
@@ -1110,6 +1208,22 @@
     }
 
     return output / tokenDuration;
+  }
+
+  function timingColor(seconds, greenThreshold, warningThreshold) {
+    const value = Number(seconds);
+    if (!Number.isFinite(value) || value <= 0) return 'var(--neutral-600)';
+    if (value <= greenThreshold) return 'var(--success-600)';
+    if (value <= warningThreshold) return 'var(--warning-600)';
+    return 'var(--error-600)';
+  }
+
+  function getFirstByteTimingColor(seconds) {
+    return timingColor(seconds, 5, 10);
+  }
+
+  function getDurationTimingColor(seconds) {
+    return timingColor(seconds, 30, 60);
   }
 
   /**
@@ -1275,6 +1389,7 @@
   window.applyFilterControlValues = applyFilterControlValues;
   window.persistFilterState = persistFilterState;
   window.initSavedDateRangeFilter = initSavedDateRangeFilter;
+  window.fillAuthTokenSelect = fillAuthTokenSelect;
   window.initAuthTokenFilter = initAuthTokenFilter;
   window.calculateTokenSpeed = calculateTokenSpeed;
   window.formatCost = formatCost;
@@ -1282,6 +1397,8 @@
   window.getCostDisplayInfo = getCostDisplayInfo;
   window.buildCostStackHtml = buildCostStackHtml;
   window.buildCornerMultiplierBadge = buildCornerMultiplierBadge;
+  window.getFirstByteTimingColor = getFirstByteTimingColor;
+  window.getDurationTimingColor = getDurationTimingColor;
   window.formatNumber = formatNumber;
   window.getRpmColor = getRpmColor;
   window.escapeHtml = escapeHtml;
@@ -1859,6 +1976,18 @@
     return `<span class="upstream-token upstream-token--${modifier}">${escapeCodeHtml(text)}</span>`;
   }
 
+  function highlightSyntax(text, language) {
+    const highlighter = globalThis.hljs;
+    if (!highlighter || typeof highlighter.highlight !== 'function') {
+      throw new Error('highlight.js is required for syntax highlighting');
+    }
+
+    return highlighter.highlight(String(text || ''), {
+      language,
+      ignoreIllegals: true
+    }).value;
+  }
+
   function classifyStatusModifier(statusCode) {
     const code = Number.parseInt(statusCode, 10);
     if (!Number.isFinite(code)) return 'status-unknown';
@@ -1868,34 +1997,9 @@
     return 'status-neutral';
   }
 
-  function renderJsonLine(line) {
-    const tokenRe = /"(?:\\.|[^"\\])*"(?=\s*:)|"(?:\\.|[^"\\])*"|true|false|null|-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?/g;
-    let out = '';
-    let lastIndex = 0;
-
-    for (const match of line.matchAll(tokenRe)) {
-      const index = match.index || 0;
-      const token = match[0];
-      out += escapeCodeHtml(line.slice(lastIndex, index));
-
-      let modifier = 'json-string';
-      if (token === 'true' || token === 'false') {
-        modifier = 'json-boolean';
-      } else if (token === 'null') {
-        modifier = 'json-null';
-      } else if (token[0] !== '"') {
-        modifier = 'json-number';
-      } else {
-        const nextChar = line.slice(index + token.length).match(/^\s*:/);
-        modifier = nextChar ? 'json-key' : 'json-string';
-      }
-
-      out += wrapHighlightedToken(token, modifier);
-      lastIndex = index + token.length;
-    }
-
-    out += escapeCodeHtml(line.slice(lastIndex));
-    return out;
+  function renderHighlightedLines(text, language) {
+    const value = String(text || '');
+    return highlightSyntax(value, language).split('\n');
   }
 
   function renderHeaderLine(line) {
@@ -1972,7 +2076,7 @@
       if (field === 'data' && value.trim()) {
         const trimmed = value.trim();
         const jsonLike = (trimmed[0] === '{' || trimmed[0] === '[');
-        if (jsonLike) return renderedField + renderJsonLine(value);
+        if (jsonLike) return renderedField + highlightSyntax(value, 'json');
       }
       return renderedField + escapeCodeHtml(value);
     }
@@ -2031,8 +2135,9 @@
   }
 
   function renderCodeLines(lines, foldRegions) {
+    const contentHtml = (line, suffix = '') => `<span class="code-line-content">${line || ''}${suffix}</span>`;
     if (!foldRegions || foldRegions.size === 0) {
-      return lines.map(line => `<span class="code-line">${line || ''}</span>`).join('');
+      return lines.map(line => `<span class="code-line">${contentHtml(line)}</span>`).join('');
     }
     // 为每个区间生成 id；保留每行的 ancestor region ids 列表（开区间 s < i < e）。
     const startToId = new Map();
@@ -2059,11 +2164,11 @@
       if (startMeta) {
         const { id, count } = startMeta;
         const summary = `<span class="code-fold-summary" data-fold-summary-for="${id}">…${count} lines</span>`;
-        const toggle = `<button type="button" class="code-fold-toggle" data-fold-toggle="${id}" aria-expanded="true" aria-label="toggle code fold">▼</button>`;
-        out.push(`<span class="code-line code-line--foldable" data-fold-id="${id}"${regionAttr}>${toggle}${content}${summary}</span>`);
+        const toggle = `<button type="button" class="code-fold-toggle" data-fold-toggle="${id}" aria-expanded="true" aria-label="toggle code fold"></button>`;
+        out.push(`<span class="code-line code-line--foldable" data-fold-id="${id}"${regionAttr}>${toggle}${contentHtml(content, summary)}</span>`);
         continue;
       }
-      out.push(`<span class="code-line"${regionAttr}>${content}</span>`);
+      out.push(`<span class="code-line"${regionAttr}>${contentHtml(content)}</span>`);
     }
     return out.join('');
   }
@@ -2090,12 +2195,15 @@
       rawForFold.push('');
       const bodyLines = lines.slice(separatorIndex + 1);
       const bodyText = bodyLines.join('\n');
-      const renderBodyLine = looksLikeJSONBlock(bodyText) ? renderJsonLine
-        : looksLikeSSE(bodyText) ? renderSSELine
-        : escapeCodeHtml;
-      bodyLines.forEach(line => {
-        renderedLines.push(renderBodyLine(line));
-        rawForFold.push(line);
+      const bodyRenderedLines = looksLikeJSONBlock(bodyText)
+        ? renderHighlightedLines(bodyText, 'json')
+        : looksLikeSSE(bodyText)
+          ? bodyLines.map(renderSSELine)
+          : bodyLines.map(escapeCodeHtml);
+      bodyRenderedLines.forEach((line, index) => {
+        const rawLine = bodyLines[index] || '';
+        renderedLines.push(line);
+        rawForFold.push(rawLine);
       });
     }
 
@@ -2112,7 +2220,7 @@
         return renderUpstreamRequestOrResponse(value, mode);
       case 'json': {
         const rawLines = value.split('\n');
-        return renderCodeLines(rawLines.map(renderJsonLine), computeFoldRegions(rawLines));
+        return renderCodeLines(renderHighlightedLines(value, 'json'), computeFoldRegions(rawLines));
       }
       case 'url':
         return renderCodeLines(value.split('\n').map(renderRequestLine));
@@ -2146,7 +2254,6 @@
       if (!startLine) return;
       const collapsed = startLine.classList.toggle('code-line--collapsed');
       foldBtn.setAttribute('aria-expanded', collapsed ? 'false' : 'true');
-      foldBtn.textContent = collapsed ? '▶' : '▼';
       const pre = startLine.closest('pre');
       const root = pre || document;
       root.querySelectorAll(`[data-fold-region~="${id}"]`).forEach(el => {
@@ -2178,31 +2285,12 @@
     select.addEventListener('change', (e) => onChange(e.target.value));
   }
 
-  /**
-   * 加载令牌列表并填充下拉框
-   * @param {string} selectId - select 元素 ID
-   * @param {Object} [opts] - 选项
-   * @param {string} [opts.tokenPrefix] - 令牌显示前缀（默认 'Token #'）
-   * @param {string} [opts.restoreValue] - 恢复选中值
-   * @returns {Promise<Array>} 令牌数组
-   */
   async function loadAuthTokensIntoSelect(selectId, opts) {
     const o = opts || {};
     try {
       const data = await fetchDataWithAuth('/admin/auth-tokens');
       const tokens = (data && data.tokens) || [];
-
-      const select = document.getElementById(selectId);
-      if (select && tokens.length > 0) {
-        select.innerHTML = `<option value="">${window.t('stats.allTokens')}</option>`;
-        tokens.forEach(token => {
-          const option = document.createElement('option');
-          option.value = token.id;
-          option.textContent = token.description || `${o.tokenPrefix || 'Token #'}${token.id}`;
-          select.appendChild(option);
-        });
-        if (o.restoreValue) select.value = o.restoreValue;
-      }
+      window.fillAuthTokenSelect(selectId, tokens, o);
       return tokens;
     } catch (error) {
       console.error('Failed to load auth tokens:', error);
@@ -2309,4 +2397,11 @@
   window.loadAuthTokensIntoSelect = loadAuthTokensIntoSelect;
   window.initTimeRangeSelector = initTimeRangeSelector;
   window.bindTimeRangeSelector = bindTimeRangeSelector;
+
+  if (typeof module !== 'undefined' && module.exports) {
+    module.exports = {
+      renderUpstreamCodeBlock,
+      setHighlightedCodeContent
+    };
+  }
 })();

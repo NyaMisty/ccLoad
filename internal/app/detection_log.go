@@ -22,19 +22,21 @@ func selectScheduledCheckModel(cfg *model.Config) (string, string) {
 	return "", "scheduled_check_model 不在渠道模型列表中"
 }
 
-func detectionLogFromResult(cfg *model.Config, logSource, requestModel, actualModel, apiKeyUsed, clientIP string, authTokenID int64, result map[string]any) *model.LogEntry {
+func detectionLogFromResult(cfg *model.Config, logSource, requestModel, actualModel, apiKeyUsed, clientIP string, authTokenID int64, requestThinkingEffort string, result map[string]any) *model.LogEntry {
 	entry := &model.LogEntry{
-		Time:          model.JSONTime{Time: time.Now()},
-		LogSource:     logSource,
-		Model:         requestModel,
-		ClientIP:      clientIP,
-		APIKeyUsed:    apiKeyUsed,
-		AuthTokenID:   authTokenID,
-		BaseURL:       getResultString(result, "base_url"),
-		StatusCode:    getResultIntOrDefault(result, "status_code", 0),
-		Duration:      float64(getResultInt64OrDefault(result, "duration_ms", 0)) / 1000,
-		FirstByteTime: float64(getResultInt64OrDefault(result, "first_byte_duration_ms", 0)) / 1000,
-		Cost:          getResultFloat64OrDefault(result, "cost_usd", 0),
+		Time:           model.JSONTime{Time: time.Now()},
+		LogSource:      logSource,
+		Model:          requestModel,
+		ClientIP:       clientIP,
+		APIKeyUsed:     apiKeyUsed,
+		AuthTokenID:    authTokenID,
+		BaseURL:        getResultString(result, "base_url"),
+		StatusCode:     getResultIntOrDefault(result, "status_code", 0),
+		Duration:       float64(getResultInt64OrDefault(result, "duration_ms", 0)) / 1000,
+		FirstByteTime:  float64(getResultInt64OrDefault(result, "first_byte_duration_ms", 0)) / 1000,
+		Cost:           getResultFloat64OrDefault(result, "cost_usd", 0),
+		IsStreaming:    getResultBoolOrDefault(result, "is_streaming", false),
+		ThinkingEffort: detectionThinkingEffort(requestThinkingEffort, result),
 	}
 	if cfg != nil {
 		entry.ChannelID = cfg.ID
@@ -48,7 +50,23 @@ func detectionLogFromResult(cfg *model.Config, logSource, requestModel, actualMo
 	}
 	populateDetectionUsage(entry, result, channelType)
 	entry.Message = detectionMessage(result)
+	if debugData, ok := getResultDebugData(result, "debug_data"); ok {
+		entry.DebugData = debugData
+	}
 	return entry
+}
+
+func detectionThinkingEffort(requestThinkingEffort string, result map[string]any) string {
+	effort := normalizeThinkingEffort(requestThinkingEffort)
+	if upstream := extractThinkingEffortFromPayload(result); upstream != "" {
+		effort = upstream
+	}
+	if apiResponse, ok := getResultMap(result, "api_response"); ok {
+		if upstream := extractThinkingEffortFromPayload(apiResponse); upstream != "" {
+			effort = upstream
+		}
+	}
+	return effort
 }
 
 func detectionSkipLog(cfg *model.Config, logSource, modelName, reason string) *model.LogEntry {
@@ -99,6 +117,7 @@ func normalizeDetectionUsage(usage map[string]any, channelType string) (map[stri
 	return map[string]any{
 		"input_tokens":                input,
 		"output_tokens":               output,
+		"reasoning_tokens":            accumulator.ReasoningTokens,
 		"cache_read_input_tokens":     cacheRead,
 		"cache_creation_input_tokens": cacheCreation,
 		"cache_5m_input_tokens":       accumulator.Cache5mInputTokens,
@@ -109,6 +128,7 @@ func normalizeDetectionUsage(usage map[string]any, channelType string) (map[stri
 func populateLogEntryUsage(entry *model.LogEntry, usage map[string]any) {
 	entry.InputTokens = getMapIntOrDefault(usage, "input_tokens", 0)
 	entry.OutputTokens = getMapIntOrDefault(usage, "output_tokens", 0)
+	entry.ReasoningTokens = getMapIntOrDefault(usage, "reasoning_tokens", 0)
 	entry.CacheReadInputTokens = getMapIntOrDefault(usage, "cache_read_input_tokens", 0)
 	entry.Cache5mInputTokens = getMapIntOrDefault(usage, "cache_5m_input_tokens", 0)
 	entry.Cache1hInputTokens = getMapIntOrDefault(usage, "cache_1h_input_tokens", 0)
@@ -172,6 +192,24 @@ func getResultFloat64OrDefault(result map[string]any, key string, fallback float
 	default:
 		return fallback
 	}
+}
+
+func getResultBoolOrDefault(result map[string]any, key string, fallback bool) bool {
+	if result == nil {
+		return fallback
+	}
+	if value, ok := result[key].(bool); ok {
+		return value
+	}
+	return fallback
+}
+
+func getResultDebugData(result map[string]any, key string) (*model.DebugLogEntry, bool) {
+	if result == nil {
+		return nil, false
+	}
+	value, ok := result[key].(*model.DebugLogEntry)
+	return value, ok && value != nil
 }
 
 func getNestedMap(result map[string]any, outerKey, innerKey string) (map[string]any, bool) {

@@ -49,7 +49,7 @@ func parseDataURLImage(dataURL string) (mimeType, data string, ok bool) {
 	return mimeType, data, true
 }
 
-func chatMessageContentBlocks(msg ChatMessage) []ChatContentBlock {
+func chatMessageContentBlocks(msg ChatMessage) []chatContentBlock {
 	if len(msg.ContentBlocks) > 0 {
 		return msg.ContentBlocks
 	}
@@ -58,15 +58,15 @@ func chatMessageContentBlocks(msg ChatMessage) []ChatContentBlock {
 		if strings.TrimSpace(content) == "" {
 			return nil
 		}
-		return []ChatContentBlock{{Type: "text", Text: content}}
-	case []ChatContentBlock:
+		return []chatContentBlock{{Type: "text", Text: content}}
+	case []chatContentBlock:
 		return content
 	case []any:
 		raw, err := sonic.Marshal(content)
 		if err != nil {
 			return nil
 		}
-		var blocks []ChatContentBlock
+		var blocks []chatContentBlock
 		if err := sonic.Unmarshal(raw, &blocks); err != nil {
 			return nil
 		}
@@ -284,12 +284,90 @@ func patchBodyObject(body []byte, mutate func(map[string]any)) ([]byte, error) {
 	return sonic.Marshal(obj)
 }
 
+func hasTestSamplingOptions(req *TestChannelRequest) bool {
+	return req != nil && (req.Temperature != nil || req.TopP != nil || req.MaxTokens > 0 || strings.TrimSpace(req.SystemPrompt) != "")
+}
+
+func setOpenAILikeSampling(obj map[string]any, req *TestChannelRequest, maxTokensKey string) {
+	if req.Temperature != nil {
+		obj["temperature"] = *req.Temperature
+	}
+	if req.TopP != nil {
+		obj["top_p"] = *req.TopP
+	}
+	if req.MaxTokens > 0 {
+		obj[maxTokensKey] = req.MaxTokens
+	}
+}
+
+func appendOpenAISystemPrompt(obj map[string]any, prompt string) {
+	prompt = strings.TrimSpace(prompt)
+	if prompt == "" {
+		return
+	}
+	systemMessage := map[string]any{"role": "system", "content": prompt}
+	messages, _ := obj["messages"].([]any)
+	obj["messages"] = append([]any{systemMessage}, messages...)
+}
+
+func prependCodexDeveloperPrompt(obj map[string]any, prompt string) {
+	prompt = strings.TrimSpace(prompt)
+	if prompt == "" {
+		return
+	}
+	developerMessage := map[string]any{"role": "developer", "content": prompt}
+	input, _ := obj["input"].([]any)
+	obj["input"] = append([]any{developerMessage}, input...)
+}
+
+func setGeminiGenerationOption(generationConfig map[string]any, key string, value any) {
+	if value != nil {
+		generationConfig[key] = value
+	}
+}
+
+func applyGeminiSamplingAndSystemPrompt(obj map[string]any, req *TestChannelRequest) {
+	if req.Temperature != nil || req.TopP != nil || req.MaxTokens > 0 {
+		generationConfig, _ := obj["generationConfig"].(map[string]any)
+		if generationConfig == nil {
+			generationConfig = map[string]any{}
+		}
+		if req.Temperature != nil {
+			setGeminiGenerationOption(generationConfig, "temperature", *req.Temperature)
+		}
+		if req.TopP != nil {
+			setGeminiGenerationOption(generationConfig, "topP", *req.TopP)
+		}
+		if req.MaxTokens > 0 {
+			setGeminiGenerationOption(generationConfig, "maxOutputTokens", req.MaxTokens)
+		}
+		obj["generationConfig"] = generationConfig
+	}
+
+	if prompt := strings.TrimSpace(req.SystemPrompt); prompt != "" {
+		obj["systemInstruction"] = map[string]any{
+			"parts": []any{map[string]any{"text": prompt}},
+		}
+	}
+}
+
+func appendAnthropicSystemPrompt(obj map[string]any, prompt string) {
+	prompt = strings.TrimSpace(prompt)
+	if prompt == "" {
+		return
+	}
+	system, _ := obj["system"].([]any)
+	obj["system"] = append(system, map[string]any{"type": "text", "text": prompt})
+}
+
 func normalizeTestThinkingEffort(effort string) string {
 	switch strings.ToLower(strings.TrimSpace(effort)) {
 	case "":
 		return ""
 	case "none", "minimal", "low", "medium", "high":
 		return strings.ToLower(strings.TrimSpace(effort))
+	case "max", "xhigh":
+		return "xhigh"
 	case "auto":
 		return "medium"
 	default:
@@ -303,7 +381,7 @@ func testThinkingBudget(effort string) int {
 		return 1024
 	case "medium":
 		return 4096
-	case "high":
+	case "high", "xhigh":
 		return 16384
 	default:
 		return 0
@@ -316,8 +394,42 @@ func testCodexReasoningEffort(effort string) string {
 		return "low"
 	case "high":
 		return "high"
+	case "xhigh":
+		return "xhigh"
 	case "medium":
 		return "medium"
+	default:
+		return ""
+	}
+}
+
+func testAnthropicOutputEffort(effort string) string {
+	switch normalizeTestThinkingEffort(effort) {
+	case "minimal", "low":
+		return "low"
+	case "medium":
+		return "medium"
+	case "high":
+		return "high"
+	case "xhigh":
+		return "max"
+	default:
+		return ""
+	}
+}
+
+func testGeminiUsesThinkingLevel(model string) bool {
+	return strings.Contains(strings.ToLower(strings.TrimSpace(model)), "gemini-3")
+}
+
+func testGeminiThinkingLevel(effort string) string {
+	switch normalizeTestThinkingEffort(effort) {
+	case "minimal", "low":
+		return "low"
+	case "medium":
+		return "medium"
+	case "high", "xhigh":
+		return "high"
 	default:
 		return ""
 	}
@@ -330,28 +442,31 @@ func appendTestTool(obj map[string]any, tool map[string]any) {
 
 func applyOpenAITestOptions(body []byte, req *TestChannelRequest) ([]byte, error) {
 	effort := normalizeTestThinkingEffort(req.ThinkingEffort)
-	if effort == "" && !req.BuiltinSearch {
+	if effort == "" && !req.BuiltinSearch && !hasTestSamplingOptions(req) {
 		return body, nil
 	}
 	return patchBodyObject(body, func(obj map[string]any) {
+		setOpenAILikeSampling(obj, req, "max_tokens")
+		appendOpenAISystemPrompt(obj, req.SystemPrompt)
 		if effort == "none" {
 			delete(obj, "reasoning_effort")
 		} else if effort != "" {
 			obj["reasoning_effort"] = effort
 		}
 		if req.BuiltinSearch {
-			appendTestTool(obj, map[string]any{"type": "web_search"})
-			obj["tool_choice"] = "auto"
+			obj["web_search_options"] = map[string]any{}
 		}
 	})
 }
 
 func applyCodexTestOptions(body []byte, req *TestChannelRequest) ([]byte, error) {
 	effort := normalizeTestThinkingEffort(req.ThinkingEffort)
-	if effort == "" && !req.BuiltinSearch {
+	if effort == "" && !req.BuiltinSearch && !hasTestSamplingOptions(req) {
 		return body, nil
 	}
 	return patchBodyObject(body, func(obj map[string]any) {
+		setOpenAILikeSampling(obj, req, "max_output_tokens")
+		prependCodexDeveloperPrompt(obj, req.SystemPrompt)
 		if effort == "none" {
 			delete(obj, "reasoning")
 			delete(obj, "include")
@@ -371,18 +486,25 @@ func applyCodexTestOptions(body []byte, req *TestChannelRequest) ([]byte, error)
 
 func applyGeminiTestOptions(body []byte, req *TestChannelRequest) ([]byte, error) {
 	effort := normalizeTestThinkingEffort(req.ThinkingEffort)
-	if effort == "" && !req.BuiltinSearch {
+	if effort == "" && !req.BuiltinSearch && !hasTestSamplingOptions(req) {
 		return body, nil
 	}
 	return patchBodyObject(body, func(obj map[string]any) {
+		applyGeminiSamplingAndSystemPrompt(obj, req)
 		if effort != "" {
 			generationConfig, _ := obj["generationConfig"].(map[string]any)
 			if generationConfig == nil {
 				generationConfig = map[string]any{}
 			}
-			thinkingConfig := map[string]any{"thinkingBudget": testThinkingBudget(effort)}
-			if effort != "none" {
+			thinkingConfig := map[string]any{}
+			if testGeminiUsesThinkingLevel(req.Model) && effort != "none" {
+				thinkingConfig["thinkingLevel"] = testGeminiThinkingLevel(effort)
 				thinkingConfig["includeThoughts"] = true
+			} else {
+				thinkingConfig["thinkingBudget"] = testThinkingBudget(effort)
+				if effort != "none" {
+					thinkingConfig["includeThoughts"] = true
+				}
 			}
 			generationConfig["thinkingConfig"] = thinkingConfig
 			obj["generationConfig"] = generationConfig
@@ -395,17 +517,17 @@ func applyGeminiTestOptions(body []byte, req *TestChannelRequest) ([]byte, error
 
 func applyAnthropicTestOptions(body []byte, req *TestChannelRequest) ([]byte, error) {
 	effort := normalizeTestThinkingEffort(req.ThinkingEffort)
-	if effort == "" && !req.BuiltinSearch {
+	if effort == "" && !req.BuiltinSearch && !hasTestSamplingOptions(req) {
 		return body, nil
 	}
 	return patchBodyObject(body, func(obj map[string]any) {
+		setOpenAILikeSampling(obj, req, "max_tokens")
+		appendAnthropicSystemPrompt(obj, req.SystemPrompt)
 		if effort == "none" {
 			obj["thinking"] = map[string]any{"type": "disabled"}
 		} else if effort != "" {
-			obj["thinking"] = map[string]any{
-				"type":          "enabled",
-				"budget_tokens": testThinkingBudget(effort),
-			}
+			obj["thinking"] = map[string]any{"type": "adaptive"}
+			obj["output_config"] = map[string]any{"effort": testAnthropicOutputEffort(effort)}
 		}
 		if req.BuiltinSearch {
 			appendTestTool(obj, map[string]any{
