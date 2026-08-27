@@ -440,7 +440,12 @@ func (s *Server) runProxyAttemptLoop(
 		}
 
 		if err != nil && errors.Is(err, ErrKeyConcurrencyExceeded) {
-			log.Printf("[INFO] 渠道 %s (ID=%d) 的可用 Key 均已达到单 Key 并发限制，跳过该渠道", cfg.Name, cfg.ID)
+			log.Printf(
+				"[INFO] 渠道 %s (ID=%d) 已达到单 Key 并发限制，跳过该渠道：%s",
+				cfg.Name,
+				cfg.ID,
+				err,
+			)
 			continue
 		}
 

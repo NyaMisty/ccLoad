@@ -1,12 +1,14 @@
 package app
 
 import (
+	"context"
 	"errors"
 	"io"
 	"net/http"
 	"testing"
 
 	"ccLoad/internal/model"
+	"ccLoad/internal/protocol"
 )
 
 func TestKeyConcurrencyLimiterIsolatesKeys(t *testing.T) {
@@ -112,4 +114,102 @@ func TestDoUpstreamRequestHoldsPerKeyConcurrencyUntilBodyClosed(t *testing.T) {
 		t.Fatalf("third request after release failed: %v", err)
 	}
 	_ = thirdResp.Body.Close()
+}
+
+func TestKeyConcurrencySkipReasonIncludesScanCounts(t *testing.T) {
+	t.Parallel()
+
+	err := &keyConcurrencyExhaustedError{
+		cause:               &keyConcurrencyExceededError{active: 2, limit: 2},
+		checkedKeys:         3,
+		totalKeys:           4,
+		concurrencyLimited:  3,
+		upstreamAttempts:    1,
+		maxUpstreamAttempts: 2,
+		perKeyLimit:         2,
+	}
+
+	if !errors.Is(err, ErrKeyConcurrencyExceeded) {
+		t.Fatalf("error should wrap ErrKeyConcurrencyExceeded: %v", err)
+	}
+
+	const want = "Key 检查=3/4，并发满载=3，上游尝试=1/2，单 Key 上限=2"
+	if got := err.Error(); got != want {
+		t.Fatalf("error=%q, want %q", got, want)
+	}
+}
+
+func TestTryChannelWithKeysReportsConcurrencyScanCounts(t *testing.T) {
+	t.Parallel()
+
+	upstream := newTestHTTPServer(t, http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		t.Error("upstream should not be called when every key is concurrency limited")
+	}))
+	defer upstream.Close()
+
+	env := setupProxyTestEnv(t, []testChannel{
+		{name: "limited", models: "gpt-4", apiKey: "sk-first"},
+	}, map[int]string{0: upstream.URL})
+
+	ctx := context.Background()
+	cfgs, err := env.store.ListConfigs(ctx)
+	if err != nil {
+		t.Fatalf("ListConfigs failed: %v", err)
+	}
+	if len(cfgs) != 1 {
+		t.Fatalf("configs=%d, want 1", len(cfgs))
+	}
+	cfg := cfgs[0]
+	cfg.MaxConcurrency = 1
+	if _, err := env.store.UpdateConfig(ctx, cfg.ID, cfg); err != nil {
+		t.Fatalf("UpdateConfig failed: %v", err)
+	}
+	if err := env.store.CreateAPIKeysBatch(ctx, []*model.APIKey{
+		{ChannelID: cfg.ID, KeyIndex: 1, APIKey: "sk-second"},
+	}); err != nil {
+		t.Fatalf("CreateAPIKeysBatch failed: %v", err)
+	}
+	env.server.InvalidateAPIKeysCache(cfg.ID)
+	env.server.maxKeyRetries = 1
+
+	for _, apiKey := range []string{"sk-first", "sk-second"} {
+		release, _, _, ok := env.server.channelConcurrencyLimiter.acquire(cfg.ID, apiKey, 1)
+		if !ok {
+			t.Fatalf("pre-acquire key %q failed", apiKey)
+		}
+		defer release()
+	}
+
+	body := []byte(`{"model":"gpt-4","messages":[{"role":"user","content":"hi"}]}`)
+	result, err := env.server.tryChannelWithKeys(ctx, cfg, &proxyRequestContext{
+		originalModel:  "gpt-4",
+		clientProtocol: protocol.OpenAI,
+		requestMethod:  http.MethodPost,
+		requestPath:    "/v1/chat/completions",
+		body:           body,
+		header:         make(http.Header),
+	}, newRecorder())
+	if result != nil {
+		t.Fatalf("result=%+v, want nil", result)
+	}
+	if !errors.Is(err, ErrKeyConcurrencyExceeded) {
+		t.Fatalf("error=%v, want ErrKeyConcurrencyExceeded", err)
+	}
+
+	var exhaustedErr *keyConcurrencyExhaustedError
+	if !errors.As(err, &exhaustedErr) {
+		t.Fatalf("error type=%T, want *keyConcurrencyExhaustedError", err)
+	}
+	if exhaustedErr.checkedKeys != 2 || exhaustedErr.totalKeys != 2 {
+		t.Fatalf("Key check=%d/%d, want 2/2", exhaustedErr.checkedKeys, exhaustedErr.totalKeys)
+	}
+	if exhaustedErr.concurrencyLimited != 2 {
+		t.Fatalf("concurrency limited=%d, want 2", exhaustedErr.concurrencyLimited)
+	}
+	if exhaustedErr.upstreamAttempts != 0 || exhaustedErr.maxUpstreamAttempts != 1 {
+		t.Fatalf("upstream attempts=%d/%d, want 0/1", exhaustedErr.upstreamAttempts, exhaustedErr.maxUpstreamAttempts)
+	}
+	if exhaustedErr.perKeyLimit != 1 {
+		t.Fatalf("per-key limit=%d, want 1", exhaustedErr.perKeyLimit)
+	}
 }

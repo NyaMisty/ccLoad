@@ -2130,6 +2130,19 @@ func (s *Server) tryChannelWithKeys(ctx context.Context, cfg *model.Config, reqC
 	var lastFailure *proxyResult
 	var lastConcurrencyErr error
 	upstreamKeyAttempts := 0
+	concurrencyLimitedKeys := 0
+	perKeyConcurrencyLimit := cfg.MaxConcurrency
+	keyConcurrencyExhausted := func() error {
+		return &keyConcurrencyExhaustedError{
+			cause:               lastConcurrencyErr,
+			checkedKeys:         len(triedKeys),
+			totalKeys:           actualKeyCount,
+			concurrencyLimited:  concurrencyLimitedKeys,
+			upstreamAttempts:    upstreamKeyAttempts,
+			maxUpstreamAttempts: maxUpstreamKeyAttempts,
+			perKeyLimit:         perKeyConcurrencyLimit,
+		}
+	}
 
 	// 准备请求体（处理模型重定向）
 	// [INFO] 修复：保存重定向后的模型名称，用于日志记录和调试
@@ -2166,7 +2179,7 @@ func (s *Server) tryChannelWithKeys(ctx context.Context, cfg *model.Config, reqC
 		keyIndex, selectedKey, selectErr := s.selectKeyWithFallback(cfg, apiKeys, triedKeys)
 		if selectErr != nil {
 			if lastFailure == nil && lastConcurrencyErr != nil {
-				return nil, lastConcurrencyErr
+				return nil, keyConcurrencyExhausted()
 			}
 			return nil, selectErr
 		}
@@ -2189,6 +2202,10 @@ func (s *Server) tryChannelWithKeys(ctx context.Context, cfg *model.Config, reqC
 		if attemptErr != nil {
 			if errors.Is(attemptErr, ErrKeyConcurrencyExceeded) {
 				lastConcurrencyErr = attemptErr
+				concurrencyLimitedKeys++
+				if _, limit, ok := keyConcurrencyLimit(attemptErr); ok {
+					perKeyConcurrencyLimit = limit
+				}
 				continue
 			}
 			return nil, attemptErr
@@ -2214,7 +2231,7 @@ func (s *Server) tryChannelWithKeys(ctx context.Context, cfg *model.Config, reqC
 		return lastFailure, nil
 	}
 	if lastConcurrencyErr != nil {
-		return nil, lastConcurrencyErr
+		return nil, keyConcurrencyExhausted()
 	}
 
 	// 所有Key都尝试过但都失败（无 lastFailure 说明循环未执行或逻辑异常）

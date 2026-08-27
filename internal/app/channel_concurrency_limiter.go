@@ -3,6 +3,7 @@ package app
 import (
 	"crypto/sha256"
 	"errors"
+	"fmt"
 	"io"
 	"sync"
 
@@ -19,6 +20,35 @@ func (e *keyConcurrencyExceededError) Error() string {
 }
 
 func (e *keyConcurrencyExceededError) Unwrap() error {
+	return ErrKeyConcurrencyExceeded
+}
+
+type keyConcurrencyExhaustedError struct {
+	cause               error
+	checkedKeys         int
+	totalKeys           int
+	concurrencyLimited  int
+	upstreamAttempts    int
+	maxUpstreamAttempts int
+	perKeyLimit         int
+}
+
+func (e *keyConcurrencyExhaustedError) Error() string {
+	return fmt.Sprintf(
+		"Key 检查=%d/%d，并发满载=%d，上游尝试=%d/%d，单 Key 上限=%d",
+		e.checkedKeys,
+		e.totalKeys,
+		e.concurrencyLimited,
+		e.upstreamAttempts,
+		e.maxUpstreamAttempts,
+		e.perKeyLimit,
+	)
+}
+
+func (e *keyConcurrencyExhaustedError) Unwrap() error {
+	if e.cause != nil {
+		return e.cause
+	}
 	return ErrKeyConcurrencyExceeded
 }
 
