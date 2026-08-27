@@ -1500,6 +1500,7 @@ func (s *codexUpstreamWebsocketSession) roundTrip(
 func (s *Server) doCodexWebsocketRequest(
 	ctx context.Context,
 	cfg *model.Config,
+	apiKey string,
 	session *codexUpstreamWebsocketSession,
 	replayReq *http.Request,
 	replayBody []byte,
@@ -1513,7 +1514,7 @@ func (s *Server) doCodexWebsocketRequest(
 	if incrementalReq != nil {
 		incrementalBody = normalizeCodexWebsocketParallelToolCalls(incrementalBody, incrementalReq.Header)
 	}
-	release, err := s.reserveUpstreamRequest(cfg)
+	release, err := s.reserveUpstreamRequest(cfg, apiKey)
 	if err != nil {
 		return nil, replayReq, replayBody, err
 	}

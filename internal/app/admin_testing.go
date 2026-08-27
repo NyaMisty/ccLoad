@@ -994,14 +994,15 @@ func channelRPMExceededTestResult(start time.Time, retryAfter time.Duration) map
 	}
 }
 
-func channelConcurrencyExceededTestResult(start time.Time, err error) map[string]any {
-	active, limit, _ := channelConcurrencyLimit(err)
+func keyConcurrencyExceededTestResult(start time.Time, err error) map[string]any {
+	active, limit, _ := keyConcurrencyLimit(err)
 	return map[string]any{
 		"success":             false,
-		"error":               "渠道已达到并发限制",
+		"error":               "当前 Key 已达到并发限制",
 		"status_code":         http.StatusTooManyRequests,
 		"duration_ms":         time.Since(start).Milliseconds(),
 		"concurrency_limited": true,
+		"concurrency_scope":   "key",
 		"active_concurrency":  active,
 		"max_concurrency":     limit,
 	}
@@ -1187,7 +1188,7 @@ func (s *Server) testChannelAPIWithURLForProtocol(
 			cfg, apiKey, testReq, clientProtocol, upstreamProtocol, selectedURL,
 		)
 		if err == nil {
-			capacityRelease, err = s.waitForUpstreamRequest(reqCtx, cfg)
+			capacityRelease, err = s.waitForUpstreamRequest(reqCtx, cfg, apiKey)
 		}
 		if err == nil {
 			req, cancel, err = s.newTestUpstreamRequest(reqCtx, cfgForBuild, testReq, requestPlan)
@@ -1266,11 +1267,11 @@ func (s *Server) testChannelAPIWithURLForProtocol(
 	// 发送请求
 	var resp *http.Response
 	if useNativeCodexWebsocket {
-		resp, err = s.doChannelTestCodexWebsocket(ctx, cfg, websocketSession, req, requestPlan.requestBody, capacityRelease)
+		resp, err = s.doChannelTestCodexWebsocket(ctx, cfg, apiKey, websocketSession, req, requestPlan.requestBody, capacityRelease)
 	} else if capacityRelease != nil {
 		resp, err = s.doReservedUpstreamRequest(cfg, req, capacityRelease, nil)
 	} else {
-		resp, err = s.doUpstreamRequest(cfg, req)
+		resp, err = s.doUpstreamRequest(cfg, apiKey, req)
 	}
 	if err != nil {
 		if errors.Is(err, ErrChannelRPMExceeded) {
@@ -1278,8 +1279,8 @@ func (s *Server) testChannelAPIWithURLForProtocol(
 			result["is_streaming"] = testReq.Stream
 			return attachTestDebugData(requestPlan, nil, result)
 		}
-		if errors.Is(err, ErrChannelConcurrencyExceeded) {
-			result := channelConcurrencyExceededTestResult(start, err)
+		if errors.Is(err, ErrKeyConcurrencyExceeded) {
+			result := keyConcurrencyExceededTestResult(start, err)
 			result["is_streaming"] = testReq.Stream
 			return attachTestDebugData(requestPlan, nil, result)
 		}
@@ -1396,6 +1397,7 @@ func (s *Server) testChannelAPIWithURLForProtocol(
 func (s *Server) doChannelTestCodexWebsocket(
 	ctx context.Context,
 	cfg *model.Config,
+	apiKey string,
 	session *codexUpstreamWebsocketSession,
 	req *http.Request,
 	body []byte,
@@ -1403,7 +1405,7 @@ func (s *Server) doChannelTestCodexWebsocket(
 ) (*http.Response, error) {
 	if capacityRelease == nil {
 		resp, _, _, err := s.doCodexWebsocketRequest(
-			ctx, cfg, session, req, body, nil, nil, req.URL.String(),
+			ctx, cfg, apiKey, session, req, body, nil, nil, req.URL.String(),
 		)
 		return resp, err
 	}

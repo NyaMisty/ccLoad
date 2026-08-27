@@ -76,7 +76,7 @@ ccLoad handles those cases with:
 - 🤗 **Hugging Face** - One-click deployment to Hugging Face Spaces, free hosting
 - 💰 **Cost Limits** - Per-channel daily cost limits, per-token cost limits
 - 🚦 **Channel RPM Limits** - Per-channel rolling 60-second request caps, 0=unlimited
-- 🚧 **Channel Concurrency Limits** - Per-channel in-flight request caps, 0=unlimited
+- 🚧 **Per-Key Concurrency Limits** - Per-key in-flight request caps within each channel, 0=unlimited
 - 🕒 **Channel Time Windows** - Optional HH:MM availability window per channel (server local time, cross-midnight supported); channels outside their window are fully excluded from routing
 - 🔐 **Token Restrictions** - Per-token cost limits, model restrictions, channel allowlist/denylist, and concurrency caps for fine-grained access control
 - ⏱️ **TTFB Monitoring** - Streaming request first byte time tracking for upstream latency diagnosis
@@ -721,7 +721,7 @@ curl -X POST http://localhost:8080/admin/channels \
 
 > **RPM Limit Note**: `rpm_limit` is a per-channel request cap over a rolling 60-second window; `0` means unlimited. Proxy forwarding, manual tests, single-URL tests, and scheduled checks all count toward the cap. Multi-URL failover counts each actual upstream HTTP request. The counter is in-memory: restart clears it, and multiple instances count independently.
 
-> **Concurrency Limit Note**: `max_concurrency` is a per-channel cap on simultaneous in-flight upstream requests; `0` means unlimited. A slot is acquired before the upstream request starts and released when the response body is closed, so streaming requests hold the slot until the stream ends. Over-limit channels are skipped without cooldown. The counter is in-memory and per instance.
+> **Concurrency Limit Note**: `max_concurrency` caps simultaneous in-flight upstream requests for each API key in a channel; `0` means unlimited. A slot is acquired before the upstream request starts and released when the response body is closed, so streaming requests hold the slot until the stream ends. A full key is skipped without consuming the upstream key retry budget; the channel is skipped only when no checked key has capacity. Counters are in-memory and per instance.
 
 #### Z.ai Coding Plan (ZCode)
 
@@ -1224,7 +1224,7 @@ storage/
 - ✅ **Debug logs**: Upstream request/response raw data capture, sensitive header masking, independent cleanup policy
 - ✅ **Scheduled channel checks**: Background periodic channel availability probing, configurable check model per channel
 - ✅ **Channel RPM limits**: Per-channel rolling 60-second request caps, `0` means unlimited, over-limit channels are skipped
-- ✅ **Channel concurrency limits**: Per-channel in-flight request caps, `0` means unlimited, over-limit channels are skipped
+- ✅ **Per-key concurrency limits**: Per-key in-flight request caps within each channel, `0` means unlimited; full keys are skipped
 
 **Backward Compatible Migration**:
 - Auto-detects and fixes duplicate channel names

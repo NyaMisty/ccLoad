@@ -1848,7 +1848,7 @@ func (s *Server) forwardOnceAsyncWithNativeCodexWebsocket(
 		// resulting wire body, not the pre-normalized caller input.
 		incrementalBody = bytes.Clone(reqCtx.transformPlan.TranslatedBody)
 		resp, req, sentBody, err = s.doCodexWebsocketRequest(
-			reqCtx.ctx, cfg, native.session,
+			reqCtx.ctx, cfg, apiKey, native.session,
 			replayReq, replayBody, incrementalReq, incrementalBody,
 			baseURL,
 		)
@@ -1856,7 +1856,7 @@ func (s *Server) forwardOnceAsyncWithNativeCodexWebsocket(
 			log.Printf("[INFO] 渠道 %d WebSocket 握手协商失败 (%v)，同 Key/URL 回退 HTTP", cfg.ID, err)
 			sentBody = responsesBodyForHTTPTransport(cfg, plan, replayBody)
 			req = cloneRequestWithBody(httpReq.WithContext(reqCtx.ctx), sentBody)
-			resp, err = s.doUpstreamRequest(cfg, req)
+			resp, err = s.doUpstreamRequest(cfg, apiKey, req)
 		} else {
 			usedNativeWebsocket = err == nil && resp != nil && resp.StatusCode >= 200 && resp.StatusCode < 300
 		}
@@ -1868,13 +1868,13 @@ func (s *Server) forwardOnceAsyncWithNativeCodexWebsocket(
 			log.Printf("[INFO] 渠道 %d WebSocket 握手返回 %d，同 Key/URL 回退 HTTP", cfg.ID, resp.StatusCode)
 			sentBody = responsesBodyForHTTPTransport(cfg, plan, replayBody)
 			req = cloneRequestWithBody(httpReq.WithContext(reqCtx.ctx), sentBody)
-			resp, err = s.doUpstreamRequest(cfg, req)
+			resp, err = s.doUpstreamRequest(cfg, apiKey, req)
 			usedNativeWebsocket = false
 		}
 	} else {
 		sentBody = responsesBodyForHTTPTransport(cfg, plan, replayBody)
 		req = cloneRequestWithBody(req, sentBody)
-		resp, err = s.doUpstreamRequest(cfg, req)
+		resp, err = s.doUpstreamRequest(cfg, apiKey, req)
 	}
 	if observer != nil && observer.OnUpstreamWebsocket != nil {
 		observer.OnUpstreamWebsocket(usedNativeWebsocket)
@@ -1930,7 +1930,7 @@ func (s *Server) forwardOnceAsyncWithNativeCodexWebsocket(
 		observer.OnDebugCapture(dc)
 	}
 
-	if err != nil && (errors.Is(err, ErrChannelRPMExceeded) || errors.Is(err, ErrChannelConcurrencyExceeded)) {
+	if err != nil && (errors.Is(err, ErrChannelRPMExceeded) || errors.Is(err, ErrKeyConcurrencyExceeded)) {
 		return nil, reqCtx.Duration().Seconds(), err
 	}
 
@@ -2395,8 +2395,11 @@ func (s *Server) forwardAttempt(
 				nextAction: cooldown.ActionReturnClient,
 			}, cooldown.ActionReturnClient, nil
 		}
-		if errors.Is(err, ErrChannelRPMExceeded) || errors.Is(err, ErrChannelConcurrencyExceeded) {
+		if errors.Is(err, ErrChannelRPMExceeded) {
 			return nil, cooldown.ActionRetryChannel, err
+		}
+		if errors.Is(err, ErrKeyConcurrencyExceeded) {
+			return nil, cooldown.ActionRetryKey, err
 		}
 		if errors.Is(err, util.ErrUpstreamStreamTimeout) && res != nil {
 			res.StreamDiagMsg = err.Error()
@@ -3406,14 +3409,29 @@ func (s *Server) tryChannelWithKeys(ctx context.Context, cfg *model.Config, reqC
 		return nil, fmt.Errorf("no API keys configured for channel %d", cfg.ID)
 	}
 
-	maxKeyRetries := min(s.maxKeyRetries, actualKeyCount)
+	maxUpstreamKeyAttempts := min(s.maxKeyRetries, actualKeyCount)
 	if cfg.RetryOtherKeysOnFailure {
-		maxKeyRetries = actualKeyCount
+		maxUpstreamKeyAttempts = actualKeyCount
 	}
 
 	triedKeys := make(map[int]bool) // 本次请求内已尝试过的Key
 
 	var lastFailure *proxyResult
+	var lastConcurrencyErr error
+	upstreamKeyAttempts := 0
+	concurrencyLimitedKeys := 0
+	perKeyConcurrencyLimit := cfg.MaxConcurrency
+	keyConcurrencyExhausted := func() error {
+		return &keyConcurrencyExhaustedError{
+			cause:               lastConcurrencyErr,
+			checkedKeys:         len(triedKeys),
+			totalKeys:           actualKeyCount,
+			concurrencyLimited:  concurrencyLimitedKeys,
+			upstreamAttempts:    upstreamKeyAttempts,
+			maxUpstreamAttempts: maxUpstreamKeyAttempts,
+			perKeyLimit:         perKeyConcurrencyLimit,
+		}
+	}
 
 	// 获取渠道URL列表（单URL时退化为单元素切片）
 	urls := cfg.GetURLs()
@@ -3422,8 +3440,8 @@ func (s *Server) tryChannelWithKeys(ctx context.Context, cfg *model.Config, reqC
 	}
 	selector := s.urlSelector
 
-	// Key重试循环
-	for range maxKeyRetries {
+	// Key重试循环。达到单 Key 并发上限只跳过该 Key，不消耗上游 Key 重试次数。
+	for len(triedKeys) < actualKeyCount && upstreamKeyAttempts < maxUpstreamKeyAttempts {
 		// 检查context是否已取消/超时
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return buildCtxDoneResult(cfg, ctxErr), nil
@@ -3439,6 +3457,9 @@ func (s *Server) tryChannelWithKeys(ctx context.Context, cfg *model.Config, reqC
 			keyIndex, selectedKey, selectErr = s.selectKeyWithFallback(cfg, apiKeys, triedKeys)
 		}
 		if selectErr != nil {
+			if lastFailure == nil && lastConcurrencyErr != nil {
+				return nil, keyConcurrencyExhausted()
+			}
 			return nil, selectErr
 		}
 
@@ -3450,8 +3471,17 @@ func (s *Server) tryChannelWithKeys(ctx context.Context, cfg *model.Config, reqC
 			ctx, cfg, urls, selector,
 			keyIndex, selectedKey, reqCtx, w)
 		if attemptErr != nil {
+			if errors.Is(attemptErr, ErrKeyConcurrencyExceeded) {
+				lastConcurrencyErr = attemptErr
+				concurrencyLimitedKeys++
+				if _, limit, ok := keyConcurrencyLimit(attemptErr); ok {
+					perKeyConcurrencyLimit = limit
+				}
+				continue
+			}
 			return nil, attemptErr
 		}
+		upstreamKeyAttempts++
 		if immediate != nil {
 			return immediate, nil
 		}
@@ -3470,6 +3500,9 @@ func (s *Server) tryChannelWithKeys(ctx context.Context, cfg *model.Config, reqC
 	// Key重试循环结束：返回最后一次失败结果
 	if lastFailure != nil {
 		return lastFailure, nil
+	}
+	if lastConcurrencyErr != nil {
+		return nil, keyConcurrencyExhausted()
 	}
 
 	// 所有Key都尝试过但都失败（无 lastFailure 说明循环未执行或逻辑异常）

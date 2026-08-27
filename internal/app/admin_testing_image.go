@@ -636,7 +636,7 @@ func (s *Server) testChannelImageGenerationWithURL(
 	req.Header.Set("Accept-Encoding", "identity")
 
 	debugCapture := s.captureDebugRequest(req, body)
-	resp, err := s.doUpstreamRequest(cfg, req)
+	resp, err := s.doUpstreamRequest(cfg, apiKey, req)
 	if err != nil {
 		if debugCapture != nil {
 			debugCapture.captureUpstreamError(err)
@@ -644,8 +644,8 @@ func (s *Server) testChannelImageGenerationWithURL(
 		result := imageGenerationErrorResult(start, err)
 		if errors.Is(err, ErrChannelRPMExceeded) {
 			result = channelRPMExceededTestResult(start, channelRPMRetryAfter(err))
-		} else if errors.Is(err, ErrChannelConcurrencyExceeded) {
-			result = channelConcurrencyExceededTestResult(start, err)
+		} else if errors.Is(err, ErrKeyConcurrencyExceeded) {
+			result = keyConcurrencyExceededTestResult(start, err)
 		} else if errors.Is(err, context.DeadlineExceeded) {
 			result["status_code"] = http.StatusGatewayTimeout
 			result["error"] = "非流式请求超时: " + err.Error()
