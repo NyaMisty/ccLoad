@@ -580,14 +580,15 @@ func channelRPMExceededTestResult(start time.Time, retryAfter time.Duration) map
 	}
 }
 
-func channelConcurrencyExceededTestResult(start time.Time, err error) map[string]any {
-	active, limit, _ := channelConcurrencyLimit(err)
+func keyConcurrencyExceededTestResult(start time.Time, err error) map[string]any {
+	active, limit, _ := keyConcurrencyLimit(err)
 	return map[string]any{
 		"success":             false,
-		"error":               "渠道已达到并发限制",
+		"error":               "当前 Key 已达到并发限制",
 		"status_code":         http.StatusTooManyRequests,
 		"duration_ms":         time.Since(start).Milliseconds(),
 		"concurrency_limited": true,
+		"concurrency_scope":   "key",
 		"active_concurrency":  active,
 		"max_concurrency":     limit,
 	}
@@ -688,15 +689,15 @@ func (s *Server) testChannelAPIWithURL(
 
 	// 发送请求
 	start := time.Now()
-	resp, err := s.doUpstreamRequest(cfg, req)
+	resp, err := s.doUpstreamRequest(cfg, apiKey, req)
 	if err != nil {
 		if errors.Is(err, ErrChannelRPMExceeded) {
 			result := channelRPMExceededTestResult(start, channelRPMRetryAfter(err))
 			result["is_streaming"] = testReq.Stream
 			return attachTestDebugData(requestPlan, nil, result)
 		}
-		if errors.Is(err, ErrChannelConcurrencyExceeded) {
-			result := channelConcurrencyExceededTestResult(start, err)
+		if errors.Is(err, ErrKeyConcurrencyExceeded) {
+			result := keyConcurrencyExceededTestResult(start, err)
 			result["is_streaming"] = testReq.Stream
 			return attachTestDebugData(requestPlan, nil, result)
 		}

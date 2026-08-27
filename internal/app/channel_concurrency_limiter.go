@@ -1,6 +1,7 @@
 package app
 
 import (
+	"crypto/sha256"
 	"errors"
 	"io"
 	"sync"
@@ -8,43 +9,55 @@ import (
 	"ccLoad/internal/model"
 )
 
-type channelConcurrencyExceededError struct {
+type keyConcurrencyExceededError struct {
 	active int
 	limit  int
 }
 
-func (e *channelConcurrencyExceededError) Error() string {
-	return ErrChannelConcurrencyExceeded.Error()
+func (e *keyConcurrencyExceededError) Error() string {
+	return ErrKeyConcurrencyExceeded.Error()
 }
 
-func (e *channelConcurrencyExceededError) Unwrap() error {
-	return ErrChannelConcurrencyExceeded
+func (e *keyConcurrencyExceededError) Unwrap() error {
+	return ErrKeyConcurrencyExceeded
 }
 
+// keyConcurrencyID avoids retaining plaintext credentials in the counter map.
+type keyConcurrencyID struct {
+	channelID int64
+	keyHash   [sha256.Size]byte
+}
+
+// channelConcurrencyLimiter applies the channel setting to each API key independently.
 type channelConcurrencyLimiter struct {
 	mu     sync.Mutex
-	active map[int64]int
+	active map[keyConcurrencyID]int
 }
 
 func newChannelConcurrencyLimiter() *channelConcurrencyLimiter {
 	return &channelConcurrencyLimiter{
-		active: make(map[int64]int),
+		active: make(map[keyConcurrencyID]int),
 	}
 }
 
-func (l *channelConcurrencyLimiter) acquire(channelID int64, limit int) (release func(), active, max int, ok bool) {
+func (l *channelConcurrencyLimiter) acquire(channelID int64, apiKey string, limit int) (release func(), active, max int, ok bool) {
 	if l == nil || channelID <= 0 || limit <= 0 {
 		return func() {}, 0, 0, true
 	}
 
+	id := keyConcurrencyID{
+		channelID: channelID,
+		keyHash:   sha256.Sum256([]byte(apiKey)),
+	}
+
 	l.mu.Lock()
-	current := l.active[channelID]
+	current := l.active[id]
 	if current >= limit {
 		l.mu.Unlock()
 		return nil, current, limit, false
 	}
 	next := current + 1
-	l.active[channelID] = next
+	l.active[id] = next
 	l.mu.Unlock()
 
 	var once sync.Once
@@ -52,17 +65,17 @@ func (l *channelConcurrencyLimiter) acquire(channelID int64, limit int) (release
 		once.Do(func() {
 			l.mu.Lock()
 			defer l.mu.Unlock()
-			current := l.active[channelID]
+			current := l.active[id]
 			if current <= 1 {
-				delete(l.active, channelID)
+				delete(l.active, id)
 				return
 			}
-			l.active[channelID] = current - 1
+			l.active[id] = current - 1
 		})
 	}, next, limit, true
 }
 
-func (s *Server) acquireChannelConcurrencySlot(cfg *model.Config) (release func(), err error) {
+func (s *Server) acquireKeyConcurrencySlot(cfg *model.Config, apiKey string) (release func(), err error) {
 	if cfg == nil || cfg.MaxConcurrency <= 0 {
 		return func() {}, nil
 	}
@@ -70,11 +83,11 @@ func (s *Server) acquireChannelConcurrencySlot(cfg *model.Config) (release func(
 		return func() {}, nil
 	}
 
-	release, active, limit, ok := s.channelConcurrencyLimiter.acquire(cfg.ID, cfg.MaxConcurrency)
+	release, active, limit, ok := s.channelConcurrencyLimiter.acquire(cfg.ID, apiKey, cfg.MaxConcurrency)
 	if ok {
 		return release, nil
 	}
-	return nil, &channelConcurrencyExceededError{active: active, limit: limit}
+	return nil, &keyConcurrencyExceededError{active: active, limit: limit}
 }
 
 type releaseOnCloseReadCloser struct {
@@ -94,8 +107,8 @@ func (rc *releaseOnCloseReadCloser) Close() error {
 	return closeErr
 }
 
-func channelConcurrencyLimit(err error) (active, limit int, ok bool) {
-	var concurrencyErr *channelConcurrencyExceededError
+func keyConcurrencyLimit(err error) (active, limit int, ok bool) {
+	var concurrencyErr *keyConcurrencyExceededError
 	if errors.As(err, &concurrencyErr) {
 		return concurrencyErr.active, concurrencyErr.limit, true
 	}

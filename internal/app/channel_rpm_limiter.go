@@ -128,8 +128,8 @@ func (s *Server) reserveChannelRPM(cfg *model.Config) channelRPMReservation {
 	return s.channelRPMLimiter.reserve(cfg.ID, cfg.RPMLimit)
 }
 
-func (s *Server) reserveUpstreamRequest(cfg *model.Config) (release func(), err error) {
-	release, err = s.acquireChannelConcurrencySlot(cfg)
+func (s *Server) reserveUpstreamRequest(cfg *model.Config, apiKey string) (release func(), err error) {
+	release, err = s.acquireKeyConcurrencySlot(cfg, apiKey)
 	if err != nil {
 		return nil, err
 	}
@@ -150,8 +150,8 @@ func channelRPMRetryAfter(err error) time.Duration {
 	return 0
 }
 
-func (s *Server) doUpstreamRequest(cfg *model.Config, req *http.Request) (*http.Response, error) {
-	release, err := s.reserveUpstreamRequest(cfg)
+func (s *Server) doUpstreamRequest(cfg *model.Config, apiKey string, req *http.Request) (*http.Response, error) {
+	release, err := s.reserveUpstreamRequest(cfg, apiKey)
 	if err != nil {
 		return nil, err
 	}

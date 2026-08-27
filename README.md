@@ -59,7 +59,7 @@ ccLoad handles those cases with:
 - 🤗 **Hugging Face** - One-click deployment to Hugging Face Spaces, free hosting
 - 💰 **Cost Limits** - Per-channel daily cost limits, per-token cost limits
 - 🚦 **Channel RPM Limits** - Per-channel rolling 60-second request caps, 0=unlimited
-- 🚧 **Channel Concurrency Limits** - Per-channel in-flight request caps, 0=unlimited
+- 🚧 **Per-Key Concurrency Limits** - Per-channel setting applied independently to each API key, 0=unlimited
 - 🔐 **Token Restrictions** - API token cost limits + model restrictions for fine-grained access control
 - ⏱️ **TTFB Monitoring** - Streaming request first byte time tracking for upstream latency diagnosis
 - 🌐 **Multi-URL Load Balancing** - Multiple URLs per channel with latency-weighted random selection
@@ -580,7 +580,7 @@ curl -X POST http://localhost:8080/admin/channels \
 
 > **RPM Limit Note**: `rpm_limit` is a per-channel request cap over a rolling 60-second window; `0` means unlimited. Proxy forwarding, manual tests, single-URL tests, and scheduled checks all count toward the cap. Multi-URL failover counts each actual upstream HTTP request. The counter is in-memory: restart clears it, and multiple instances count independently.
 
-> **Concurrency Limit Note**: `max_concurrency` is a per-channel cap on simultaneous in-flight upstream requests; `0` means unlimited. A slot is acquired before the upstream request starts and released when the response body is closed, so streaming requests hold the slot until the stream ends. Over-limit channels are skipped without cooldown. The counter is in-memory and per instance.
+> **Concurrency Limit Note**: `max_concurrency` caps simultaneous in-flight requests independently for each API key in the channel; `0` means unlimited. A slot is acquired before the upstream request starts and released when the response body is closed, so streaming requests hold the slot until the stream ends. When one key is full, another key in the same channel is tried; the channel is skipped without cooldown only when all available keys are full. A multi-key channel can therefore reach up to `available key count × max_concurrency` total in-flight requests. Counters are in-memory and per instance.
 
 ### Custom Request Rules (Advanced)
 
@@ -1010,7 +1010,7 @@ storage/
 - ✅ **Debug logs**: Upstream request/response raw data capture, sensitive header masking, independent cleanup policy
 - ✅ **Scheduled channel checks**: Background periodic channel availability probing, configurable check model per channel
 - ✅ **Channel RPM limits**: Per-channel rolling 60-second request caps, `0` means unlimited, over-limit channels are skipped
-- ✅ **Channel concurrency limits**: Per-channel in-flight request caps, `0` means unlimited, over-limit channels are skipped
+- ✅ **Per-key concurrency limits**: Each API key has an independent in-flight cap, `0` means unlimited, and full keys are skipped
 
 **Backward Compatible Migration**:
 - Auto-detects and fixes duplicate channel names

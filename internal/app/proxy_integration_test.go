@@ -341,7 +341,7 @@ func TestProxy_SkipsChannelAfterRPMLimitExceeded(t *testing.T) {
 	}
 }
 
-func TestProxy_SkipsChannelAfterConcurrencyLimitExceeded(t *testing.T) {
+func TestProxy_SkipsChannelWhenOnlyKeyConcurrencyLimitExceeded(t *testing.T) {
 	t.Parallel()
 
 	var limitedHits atomic.Int64
@@ -388,9 +388,9 @@ func TestProxy_SkipsChannelAfterConcurrencyLimitExceeded(t *testing.T) {
 	}
 	env.server.InvalidateChannelListCache()
 
-	release, _, _, ok := env.server.channelConcurrencyLimiter.acquire(limitedID, 1)
+	release, _, _, ok := env.server.channelConcurrencyLimiter.acquire(limitedID, "sk-limited", 1)
 	if !ok {
-		t.Fatal("pre-acquire limited channel slot failed")
+		t.Fatal("pre-acquire limited key slot failed")
 	}
 	defer release()
 
@@ -409,6 +409,70 @@ func TestProxy_SkipsChannelAfterConcurrencyLimitExceeded(t *testing.T) {
 	}
 	if !strings.Contains(w.Body.String(), "from-fallback") {
 		t.Fatalf("response should come from fallback, got %s", w.Body.String())
+	}
+}
+
+func TestProxy_UsesNextKeyWhenFirstKeyConcurrencyLimitExceeded(t *testing.T) {
+	t.Parallel()
+
+	var upstreamHits atomic.Int64
+	usedKey := make(chan string, 1)
+	upstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamHits.Add(1)
+		usedKey <- r.Header.Get("Authorization")
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"id":"from-second","choices":[{"message":{"content":"second"}}],"usage":{"prompt_tokens":1,"completion_tokens":1}}`))
+	}))
+	defer upstream.Close()
+
+	env := setupProxyTestEnv(t, []testChannel{
+		{name: "multi-key", models: "gpt-4", apiKey: "sk-first", priority: 100},
+	}, map[int]string{0: upstream.URL})
+
+	ctx := context.Background()
+	cfgs, err := env.store.ListConfigs(ctx)
+	if err != nil {
+		t.Fatalf("ListConfigs failed: %v", err)
+	}
+	if len(cfgs) != 1 {
+		t.Fatalf("configs=%d, want 1", len(cfgs))
+	}
+	cfg := cfgs[0]
+	cfg.MaxConcurrency = 1
+	if _, err := env.store.UpdateConfig(ctx, cfg.ID, cfg); err != nil {
+		t.Fatalf("UpdateConfig failed: %v", err)
+	}
+	if err := env.store.CreateAPIKeysBatch(ctx, []*model.APIKey{
+		{ChannelID: cfg.ID, KeyIndex: 1, APIKey: "sk-second", KeyStrategy: model.KeyStrategySequential},
+	}); err != nil {
+		t.Fatalf("CreateAPIKeysBatch failed: %v", err)
+	}
+	env.server.InvalidateChannelListCache()
+	env.server.InvalidateAPIKeysCache(cfg.ID)
+	env.server.maxKeyRetries = 1
+
+	release, _, _, ok := env.server.channelConcurrencyLimiter.acquire(cfg.ID, "sk-first", 1)
+	if !ok {
+		t.Fatal("pre-acquire first key slot failed")
+	}
+	defer release()
+
+	w := doProxyRequest(t, env.engine, http.MethodPost, "/v1/chat/completions", map[string]any{
+		"model":    "gpt-4",
+		"messages": []map[string]string{{"role": "user", "content": "hi"}},
+	}, nil)
+	if w.Code != http.StatusOK {
+		t.Fatalf("request status=%d body=%s", w.Code, w.Body.String())
+	}
+	if upstreamHits.Load() != 1 {
+		t.Fatalf("upstream hits=%d, want 1", upstreamHits.Load())
+	}
+	if got := <-usedKey; got != "Bearer sk-second" {
+		t.Fatalf("Authorization=%q, want second key", got)
+	}
+	if !strings.Contains(w.Body.String(), "from-second") {
+		t.Fatalf("response should come from second key, got %s", w.Body.String())
 	}
 }
 

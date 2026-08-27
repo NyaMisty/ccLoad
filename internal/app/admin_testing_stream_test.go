@@ -1147,9 +1147,9 @@ func TestChatRequestErrorResultClassifiesLimitAndNetworkFailures(t *testing.T) {
 		},
 		{
 			name:        "concurrency",
-			err:         &channelConcurrencyExceededError{active: 1, limit: 1},
+			err:         &keyConcurrencyExceededError{active: 1, limit: 1},
 			wantStatus:  http.StatusTooManyRequests,
-			wantMessage: "渠道已达到并发限制",
+			wantMessage: "当前 Key 已达到并发限制",
 			wantKey:     "concurrency_limited",
 		},
 	}

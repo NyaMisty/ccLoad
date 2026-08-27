@@ -218,7 +218,7 @@ func (s *Server) streamChatWithURL(
 	requestThinking := testRequestThinkingEffort(testReq, requestPlan)
 
 	start := time.Now()
-	resp, err := s.doUpstreamRequest(cfg, req)
+	resp, err := s.doUpstreamRequest(cfg, apiKey, req)
 	if err != nil {
 		result := chatRequestErrorResult(start, testReq, requestPlan.timeout, err)
 		if requestThinking != "" {
@@ -312,8 +312,8 @@ func chatRequestErrorResult(start time.Time, testReq *testutil.TestChannelReques
 		result["is_streaming"] = isStream
 		return result
 	}
-	if errors.Is(err, ErrChannelConcurrencyExceeded) {
-		result := channelConcurrencyExceededTestResult(start, err)
+	if errors.Is(err, ErrKeyConcurrencyExceeded) {
+		result := keyConcurrencyExceededTestResult(start, err)
 		result["is_streaming"] = isStream
 		return result
 	}

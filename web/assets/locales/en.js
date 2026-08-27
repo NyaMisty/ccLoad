@@ -233,7 +233,7 @@ window.I18N_LOCALES['en'] = {
   'channels.dailyCostLimitPlaceholder': '0=No limit',
   'channels.rpmLimit': 'RPM Limit',
   'channels.rpmLimitPlaceholder': '0=No limit',
-  'channels.maxConcurrency': 'Concurrency Limit',
+  'channels.maxConcurrency': 'Per-Key Concurrency',
   'channels.maxConcurrencyPlaceholder': '0=No limit',
   'channels.costMultiplier': 'Cost Multiplier',
   'channels.costMultiplierPlaceholder': 'Default 1',

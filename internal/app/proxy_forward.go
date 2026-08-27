@@ -1305,8 +1305,8 @@ func (s *Server) forwardOnceAsync(ctx context.Context, cfg *model.Config, apiKey
 	}
 
 	// 3. 发送请求
-	resp, err := s.doUpstreamRequest(cfg, req)
-	if err != nil && (errors.Is(err, ErrChannelRPMExceeded) || errors.Is(err, ErrChannelConcurrencyExceeded)) {
+	resp, err := s.doUpstreamRequest(cfg, apiKey, req)
+	if err != nil && (errors.Is(err, ErrChannelRPMExceeded) || errors.Is(err, ErrKeyConcurrencyExceeded)) {
 		return nil, reqCtx.Duration().Seconds(), err
 	}
 
@@ -1527,8 +1527,11 @@ func (s *Server) forwardAttempt(
 	// [INFO] 修复：handleResponse可能返回err即使StatusCode=200（例如Content-Length=0）
 	// [FIX] 2025-12: 传递 res 和 reqCtx，用于保留 499 场景下已消耗的 token 统计
 	if err != nil {
-		if errors.Is(err, ErrChannelRPMExceeded) || errors.Is(err, ErrChannelConcurrencyExceeded) {
+		if errors.Is(err, ErrChannelRPMExceeded) {
 			return nil, cooldown.ActionRetryChannel, err
+		}
+		if errors.Is(err, ErrKeyConcurrencyExceeded) {
+			return nil, cooldown.ActionRetryKey, err
 		}
 		result, action := s.handleNetworkError(
 			ctx, cfg, keyIndex, actualModel, selectedKey, reqCtx.tokenID, reqCtx.clientIP,
@@ -2120,11 +2123,13 @@ func (s *Server) tryChannelWithKeys(ctx context.Context, cfg *model.Config, reqC
 		return nil, fmt.Errorf("no API keys configured for channel %d", cfg.ID)
 	}
 
-	maxKeyRetries := min(s.maxKeyRetries, actualKeyCount)
+	maxUpstreamKeyAttempts := min(s.maxKeyRetries, actualKeyCount)
 
 	triedKeys := make(map[int]bool) // 本次请求内已尝试过的Key
 
 	var lastFailure *proxyResult
+	var lastConcurrencyErr error
+	upstreamKeyAttempts := 0
 
 	// 准备请求体（处理模型重定向）
 	// [INFO] 修复：保存重定向后的模型名称，用于日志记录和调试
@@ -2150,8 +2155,8 @@ func (s *Server) tryChannelWithKeys(ctx context.Context, cfg *model.Config, reqC
 		go selector.ProbeURLs(s.baseCtx, cfg.ID, urlsSnapshot)
 	}
 
-	// Key重试循环
-	for range maxKeyRetries {
+	// Key重试循环。达到单 Key 并发上限只跳过该 Key，不消耗上游 Key 重试次数。
+	for len(triedKeys) < actualKeyCount && upstreamKeyAttempts < maxUpstreamKeyAttempts {
 		// 检查context是否已取消/超时
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return buildCtxDoneResult(cfg, ctxErr), nil
@@ -2160,6 +2165,9 @@ func (s *Server) tryChannelWithKeys(ctx context.Context, cfg *model.Config, reqC
 		// 选择可用的API Key（直接传入apiKeys，避免重复查询）
 		keyIndex, selectedKey, selectErr := s.selectKeyWithFallback(cfg, apiKeys, triedKeys)
 		if selectErr != nil {
+			if lastFailure == nil && lastConcurrencyErr != nil {
+				return nil, lastConcurrencyErr
+			}
 			return nil, selectErr
 		}
 
@@ -2179,8 +2187,13 @@ func (s *Server) tryChannelWithKeys(ctx context.Context, cfg *model.Config, reqC
 			ctx, cfg, urls, selector,
 			keyIndex, selectedKey, reqCtx, actualModel, bodyToSend, requestPath, w)
 		if attemptErr != nil {
+			if errors.Is(attemptErr, ErrKeyConcurrencyExceeded) {
+				lastConcurrencyErr = attemptErr
+				continue
+			}
 			return nil, attemptErr
 		}
+		upstreamKeyAttempts++
 		if immediate != nil {
 			return immediate, nil
 		}
@@ -2199,6 +2212,9 @@ func (s *Server) tryChannelWithKeys(ctx context.Context, cfg *model.Config, reqC
 	// Key重试循环结束：返回最后一次失败结果
 	if lastFailure != nil {
 		return lastFailure, nil
+	}
+	if lastConcurrencyErr != nil {
+		return nil, lastConcurrencyErr
 	}
 
 	// 所有Key都尝试过但都失败（无 lastFailure 说明循环未执行或逻辑异常）

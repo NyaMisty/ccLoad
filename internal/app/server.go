@@ -45,7 +45,7 @@ type Server struct {
 	healthCache                   *HealthCache               // 渠道健康度缓存
 	costCache                     *CostCache                 // 渠道每日成本缓存
 	channelRPMLimiter             *channelRPMLimiter         // 渠道RPM限制器（内存滑动窗口）
-	channelConcurrencyLimiter     *channelConcurrencyLimiter // 渠道并发限制器（内存计数）
+	channelConcurrencyLimiter     *channelConcurrencyLimiter // 渠道内单 Key 并发限制器（内存计数）
 	statsCache                    *StatsCache                // 统计结果缓存层
 	channelBalancer               *SmoothWeightedRR          // 渠道负载均衡器（平滑加权轮询）
 	urlSelector                   *URLSelector               // URL选择器（多URL场景的延迟追踪与冷却）
