@@ -16,11 +16,13 @@ import (
 	"ccLoad/internal/util"
 
 	"github.com/bytedance/sonic"
+	"github.com/tidwall/gjson"
 )
 
-func mustBuildTestTransformPlan(t testing.TB, cfg *model.Config, requestPath string, body []byte) protocol.TransformPlan {
+func mustBuildTestTransformPlan(t testing.TB, cfg *model.Config, body []byte) protocol.TransformPlan {
 	t.Helper()
 
+	const requestPath = "/v1/messages"
 	modelName := extractModelFromPath(requestPath)
 	if modelName == "" {
 		var reqModel struct {
@@ -32,7 +34,7 @@ func mustBuildTestTransformPlan(t testing.TB, cfg *model.Config, requestPath str
 
 	plan, err := protocol.BuildTransformPlan(
 		detectClientProtocolFromPath(requestPath),
-		protocol.Protocol(cfg.GetChannelType()),
+		detectClientProtocolFromPath(requestPath),
 		requestPath,
 		requestPath,
 		body,
@@ -102,10 +104,9 @@ func TestBuildProxyRequest(t *testing.T) {
 	srv := newInMemoryServer(t)
 
 	cfg := &model.Config{
-		ID:          1,
-		Name:        "test",
-		URL:         "https://api.example.com",
-		ChannelType: "anthropic",
+		ID:   1,
+		Name: "test",
+		URLs: model.ChannelURLs{{URL: "https://api.example.com"}},
 	}
 
 	reqCtx := &requestContext{
@@ -122,7 +123,7 @@ func TestBuildProxyRequest(t *testing.T) {
 		http.Header{"User-Agent": []string{"test"}},
 		"",
 		"/v1/messages",
-		cfg.URL,
+		cfg.GetURLs()[0],
 	)
 
 	if err != nil {
@@ -149,10 +150,9 @@ func TestBuildProxyRequest_ExactURLMarkerSkipsEndpointPath(t *testing.T) {
 	srv := newInMemoryServer(t)
 
 	cfg := &model.Config{
-		ID:          1,
-		Name:        "test",
-		URL:         "https://api.example.com/custom/messages#",
-		ChannelType: "anthropic",
+		ID:   1,
+		Name: "test",
+		URLs: channelURLsForTest("https://api.example.com/custom/messages#"),
 	}
 
 	reqCtx := &requestContext{
@@ -169,7 +169,7 @@ func TestBuildProxyRequest_ExactURLMarkerSkipsEndpointPath(t *testing.T) {
 		http.Header{"User-Agent": []string{"test"}},
 		"beta=true&key=should-not-leak",
 		"/v1/messages",
-		cfg.URL,
+		cfg.GetURLs()[0],
 	)
 	if err != nil {
 		t.Fatalf("buildProxyRequest failed: %v", err)
@@ -180,14 +180,17 @@ func TestBuildProxyRequest_ExactURLMarkerSkipsEndpointPath(t *testing.T) {
 	}
 }
 
-func TestBuildProxyRequest_KeepsAnthropicHeadersForRuntimeAnthropicUpstream(t *testing.T) {
+// TestBuildProxyRequest_RebuildsClaudeCodeWireForAnthropicMessagesUpstream 守住
+// Claude Code CLI 指纹路径的 header 契约：Anthropic Messages 上游的请求头由网关
+// 整体重建，调用方声明的 anthropic-beta 不透传——否则 body 已按 CLI 形态重写，
+// header 却还是调用方的旧能力集，两边必然对不上。
+func TestBuildProxyRequest_RebuildsClaudeCodeWireForAnthropicMessagesUpstream(t *testing.T) {
 	srv := newInMemoryServer(t)
 
 	cfg := &model.Config{
-		ID:          1,
-		Name:        "openai-compatible-anthropic",
-		URL:         "https://api.example.com",
-		ChannelType: "openai",
+		ID:   1,
+		Name: "openai-compatible-anthropic",
+		URLs: model.ChannelURLs{{URL: "https://api.example.com"}},
 	}
 
 	reqCtx := &requestContext{
@@ -214,17 +217,172 @@ func TestBuildProxyRequest_KeepsAnthropicHeadersForRuntimeAnthropicUpstream(t *t
 		},
 		"",
 		"/v1/messages",
-		cfg.URL,
+		cfg.GetURLs()[0],
 	)
 	if err != nil {
 		t.Fatalf("buildProxyRequest failed: %v", err)
 	}
 
-	if got := req.Header.Get("anthropic-version"); got != "2023-06-01" {
-		t.Fatalf("anthropic-version = %q, want preserved runtime Anthropic upstream header", got)
+	if got := headerValueFold(req.Header, "anthropic-version"); got != "2023-06-01" {
+		t.Fatalf("anthropic-version = %q, want rebuilt Claude Code wire header", got)
 	}
-	if got := req.Header.Get("anthropic-beta"); got != "messages-2023-12-15" {
-		t.Fatalf("anthropic-beta = %q, want preserved runtime Anthropic upstream header", got)
+	betas := headerValueFold(req.Header, "anthropic-beta")
+	if strings.Contains(betas, "messages-2023-12-15") || !strings.Contains(betas, "claude-code-20250219") {
+		t.Fatalf("anthropic-beta = %q, want rebuilt Claude Code beta set", betas)
+	}
+	if got := headerValueFold(req.Header, "User-Agent"); got != "claude-cli/2.1.220 (external, cli)" {
+		t.Fatalf("User-Agent = %q, want Claude Code CLI fingerprint", got)
+	}
+}
+
+func TestBuildProxyRequest_KeepsCustomHeaderRulesOnClaudeCodeWire(t *testing.T) {
+	srv := newInMemoryServer(t)
+
+	cfg := &model.Config{
+		ID:   1,
+		Name: "anthropic-with-header-rules",
+		URLs: model.ChannelURLs{{URL: "https://api.example.com"}},
+		CustomRequestRules: &model.CustomRequestRules{Headers: []model.CustomHeaderRule{
+			{Action: model.RuleActionOverride, Name: "X-Gateway-Tag", Value: "ccload"},
+			{Action: model.RuleActionOverride, Name: "User-Agent", Value: "custom-agent"},
+			{Action: model.RuleActionAppend, Name: "Anthropic-Beta", Value: "context-1m-2025-08-07"},
+			{Action: model.RuleActionRemove, Name: "Anthropic-Beta", Value: "claude-code-20250219"},
+			{Action: model.RuleActionOverride, Name: "X-Api-Key", Value: "hijack"},
+		}},
+	}
+
+	reqCtx := &requestContext{
+		ctx:              context.Background(),
+		startTime:        time.Now(),
+		clientProtocol:   protocol.Anthropic,
+		upstreamProtocol: protocol.Anthropic,
+		transformPlan: protocol.TransformPlan{
+			ClientProtocol:   protocol.Anthropic,
+			UpstreamProtocol: protocol.Anthropic,
+			UpstreamPath:     "/v1/messages",
+		},
+	}
+
+	req, err := srv.buildProxyRequest(
+		reqCtx, cfg, "sk-test-key", http.MethodPost,
+		[]byte(`{"model":"claude-3","messages":[{"role":"user","content":"hi"}]}`),
+		http.Header{"anthropic-version": []string{"2023-06-01"}},
+		"", "/v1/messages", cfg.GetURLs()[0],
+	)
+	if err != nil {
+		t.Fatalf("buildProxyRequest failed: %v", err)
+	}
+
+	// 指纹路径清空并重建了整个请求头，规则必须在重建之后仍然生效。
+	if got := headerValueFold(req.Header, "X-Gateway-Tag"); got != "ccload" {
+		t.Fatalf("X-Gateway-Tag = %q, want the custom rule to survive the wire rebuild", got)
+	}
+	if got := headerValueFold(req.Header, "User-Agent"); got != "custom-agent" {
+		t.Fatalf("User-Agent = %q, want the custom rule to override the CLI fingerprint", got)
+	}
+	// append 产生独立的一条头值（applyHeaderRules 既有语义），断言要看全部值。
+	var betaValues []string
+	for name, values := range req.Header {
+		if strings.EqualFold(name, "anthropic-beta") {
+			betaValues = append(betaValues, values...)
+		}
+	}
+	betas := strings.Join(betaValues, ", ")
+	if strings.Contains(betas, "claude-code-20250219") || !strings.Contains(betas, "context-1m-2025-08-07") {
+		t.Fatalf("anthropic-beta = %q, want the remove/append rules applied", betas)
+	}
+	if strings.Count(betas, "context-1m-2025-08-07") != 1 {
+		t.Fatalf("anthropic-beta = %q, append rule must not run twice", betas)
+	}
+	// 认证头黑名单在该路径上同样不可被规则改写。
+	if got := headerValueFold(req.Header, "x-api-key"); got != "sk-test-key" {
+		t.Fatalf("x-api-key = %q, want the auth header protected from custom rules", got)
+	}
+}
+
+func TestBuildProxyRequest_AnyrouterMergesContext1mIntoClaudeCodeBeta(t *testing.T) {
+	srv := newInMemoryServer(t)
+	cfg := anyrouterAnthropicCfg()
+	reqCtx := &requestContext{
+		ctx:              context.Background(),
+		startTime:        time.Now(),
+		clientProtocol:   protocol.Anthropic,
+		upstreamProtocol: protocol.Anthropic,
+		transformPlan: protocol.TransformPlan{
+			ClientProtocol:   protocol.Anthropic,
+			UpstreamProtocol: protocol.Anthropic,
+			UpstreamPath:     "/v1/messages",
+		},
+	}
+
+	req, err := srv.buildProxyRequest(
+		reqCtx, cfg, "sk-test-key", http.MethodPost,
+		[]byte(`{"model":"claude-3","messages":[{"role":"user","content":"hi"}]}`),
+		http.Header{"anthropic-version": []string{"2023-06-01"}},
+		"", "/v1/messages", cfg.GetURLs()[0],
+	)
+	if err != nil {
+		t.Fatalf("buildProxyRequest failed: %v", err)
+	}
+
+	var keys []string
+	var values []string
+	for name, vs := range req.Header {
+		if strings.EqualFold(name, "anthropic-beta") {
+			keys = append(keys, name)
+			values = append(values, vs...)
+		}
+	}
+	if len(keys) != 1 {
+		t.Fatalf("anthropic-beta keys = %v, want exactly one map key", keys)
+	}
+	betas := strings.Join(values, ",")
+	if !strings.Contains(betas, "claude-code-20250219") || !strings.Contains(betas, "context-1m-2025-08-07") {
+		t.Fatalf("anthropic-beta = %q, want CLI betas plus context-1m", betas)
+	}
+}
+
+func TestBuildProxyRequest_KeepsCustomHeaderRulesOnAntigravityWire(t *testing.T) {
+	srv := newInMemoryServer(t)
+	cfg := &model.Config{
+		ID:                     1,
+		Name:                   "antigravity",
+		AuthType:               model.AuthTypeAntigravityOAuth,
+		AntigravityAccessToken: "at-gravity",
+		AntigravityProjectID:   "gravity-project",
+		URLs:                   model.ChannelURLs{{URL: "https://daily-cloudcode-pa.googleapis.com"}},
+		CustomRequestRules: &model.CustomRequestRules{Headers: []model.CustomHeaderRule{
+			{Action: model.RuleActionOverride, Name: "X-Configured", Value: "kept"},
+			{Action: model.RuleActionOverride, Name: "Authorization", Value: "Bearer hijack"},
+		}},
+	}
+	body := []byte(`{"contents":[{"role":"user","parts":[{"text":"hi"}]}]}`)
+	reqCtx := &requestContext{
+		ctx:              context.Background(),
+		startTime:        time.Now(),
+		clientProtocol:   protocol.Gemini,
+		upstreamProtocol: protocol.Gemini,
+		transformPlan: protocol.TransformPlan{
+			ClientProtocol:   protocol.Gemini,
+			UpstreamProtocol: protocol.Gemini,
+			UpstreamPath:     "/v1beta/models/gemini-3-flash:generateContent",
+			OriginalBody:     body,
+		},
+	}
+
+	req, err := srv.buildProxyRequest(
+		reqCtx, cfg, "unused", http.MethodPost, body,
+		http.Header{"Content-Type": []string{"application/json"}},
+		"", "/v1beta/models/gemini-3-flash:generateContent", cfg.GetURLs()[0],
+	)
+	if err != nil {
+		t.Fatalf("buildProxyRequest failed: %v", err)
+	}
+	if got := headerValueFold(req.Header, "X-Configured"); got != "kept" {
+		t.Fatalf("X-Configured = %q, want the custom rule to survive the Antigravity header rebuild", got)
+	}
+	if got := headerValueFold(req.Header, "Authorization"); got != "Bearer at-gravity" {
+		t.Fatalf("Authorization = %q, want the auth header protected from custom rules", got)
 	}
 }
 
@@ -232,10 +390,9 @@ func TestBuildProxyRequest_AuthHeadersUseRuntimeUpstreamProtocol(t *testing.T) {
 	srv := newInMemoryServer(t)
 
 	cfg := &model.Config{
-		ID:          1,
-		Name:        "anthropic-channel-openai-upstream",
-		URL:         "https://api.example.com",
-		ChannelType: "anthropic",
+		ID:   1,
+		Name: "anthropic-channel-openai-upstream",
+		URLs: model.ChannelURLs{{URL: "https://api.example.com"}},
 	}
 
 	reqCtx := &requestContext{
@@ -259,7 +416,7 @@ func TestBuildProxyRequest_AuthHeadersUseRuntimeUpstreamProtocol(t *testing.T) {
 		http.Header{"Content-Type": []string{"application/json"}},
 		"",
 		"/custom/responses",
-		cfg.URL,
+		cfg.GetURLs()[0],
 	)
 	if err != nil {
 		t.Fatalf("buildProxyRequest failed: %v", err)
@@ -280,10 +437,9 @@ func TestBuildProxyRequest_AddsAnthropicVersionForRuntimeAnthropicUpstream(t *te
 	srv := newInMemoryServer(t)
 
 	cfg := &model.Config{
-		ID:          1,
-		Name:        "openai-to-anthropic",
-		URL:         "https://api.example.com",
-		ChannelType: "anthropic",
+		ID:   1,
+		Name: "openai-to-anthropic",
+		URLs: model.ChannelURLs{{URL: "https://api.example.com"}},
 	}
 
 	reqCtx := &requestContext{
@@ -311,13 +467,13 @@ func TestBuildProxyRequest_AddsAnthropicVersionForRuntimeAnthropicUpstream(t *te
 		},
 		"",
 		"/v1/messages",
-		cfg.URL,
+		cfg.GetURLs()[0],
 	)
 	if err != nil {
 		t.Fatalf("buildProxyRequest failed: %v", err)
 	}
 
-	if got := req.Header.Get("anthropic-version"); got != "2023-06-01" {
+	if got := headerValueFold(req.Header, "anthropic-version"); got != "2023-06-01" {
 		t.Fatalf("anthropic-version = %q, want %q", got, "2023-06-01")
 	}
 }
@@ -391,7 +547,8 @@ func TestForwardOnceAsync_Integration(t *testing.T) {
 	// 创建测试服务器
 	upstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// 验证认证头
-		if r.Header.Get("x-api-key") != "sk-test" {
+		// Claude Code CLI 指纹路径写的是原样小写头名，进程内测试传输不做 canonical 化。
+		if headerValueFold(r.Header, "x-api-key") != "sk-test" {
 			w.WriteHeader(401)
 			_, _ = w.Write([]byte(`{"error":"unauthorized"}`))
 			return
@@ -410,7 +567,7 @@ func TestForwardOnceAsync_Integration(t *testing.T) {
 	cfg := &model.Config{
 		ID:   1,
 		Name: "test",
-		URL:  upstream.URL,
+		URLs: model.ChannelURLs{{URL: upstream.URL}},
 	}
 
 	// 测试成功请求
@@ -421,10 +578,10 @@ func TestForwardOnceAsync_Integration(t *testing.T) {
 			cfg,
 			"sk-test", // 正确的key
 			http.MethodPost,
-			mustBuildTestTransformPlan(t, cfg, "/v1/messages", []byte(`{"model":"claude-3"}`)),
+			mustBuildTestTransformPlan(t, cfg, []byte(`{"model":"claude-3"}`)),
 			http.Header{},
 			"",
-			cfg.URL,
+			cfg.GetURLs()[0],
 			recorder,
 			nil, // observer
 		)
@@ -454,10 +611,10 @@ func TestForwardOnceAsync_Integration(t *testing.T) {
 			cfg,
 			"sk-wrong", // 错误的key
 			http.MethodPost,
-			mustBuildTestTransformPlan(t, cfg, "/v1/messages", []byte(`{"model":"claude-3"}`)),
+			mustBuildTestTransformPlan(t, cfg, []byte(`{"model":"claude-3"}`)),
 			http.Header{},
 			"",
-			cfg.URL,
+			cfg.GetURLs()[0],
 			recorder,
 			nil, // observer
 		)
@@ -479,8 +636,13 @@ func TestForwardOnceAsync_Integration(t *testing.T) {
 func TestForwardOnceAsync_UsesTransformPlanUpstreamPathAndBody(t *testing.T) {
 	var gotPath string
 	var gotBody string
+	originalBody := []byte(`{"model":"alias-model","messages":[{"role":"user","content":"hi"}]}`)
+	rawResponseBody := `{"candidates":[{"content":{"parts":[{"text":"ok"}]}}],"usageMetadata":{"promptTokenCount":1,"candidatesTokenCount":1,"totalTokenCount":2},"modelVersion":"gemini-2.5-pro"}`
 
 	srv := newInMemoryServer(t)
+	srv.configService.mu.Lock()
+	srv.configService.cache["debug_log_enabled"] = &model.SystemSetting{Key: "debug_log_enabled", Value: "true"}
+	srv.configService.mu.Unlock()
 	srv.client = &http.Client{
 		Transport: roundTripperFunc(func(r *http.Request) (*http.Response, error) {
 			rawBody, _ := io.ReadAll(r.Body)
@@ -489,17 +651,17 @@ func TestForwardOnceAsync_UsesTransformPlanUpstreamPathAndBody(t *testing.T) {
 			return &http.Response{
 				StatusCode: http.StatusOK,
 				Header: http.Header{
-					"Content-Type": []string{"application/json"},
+					"Content-Type":     []string{"application/x-gemini+json"},
+					"X-Upstream-Trace": []string{"raw-response"},
 				},
-				Body: io.NopCloser(strings.NewReader(`{"candidates":[{"content":{"parts":[{"text":"ok"}]}}],"usageMetadata":{"promptTokenCount":1,"candidatesTokenCount":1,"totalTokenCount":2},"modelVersion":"gemini-2.5-pro"}`)),
+				Body: io.NopCloser(strings.NewReader(rawResponseBody)),
 			}, nil
 		}),
 	}
 	cfg := &model.Config{
-		ID:          1,
-		Name:        "gemini",
-		URL:         "https://gemini-upstream.example.com",
-		ChannelType: "gemini",
+		ID:   1,
+		Name: "gemini",
+		URLs: model.ChannelURLs{{URL: "https://gemini-upstream.example.com"}},
 	}
 
 	plan, err := protocol.BuildTransformPlan(
@@ -507,7 +669,7 @@ func TestForwardOnceAsync_UsesTransformPlanUpstreamPathAndBody(t *testing.T) {
 		protocol.Gemini,
 		"/v1/chat/completions",
 		"/v1/chat/completions",
-		[]byte(`{"model":"alias-model","messages":[{"role":"user","content":"hi"}]}`),
+		originalBody,
 		[]byte(`{"model":"gemini-2.5-pro","messages":[{"role":"user","content":"hi"}]}`),
 		"alias-model",
 		"gemini-2.5-pro",
@@ -517,6 +679,10 @@ func TestForwardOnceAsync_UsesTransformPlanUpstreamPathAndBody(t *testing.T) {
 		t.Fatalf("BuildTransformPlan failed: %v", err)
 	}
 
+	clientHeaders := http.Header{
+		"Content-Type":   []string{"application/json"},
+		"X-Client-Trace": []string{"original-request"},
+	}
 	recorder := newRecorder()
 	result, _, err := srv.forwardOnceAsync(
 		context.Background(),
@@ -524,9 +690,9 @@ func TestForwardOnceAsync_UsesTransformPlanUpstreamPathAndBody(t *testing.T) {
 		"sk-test",
 		http.MethodPost,
 		plan,
-		http.Header{},
+		clientHeaders,
 		"",
-		cfg.URL,
+		cfg.GetURLs()[0],
 		recorder,
 		nil,
 	)
@@ -541,6 +707,39 @@ func TestForwardOnceAsync_UsesTransformPlanUpstreamPathAndBody(t *testing.T) {
 	}
 	if !strings.Contains(gotBody, `"contents"`) {
 		t.Fatalf("expected transformed request body from plan, got %s", gotBody)
+	}
+	if result.DebugData == nil {
+		t.Fatal("expected debug data")
+	}
+	if !result.DebugData.ProtocolTransformed {
+		t.Fatal("debug data should mark local protocol transform")
+	}
+	if string(result.DebugData.OriginalReqBody) != string(originalBody) {
+		t.Fatalf("original request body=%s, want %s", result.DebugData.OriginalReqBody, originalBody)
+	}
+	if result.DebugData.OriginalReqURL != "/v1/chat/completions" {
+		t.Fatalf("original request URL=%q, want /v1/chat/completions", result.DebugData.OriginalReqURL)
+	}
+	if got := gjson.Get(result.DebugData.OriginalReqHeaders, "X-Client-Trace").String(); got != "original-request" {
+		t.Fatalf("original request header=%q, want original-request; headers=%s", got, result.DebugData.OriginalReqHeaders)
+	}
+	if string(result.DebugData.ReqBody) != gotBody {
+		t.Fatalf("translated request body=%s, want emitted body %s", result.DebugData.ReqBody, gotBody)
+	}
+	if string(result.DebugData.RespBody) != rawResponseBody {
+		t.Fatalf("original response body=%s, want %s", result.DebugData.RespBody, rawResponseBody)
+	}
+	if got := gjson.GetBytes(result.DebugData.TranslatedRespBody, "choices.0.message.content").String(); got != "ok" {
+		t.Fatalf("translated response content=%q, want ok; body=%s", got, result.DebugData.TranslatedRespBody)
+	}
+	if result.DebugData.TranslatedRespStatus != http.StatusOK {
+		t.Fatalf("translated response status=%d, want 200", result.DebugData.TranslatedRespStatus)
+	}
+	if got := gjson.Get(result.DebugData.TranslatedRespHeaders, "Content-Type").String(); got != "application/json" {
+		t.Fatalf("translated response content type=%q, want application/json; headers=%s", got, result.DebugData.TranslatedRespHeaders)
+	}
+	if got := gjson.Get(result.DebugData.RespHeaders, "Content-Type").String(); got != "application/x-gemini+json" {
+		t.Fatalf("raw response content type=%q, want application/x-gemini+json; headers=%s", got, result.DebugData.RespHeaders)
 	}
 }
 
@@ -567,10 +766,9 @@ func TestForwardOnceAsync_CodexSessionInjectionUsesFinalBodyForDebug(t *testing.
 	}
 
 	cfg := &model.Config{
-		ID:          1,
-		Name:        "codex-upstream",
-		URL:         "https://codex-upstream.example.com",
-		ChannelType: "codex",
+		ID:   1,
+		Name: "codex-upstream",
+		URLs: model.ChannelURLs{{URL: "https://codex-upstream.example.com"}},
 	}
 	originalBody := []byte(`{"model":"claude-3-5-sonnet","metadata":{"user_id":"claude-code-user-42"},"system":[{"type":"text","text":"be careful"}],"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]}`)
 	plan, err := protocol.BuildTransformPlan(
@@ -597,7 +795,7 @@ func TestForwardOnceAsync_CodexSessionInjectionUsesFinalBodyForDebug(t *testing.
 		plan,
 		http.Header{"Content-Type": []string{"application/json"}},
 		"",
-		cfg.URL,
+		cfg.GetURLs()[0],
 		recorder,
 		nil,
 	)
@@ -616,6 +814,123 @@ func TestForwardOnceAsync_CodexSessionInjectionUsesFinalBodyForDebug(t *testing.
 	}
 	if string(result.DebugData.ReqBody) != string(gotBody) {
 		t.Fatalf("debug body does not match final upstream body:\ndebug=%s\nsent=%s", result.DebugData.ReqBody, gotBody)
+	}
+	if !result.DebugData.ProtocolTransformed || string(result.DebugData.OriginalReqBody) != string(originalBody) {
+		t.Fatalf("debug data lost local transform request bodies: %+v", result.DebugData)
+	}
+	if got := gjson.GetBytes(result.DebugData.RespBody, "error").String(); got != "boom" {
+		t.Fatalf("original error response=%q, want boom; body=%s", got, result.DebugData.RespBody)
+	}
+	if len(result.DebugData.TranslatedRespBody) != 0 {
+		t.Fatalf("failed upstream response was not translated, got translated body=%s", result.DebugData.TranslatedRespBody)
+	}
+}
+
+func TestForwardOnceAsync_CodexStaticKeyUsesDedicatedHeaderContract(t *testing.T) {
+	var gotHeaders http.Header
+	srv := newInMemoryServer(t)
+	srv.client = &http.Client{
+		Transport: roundTripperFunc(func(r *http.Request) (*http.Response, error) {
+			gotHeaders = r.Header.Clone()
+			return &http.Response{
+				StatusCode: http.StatusInternalServerError,
+				Header:     http.Header{"Content-Type": []string{"application/json"}},
+				Body:       io.NopCloser(strings.NewReader(`{"error":"boom"}`)),
+			}, nil
+		}),
+	}
+
+	cfg := &model.Config{
+		ID:   1,
+		Name: "codex-static",
+		URLs: model.ChannelURLs{{URL: "https://codex-upstream.example.com"}},
+		CustomRequestRules: &model.CustomRequestRules{Headers: []model.CustomHeaderRule{
+			{Action: model.RuleActionOverride, Name: "Authorization", Value: "Bearer configured-attacker"},
+			{Action: model.RuleActionOverride, Name: "User-Agent", Value: "configured-attacker"},
+			{Action: model.RuleActionOverride, Name: "X-Configured", Value: "kept"},
+		}},
+	}
+	body := []byte(`{"model":"gpt-5.4","stream":false,"prompt_cache_key":"session-1","input":[]}`)
+	plan, err := protocol.BuildTransformPlan(
+		protocol.Codex,
+		protocol.Codex,
+		"/v1/responses",
+		"/v1/responses",
+		body,
+		body,
+		"gpt-5.4",
+		"gpt-5.4",
+		false,
+	)
+	if err != nil {
+		t.Fatalf("BuildTransformPlan failed: %v", err)
+	}
+
+	_, _, err = srv.forwardOnceAsync(
+		context.Background(),
+		cfg,
+		"sk-static",
+		http.MethodPost,
+		plan,
+		http.Header{
+			"Accept":                                []string{"application/problem+json"},
+			"Authorization":                         []string{"Bearer client-attacker"},
+			"Content-Type":                          []string{"text/plain"},
+			"Originator":                            []string{"client-attacker"},
+			"User-Agent":                            []string{"client-attacker"},
+			"Version":                               []string{"1.2.3"},
+			"X-Api-Key":                             []string{"client-attacker"},
+			"X-Arbitrary-Client":                    []string{"drop-me"},
+			"X-Client-Request-Id":                   []string{"request-1"},
+			"X-Codex-Beta-Features":                 []string{"feature-1"},
+			"X-Codex-Turn-Metadata":                 []string{`{"turn_id":"turn-1"}`},
+			"X-Codex-Turn-State":                    []string{"turn-state-1"},
+			"X-Forwarded-For":                       []string{"203.0.113.10"},
+			"X-ResponsesAPI-Include-Timing-Metrics": []string{"http-must-drop"},
+		},
+		"",
+		cfg.GetURLs()[0],
+		newRecorder(),
+		nil,
+	)
+	if err != nil {
+		t.Fatalf("forwardOnceAsync failed: %v", err)
+	}
+	if gotHeaders == nil {
+		t.Fatal("upstream request was not captured")
+	}
+
+	wantHeaders := map[string]string{
+		"Accept":                "application/json",
+		"Authorization":         "Bearer sk-static",
+		"Connection":            "Keep-Alive",
+		"Content-Type":          "application/json",
+		"Originator":            "codex-tui",
+		"Session_id":            "session-1",
+		"User-Agent":            codexUserAgent,
+		"Version":               codexVersion,
+		"X-Client-Request-Id":   "request-1",
+		"X-Codex-Beta-Features": "feature-1",
+		"X-Codex-Turn-State":    "turn-state-1",
+		"X-Codex-Turn-Metadata": `{"turn_id":"turn-1"}`,
+		"X-Configured":          "kept",
+	}
+	for name, want := range wantHeaders {
+		if got := gotHeaders.Get(name); got != want {
+			t.Errorf("%s = %q, want %q; headers=%v", name, got, want, gotHeaders)
+		}
+	}
+	for _, name := range []string{
+		"ChatGPT-Account-ID",
+		"X-Api-Key",
+		"x-goog-api-key",
+		"X-Arbitrary-Client",
+		"X-Forwarded-For",
+		"X-ResponsesAPI-Include-Timing-Metrics",
+	} {
+		if got := gotHeaders.Get(name); got != "" {
+			t.Errorf("%s leaked upstream with value %q; headers=%v", name, got, gotHeaders)
+		}
 	}
 }
 
@@ -667,7 +982,7 @@ func TestClientCancelClosesUpstream(t *testing.T) {
 	cfg := &model.Config{
 		ID:   1,
 		Name: "test",
-		URL:  upstream.URL,
+		URLs: model.ChannelURLs{{URL: upstream.URL}},
 	}
 
 	// 创建可取消的context
@@ -687,10 +1002,10 @@ func TestClientCancelClosesUpstream(t *testing.T) {
 			cfg,
 			"sk-test",
 			http.MethodPost,
-			mustBuildTestTransformPlan(t, cfg, "/v1/messages", []byte(`{"stream":true}`)),
+			mustBuildTestTransformPlan(t, cfg, []byte(`{"stream":true}`)),
 			http.Header{},
 			"",
-			cfg.URL,
+			cfg.GetURLs()[0],
 			recorder,
 			nil, // observer
 		)
@@ -759,7 +1074,7 @@ func TestNoGoroutineLeak(t *testing.T) {
 		}))
 		defer upstream.Close()
 
-		cfg := &model.Config{ID: 1, URL: upstream.URL}
+		cfg := &model.Config{ID: 1, URLs: model.ChannelURLs{{URL: upstream.URL}}}
 
 		for i := 0; i < 30; i++ {
 			recorder := newRecorder()
@@ -768,10 +1083,10 @@ func TestNoGoroutineLeak(t *testing.T) {
 				cfg,
 				"sk-test",
 				http.MethodPost,
-				mustBuildTestTransformPlan(t, cfg, "/v1/messages", []byte(`{}`)),
+				mustBuildTestTransformPlan(t, cfg, []byte(`{}`)),
 				http.Header{},
 				"",
-				cfg.URL,
+				cfg.GetURLs()[0],
 				recorder,
 				nil, // observer
 			)
@@ -795,7 +1110,7 @@ func TestNoGoroutineLeak(t *testing.T) {
 		}))
 		defer upstream.Close()
 
-		cfg := &model.Config{ID: 1, URL: upstream.URL}
+		cfg := &model.Config{ID: 1, URLs: model.ChannelURLs{{URL: upstream.URL}}}
 
 		for i := 0; i < 20; i++ {
 			ctx, cancel := context.WithCancel(context.Background())
@@ -807,7 +1122,7 @@ func TestNoGoroutineLeak(t *testing.T) {
 				cancel()
 			}()
 
-			_, _, _ = srv.forwardOnceAsync(ctx, cfg, "sk-test", http.MethodPost, mustBuildTestTransformPlan(t, cfg, "/v1/messages", []byte(`{}`)), http.Header{}, "", cfg.URL, recorder, nil)
+			_, _, _ = srv.forwardOnceAsync(ctx, cfg, "sk-test", http.MethodPost, mustBuildTestTransformPlan(t, cfg, []byte(`{}`)), http.Header{}, "", cfg.GetURLs()[0], recorder, nil)
 		}
 
 		after := waitForGoroutineDeltaLE(t, before, maxDelta, waitTimeout)
@@ -831,7 +1146,7 @@ func TestNoGoroutineLeak(t *testing.T) {
 		}))
 		defer upstream.Close()
 
-		cfg := &model.Config{ID: 1, URL: upstream.URL}
+		cfg := &model.Config{ID: 1, URLs: model.ChannelURLs{{URL: upstream.URL}}}
 
 		for i := 0; i < 10; i++ {
 			recorder := newRecorder()
@@ -840,10 +1155,10 @@ func TestNoGoroutineLeak(t *testing.T) {
 				cfg,
 				"sk-test",
 				http.MethodPost,
-				mustBuildTestTransformPlan(t, cfg, "/v1/messages", []byte(`{"stream":true}`)), // 流式请求
+				mustBuildTestTransformPlan(t, cfg, []byte(`{"stream":true}`)), // 流式请求
 				http.Header{},
 				"",
-				cfg.URL,
+				cfg.GetURLs()[0],
 				recorder,
 				nil, // observer
 			)
@@ -882,7 +1197,7 @@ func TestFirstByteTimeout_StreamingResponse(t *testing.T) {
 
 	cfg := &model.Config{
 		ID:   1,
-		URL:  upstream.URL,
+		URLs: model.ChannelURLs{{URL: upstream.URL}},
 		Name: "test-timeout",
 	}
 
@@ -892,10 +1207,10 @@ func TestFirstByteTimeout_StreamingResponse(t *testing.T) {
 		cfg,
 		"sk-test",
 		http.MethodPost,
-		mustBuildTestTransformPlan(t, cfg, "/v1/messages", []byte(`{"stream":true}`)),
+		mustBuildTestTransformPlan(t, cfg, []byte(`{"stream":true}`)),
 		http.Header{},
 		"",
-		cfg.URL,
+		cfg.GetURLs()[0],
 		recorder,
 		nil, // observer
 	)
@@ -923,6 +1238,60 @@ func TestFirstByteTimeout_StreamingResponse(t *testing.T) {
 
 }
 
+func TestStreamTimeout_ClosesLongRunningStreamingResponse(t *testing.T) {
+	srv := newInMemoryServer(t)
+
+	const testTimeout = 50 * time.Millisecond
+	srv.streamTimeout = testTimeout
+
+	upstreamCanceled := make(chan struct{})
+	upstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n")
+		if flusher, ok := w.(http.Flusher); ok {
+			flusher.Flush()
+		}
+		<-r.Context().Done()
+		close(upstreamCanceled)
+	}))
+	defer upstream.Close()
+
+	cfg := &model.Config{ID: 1, URLs: model.ChannelURLs{{URL: upstream.URL}}, Name: "test-stream-timeout"}
+	recorder := newRecorder()
+	started := time.Now()
+	res, _, err := srv.forwardOnceAsync(
+		context.Background(),
+		cfg,
+		"sk-test",
+		http.MethodPost,
+		mustBuildTestTransformPlan(t, cfg, []byte(`{"stream":true}`)),
+		http.Header{},
+		"",
+		cfg.GetURLs()[0],
+		recorder,
+		nil,
+	)
+
+	if err == nil || !strings.Contains(err.Error(), "stream timeout") {
+		t.Fatalf("error=%v, want stream timeout", err)
+	}
+	if !errors.Is(err, util.ErrUpstreamStreamTimeout) || errors.Is(err, context.Canceled) {
+		t.Fatalf("error=%v, want upstream timeout sentinel without client cancellation", err)
+	}
+	if res == nil || res.Status != util.StatusStreamIncomplete {
+		t.Fatalf("result=%+v, want status %d", res, util.StatusStreamIncomplete)
+	}
+	if elapsed := time.Since(started); elapsed > 10*testTimeout {
+		t.Fatalf("stream closed after %v, want no later than %v", elapsed, 10*testTimeout)
+	}
+	select {
+	case <-upstreamCanceled:
+	case <-time.After(10 * testTimeout):
+		t.Fatal("upstream request context was not canceled")
+	}
+}
+
 // TestFirstByteTimeout_StreamingResponseBodyDelayed 测试响应头已到但响应体迟迟不来时的首字节超时
 // 场景：上游先发送响应头并 flush，但延迟发送 SSE body
 // 期望：返回 598 状态码和 ErrUpstreamFirstByteTimeout 错误
@@ -947,7 +1316,7 @@ func TestFirstByteTimeout_StreamingResponseBodyDelayed(t *testing.T) {
 
 	cfg := &model.Config{
 		ID:   1,
-		URL:  upstream.URL,
+		URLs: model.ChannelURLs{{URL: upstream.URL}},
 		Name: "test-timeout-body-delayed",
 	}
 
@@ -957,10 +1326,10 @@ func TestFirstByteTimeout_StreamingResponseBodyDelayed(t *testing.T) {
 		cfg,
 		"sk-test",
 		http.MethodPost,
-		mustBuildTestTransformPlan(t, cfg, "/v1/messages", []byte(`{"stream":true}`)),
+		mustBuildTestTransformPlan(t, cfg, []byte(`{"stream":true}`)),
 		http.Header{},
 		"",
-		cfg.URL,
+		cfg.GetURLs()[0],
 		recorder,
 		nil, // observer
 	)
@@ -1014,7 +1383,7 @@ func TestFirstByteTimeout_StreamingHeartbeatBeforeContent(t *testing.T) {
 
 	cfg := &model.Config{
 		ID:   1,
-		URL:  upstream.URL,
+		URLs: model.ChannelURLs{{URL: upstream.URL}},
 		Name: "test-timeout-heartbeat-before-content",
 	}
 
@@ -1024,10 +1393,10 @@ func TestFirstByteTimeout_StreamingHeartbeatBeforeContent(t *testing.T) {
 		cfg,
 		"sk-test",
 		http.MethodPost,
-		mustBuildTestTransformPlan(t, cfg, "/v1/messages", []byte(`{"stream":true}`)),
+		mustBuildTestTransformPlan(t, cfg, []byte(`{"stream":true}`)),
 		http.Header{},
 		"",
-		cfg.URL,
+		cfg.GetURLs()[0],
 		recorder,
 		nil,
 	)

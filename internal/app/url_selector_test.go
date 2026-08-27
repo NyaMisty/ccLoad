@@ -1,9 +1,6 @@
 package app
 
 import (
-	"context"
-	"net"
-	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -27,6 +24,27 @@ func TestURLSelector_EmptyURLs(t *testing.T) {
 	sorted := sel.SortURLs(1, nil)
 	if len(sorted) != 0 {
 		t.Fatalf("expected empty sorted urls, got %v", sorted)
+	}
+}
+
+func TestURLSelector_LoadDisabledReplacesSnapshot(t *testing.T) {
+	sel := NewURLSelector()
+	sel.LoadDisabled(map[int64][]string{1: {"https://old.example.com"}})
+	if !sel.IsDisabled(1, "https://old.example.com") {
+		t.Fatal("initial disabled URL missing")
+	}
+
+	sel.LoadDisabled(map[int64][]string{2: {"https://new.example.com"}})
+	if sel.IsDisabled(1, "https://old.example.com") {
+		t.Fatal("stale disabled URL survived snapshot replacement")
+	}
+	if !sel.IsDisabled(2, "https://new.example.com") {
+		t.Fatal("new disabled URL missing")
+	}
+
+	sel.LoadDisabled(nil)
+	if sel.IsDisabled(2, "https://new.example.com") {
+		t.Fatal("empty authoritative snapshot did not clear disabled URLs")
 	}
 }
 
@@ -234,6 +252,66 @@ func TestURLSelector_RecordLatencyClearsCooldownWindow(t *testing.T) {
 	}
 }
 
+func TestURLSelector_ClearCooldownsOnlyAffectsSelectedChannel(t *testing.T) {
+	sel := NewURLSelector()
+	const (
+		selectedChannelID = int64(1)
+		otherChannelID    = int64(2)
+		selectedURL       = "https://selected.example"
+		otherURL          = "https://other.example"
+	)
+
+	sel.RecordLatency(selectedChannelID, selectedURL, 25*time.Millisecond)
+	sel.RecordRequestResult(selectedChannelID, selectedURL, 200)
+	sel.DisableURL(selectedChannelID, selectedURL)
+	sel.CooldownURL(selectedChannelID, selectedURL)
+	sel.CooldownURL(otherChannelID, otherURL)
+
+	sel.ClearCooldowns(selectedChannelID)
+
+	if sel.IsCooledDown(selectedChannelID, selectedURL) {
+		t.Fatal("selected channel URL cooldown was not cleared")
+	}
+	if !sel.IsCooledDown(otherChannelID, otherURL) {
+		t.Fatal("another channel URL cooldown was cleared")
+	}
+	stats := sel.GetURLStats(selectedChannelID, []string{selectedURL})
+	if len(stats) != 1 || stats[0].LatencyMs <= 0 || stats[0].Requests != 1 || !stats[0].Disabled {
+		t.Fatalf("clearing cooldown changed unrelated URL state: %+v", stats)
+	}
+}
+
+func TestURLSelector_HealthSignalsDoNotCountRequests(t *testing.T) {
+	sel := NewURLSelector()
+	channelID := int64(1)
+	url := "https://a.example"
+
+	sel.RecordLatency(channelID, url, 20*time.Millisecond)
+	sel.CooldownURL(channelID, url)
+
+	stats := sel.GetURLStats(channelID, []string{url})
+	if len(stats) != 1 || stats[0].Requests != 0 || stats[0].Failures != 0 {
+		t.Fatalf("延迟和冷却是健康信号，不应伪造调用次数: %+v", stats)
+	}
+}
+
+func TestURLSelector_RecordRequestResultMatchesLogAggregation(t *testing.T) {
+	sel := NewURLSelector()
+	channelID := int64(1)
+	url := "https://a.example"
+
+	sel.RecordRequestResult(channelID, url, 200)
+	sel.RecordRequestResult(channelID, url, 204)
+	sel.RecordRequestResult(channelID, url, 0)
+	sel.RecordRequestResult(channelID, url, 401)
+	sel.RecordRequestResult(channelID, url, StatusClientClosedRequest)
+
+	stats := sel.GetURLStats(channelID, []string{url})
+	if len(stats) != 1 || stats[0].Requests != 2 || stats[0].Failures != 2 {
+		t.Fatalf("URL 调用统计必须与日志聚合口径一致: %+v", stats)
+	}
+}
+
 func TestURLSelector_GC_RemovesExpiredState(t *testing.T) {
 	sel := NewURLSelector()
 	now := time.Now()
@@ -242,7 +320,6 @@ func TestURLSelector_GC_RemovesExpiredState(t *testing.T) {
 	freshLatencyKey := urlKey{channelID: 1, url: "https://fresh-latency.com"}
 	expiredCooldownKey := urlKey{channelID: 1, url: "https://expired-cooldown.com"}
 	activeCooldownKey := urlKey{channelID: 1, url: "https://active-cooldown.com"}
-
 	sel.latencies[oldLatencyKey] = &ewmaValue{value: 120, lastSeen: now.Add(-25 * time.Hour)}
 	sel.latencies[freshLatencyKey] = &ewmaValue{value: 80, lastSeen: now.Add(-2 * time.Hour)}
 	sel.cooldowns[expiredCooldownKey] = urlCooldownState{until: now.Add(-time.Minute), consecutiveFails: 2}
@@ -286,252 +363,6 @@ func TestURLSelector_RecordLatency_TriggersScheduledCleanup(t *testing.T) {
 	if _, ok := sel.cooldowns[expiredCooldownKey]; ok {
 		t.Fatalf("expected expired cooldown removed by scheduled cleanup")
 	}
-}
-
-func TestExtractHostPort(t *testing.T) {
-	tests := []struct {
-		input string
-		want  string
-	}{
-		{"https://api.openai.com", "api.openai.com:443"},
-		{"http://localhost", "localhost:80"},
-		{"https://api.example.com:8443", "api.example.com:8443"},
-		{"http://127.0.0.1:3000", "127.0.0.1:3000"},
-		{"https://[::1]", "[::1]:443"},
-		{"http://[2001:db8::1]:8080", "[2001:db8::1]:8080"},
-		{"", ""},
-		{"not-a-url", ""},
-	}
-	for _, tt := range tests {
-		got := extractHostPort(tt.input)
-		if got != tt.want {
-			t.Errorf("extractHostPort(%q) = %q, want %q", tt.input, got, tt.want)
-		}
-	}
-}
-
-func TestURLSelector_ProbeURLs_TimeoutCoolsPendingURLs(t *testing.T) {
-	sel := NewURLSelector()
-	sel.probeTimeout = 20 * time.Millisecond
-	sel.probeDial = func(ctx context.Context, _, address string) (net.Conn, error) {
-		switch address {
-		case "fast.example:443":
-			conn, peer := net.Pipe()
-			_ = peer.Close()
-			return conn, nil
-		case "slow.example:443":
-			<-ctx.Done()
-			return nil, ctx.Err()
-		default:
-			t.Fatalf("unexpected probe address: %s", address)
-			return nil, context.Canceled
-		}
-	}
-
-	urls := []string{"https://fast.example", "https://slow.example"}
-	sel.ProbeURLs(context.Background(), 1, urls)
-
-	if !sel.IsCooledDown(1, "https://slow.example") {
-		t.Fatalf("expected timed out URL to be cooled down")
-	}
-
-	sel.mu.RLock()
-	_, fastKnown := sel.latencies[urlKey{channelID: 1, url: "https://fast.example"}]
-	_, slowKnown := sel.latencies[urlKey{channelID: 1, url: "https://slow.example"}]
-	sel.mu.RUnlock()
-
-	if !fastKnown {
-		t.Fatalf("expected fast URL latency seed recorded")
-	}
-	if slowKnown {
-		t.Fatalf("expected timed out URL to remain without latency seed")
-	}
-
-	selected, _ := sel.SelectURL(1, urls)
-	if selected != "https://fast.example" {
-		t.Fatalf("expected known fast URL selected after probe timeout, got %s", selected)
-	}
-}
-
-func TestURLSelector_ProbeURLs_SuccessDoesNotClearExistingCooldown(t *testing.T) {
-	sel := NewURLSelector()
-	sel.probeDial = func(context.Context, string, string) (net.Conn, error) {
-		conn, peer := net.Pipe()
-		_ = peer.Close()
-		return conn, nil
-	}
-
-	urls := []string{"https://a.example", "https://b.example"}
-	sel.CooldownURL(1, "https://b.example")
-
-	sel.ProbeURLs(context.Background(), 1, urls)
-
-	if !sel.IsCooledDown(1, "https://b.example") {
-		t.Fatalf("expected successful probe to preserve existing cooldown")
-	}
-}
-
-func TestURLSelector_ProbeURLs_SkipsSingleURL(t *testing.T) {
-	sel := NewURLSelector()
-	// 单URL不应触发探测
-	sel.ProbeURLs(context.Background(), 1, []string{"https://a.com"})
-	sel.mu.RLock()
-	defer sel.mu.RUnlock()
-	if len(sel.latencies) != 0 {
-		t.Errorf("single URL should not trigger probe, got %d latencies", len(sel.latencies))
-	}
-}
-
-func TestURLSelector_ProbeURLs_SkipsKnownURLs(t *testing.T) {
-	sel := NewURLSelector()
-	urls := []string{"https://a.com", "https://b.com"}
-	// 给所有URL预设延迟数据
-	sel.RecordLatency(1, "https://a.com", 100*time.Millisecond)
-	sel.RecordLatency(1, "https://b.com", 200*time.Millisecond)
-
-	// 所有URL已有数据，ProbeURLs应立即返回（不发TCP连接）
-	sel.ProbeURLs(context.Background(), 1, urls)
-	// 不crash即通过
-}
-
-func TestURLSelector_ProbeURLs_InvalidURL(t *testing.T) {
-	sel := NewURLSelector()
-	// 无效URL应被冷却，不应panic
-	sel.ProbeURLs(context.Background(), 1, []string{"not-a-valid-url", "also-invalid"})
-
-	sel.mu.RLock()
-	defer sel.mu.RUnlock()
-	// 无效URL应该被冷却或至少不产生延迟数据
-	if len(sel.latencies) != 0 {
-		t.Errorf("invalid URLs should not produce latency data, got %d", len(sel.latencies))
-	}
-}
-
-func TestURLSelector_ProbeURLs_RealTCP(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skipping TCP probe test in short mode")
-	}
-
-	sel := NewURLSelector()
-	// 用localhost做TCP探测测试（假设本机80端口不开放）
-	// 这个测试主要验证ProbeURLs不会panic/hang，而非成功连接
-	urls := []string{"https://127.0.0.1:1", "https://127.0.0.1:2"}
-	sel.ProbeURLs(context.Background(), 1, urls)
-
-	// 连接失败的URL应被冷却
-	cooled := 0
-	for _, u := range urls {
-		if sel.IsCooledDown(1, u) {
-			cooled++
-		}
-	}
-	if cooled == 0 {
-		t.Logf("warning: no URLs were cooled down (might succeed if ports are open)")
-	}
-}
-
-func TestURLSelector_ProbeURLs_CancelDoesNotCooldownPendingURLs(t *testing.T) {
-	sel := NewURLSelector()
-	sel.probeTimeout = time.Second
-
-	slowStarted := make(chan struct{})
-	sel.probeDial = func(ctx context.Context, _, address string) (net.Conn, error) {
-		switch address {
-		case "fast.example:443":
-			conn, peer := net.Pipe()
-			_ = peer.Close()
-			return conn, nil
-		case "slow.example:443":
-			close(slowStarted)
-			<-ctx.Done()
-			return nil, ctx.Err()
-		default:
-			t.Fatalf("unexpected probe address: %s", address)
-			return nil, context.Canceled
-		}
-	}
-
-	parentCtx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	go func() {
-		<-slowStarted
-		cancel()
-	}()
-
-	urls := []string{"https://fast.example", "https://slow.example"}
-	sel.ProbeURLs(parentCtx, 1, urls)
-
-	if sel.IsCooledDown(1, "https://slow.example") {
-		t.Fatalf("expected canceled probe not to cooldown pending URL")
-	}
-}
-
-func TestURLSelector_ProbeURLs_DeduplicatesInFlightRequests(t *testing.T) {
-	sel := NewURLSelector()
-	sel.probeTimeout = time.Second
-
-	var dialCount atomic.Int64
-	release := make(chan struct{})
-	closed := false
-	closeRelease := func() {
-		if !closed {
-			close(release)
-			closed = true
-		}
-	}
-	defer closeRelease()
-
-	sel.probeDial = func(ctx context.Context, _, address string) (net.Conn, error) {
-		dialCount.Add(1)
-		select {
-		case <-release:
-			conn, peer := net.Pipe()
-			_ = peer.Close()
-			return conn, nil
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		}
-	}
-
-	urls := []string{"https://a.example", "https://b.example"}
-	done1 := make(chan struct{})
-	go func() {
-		sel.ProbeURLs(context.Background(), 1, urls)
-		close(done1)
-	}()
-
-	deadline := time.Now().Add(300 * time.Millisecond)
-	for dialCount.Load() < int64(len(urls)) {
-		if time.Now().After(deadline) {
-			closeRelease()
-			<-done1
-			t.Fatalf("first probe did not start all dials in time, got=%d want=%d", dialCount.Load(), len(urls))
-		}
-		time.Sleep(time.Millisecond)
-	}
-
-	done2 := make(chan struct{})
-	go func() {
-		sel.ProbeURLs(context.Background(), 1, urls)
-		close(done2)
-	}()
-
-	select {
-	case <-done2:
-	case <-time.After(100 * time.Millisecond):
-		closeRelease()
-		<-done1
-		t.Fatalf("second probe should return quickly when URLs are already being probed")
-	}
-
-	if got := dialCount.Load(); got != int64(len(urls)) {
-		closeRelease()
-		<-done1
-		t.Fatalf("expected no duplicate probe dials, got=%d want=%d", got, len(urls))
-	}
-
-	closeRelease()
-	<-done1
 }
 
 func TestPruneChannel_DisabledMap(t *testing.T) {

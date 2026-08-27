@@ -1,11 +1,11 @@
 /**
- * 渠道自定义请求规则模态框
+ * 渠道高级设置模态框
  *
  * 暴露全局函数：
  * - openCustomRulesModal / closeCustomRulesModal
  * - resetCustomRulesState(rules|null)
  * - collectCustomRulesForSubmit()
- * - applyCustomRulesFromForm() / addCustomRule / removeCustomRule / closeCustomRulesHelp
+ * - applyAdvancedSettingsFromForm() / addCustomRule / removeCustomRule / closeCustomRulesHelp
  *
  * 状态：模块内 `_state`（{ headers: [], body: [] }）与 `_draft`（仅模态打开期间）
  */
@@ -234,6 +234,13 @@
     switchTab('headers');
     hideError();
     updateAnyrouterHint();
+    if (hasWindow && typeof window.beginCooldownDetectionDraft === 'function') {
+      window.beginCooldownDetectionDraft();
+    }
+    if (hasWindow && typeof window.resetCodexQuotaOverdraftDraft === 'function') {
+      window.resetCodexQuotaOverdraftDraft();
+    }
+    switchAdvancedSettingsTab('custom-rules');
     const modal = document.getElementById('customRulesModal');
     if (modal) modal.classList.add('show');
   }
@@ -242,9 +249,14 @@
     const hint = document.getElementById('customRulesAnyrouterHint');
     if (!hint) return;
     const name = (document.getElementById('channelName')?.value || '').toLowerCase();
-    const url = (document.getElementById('channelUrl')?.value || '').toLowerCase();
-    const type = document.querySelector('input[name="channelType"]:checked')?.value || '';
-    hint.hidden = !(type === 'anthropic' && (name.includes('anyrouter') || url.includes('anyrouter')));
+    const url = typeof getValidInlineURLs === 'function'
+      ? getValidInlineURLs().join('\n').toLowerCase()
+      : '';
+    const urlConfigs = typeof getValidInlineURLConfigs === 'function' ? getValidInlineURLConfigs() : [];
+    const supportsAnthropic = urlConfigs.some(entry =>
+      !Array.isArray(entry.protocols) || entry.protocols.length === 0 || entry.protocols.includes('anthropic')
+    );
+    hint.hidden = !(supportsAnthropic && (name.includes('anyrouter') || url.includes('anyrouter')));
   }
 
   function closeCustomRulesModal() {
@@ -253,6 +265,33 @@
     if (modal) modal.classList.remove('show');
     _draft = null;
     closeCustomRulesHelp();
+    if (hasWindow && typeof window.discardCooldownDetectionDraft === 'function') {
+      window.discardCooldownDetectionDraft();
+    }
+  }
+
+  function switchAdvancedSettingsTab(tab) {
+    if (!hasDocument) return;
+    const panels = {
+      'custom-rules': document.getElementById('advancedSettingsPanelCustomRules'),
+      'cooldown-detection': document.getElementById('advancedSettingsPanelCooldownDetection'),
+      credential: document.getElementById('advancedSettingsPanelCredential'),
+      other: document.getElementById('advancedSettingsPanelOther')
+    };
+    if (!Object.prototype.hasOwnProperty.call(panels, tab)) return;
+    const buttons = document.querySelectorAll('[data-advanced-settings-tab]');
+    buttons.forEach((button) => {
+      const active = button.dataset.advancedSettingsTab === tab;
+      button.classList.toggle('active', active);
+      button.setAttribute('aria-selected', active ? 'true' : 'false');
+    });
+    Object.entries(panels).forEach(([name, panel]) => {
+      if (!panel) return;
+      panel.classList.toggle('hidden', name !== tab);
+    });
+    if (tab === 'cooldown-detection' && hasWindow && typeof window.beginCooldownDetectionDraft === 'function') {
+      window.beginCooldownDetectionDraft();
+    }
   }
 
   function switchTab(tab) {
@@ -410,27 +449,37 @@
     el.hidden = true;
   }
 
-  function applyCustomRulesFromForm() {
-    if (!_draft) {
-      closeCustomRulesModal();
-      return;
-    }
-    const normalized = {
-      headers: _draft.headers.map((r) => ({
+  function normalizedCustomRulesDraft() {
+    const draft = _draft || { headers: [], body: [] };
+    return {
+      headers: draft.headers.map((r) => ({
         action: r.action,
         name: (r.name || '').trim(),
         value: r.value || ''
       })),
-      body: _draft.body.map((r) => ({
+      body: draft.body.map((r) => ({
         action: r.action,
         path: (r.path || '').trim(),
         value: r.action === 'remove' ? '' : (r.value || '')
       }))
     };
+  }
+
+  function validateCustomRulesDraft() {
+    const errors = validateRulesLocally(normalizedCustomRulesDraft());
+    if (errors.length > 0) {
+      showError(errors.join(' · '));
+      return false;
+    }
+    return true;
+  }
+
+  function commitCustomRulesDraft() {
+    const normalized = normalizedCustomRulesDraft();
     const errors = validateRulesLocally(normalized);
     if (errors.length > 0) {
       showError(errors.join(' · '));
-      return;
+      return false;
     }
     _state = normalized;
     if (hasWindow) {
@@ -440,7 +489,56 @@
       }
     }
     updateTabCounts(_state);
-    closeCustomRulesModal();
+    return true;
+  }
+
+  async function applyAdvancedSettingsFromForm() {
+    const customRulesValid = validateCustomRulesDraft();
+    const cooldownRulesValid = !hasWindow || typeof window.validateCooldownDetectionDraft !== 'function'
+      || window.validateCooldownDetectionDraft();
+    if (!customRulesValid) {
+      switchAdvancedSettingsTab('custom-rules');
+      return false;
+    }
+    if (!cooldownRulesValid) {
+      const cooldownPanel = hasDocument ? document.getElementById('advancedSettingsPanelCooldownDetection') : null;
+      if (cooldownPanel && cooldownPanel.classList.contains('hidden')) {
+        switchAdvancedSettingsTab('cooldown-detection');
+        window.validateCooldownDetectionDraft();
+      }
+      return false;
+    }
+    const confirmButton = hasDocument
+      ? document.querySelector('[data-action="apply-advanced-settings"]')
+      : null;
+    try {
+      if (confirmButton) {
+        confirmButton.disabled = true;
+        confirmButton.setAttribute('aria-busy', 'true');
+      }
+      if (hasWindow && typeof window.saveCodexQuotaOverdraftFromAdvancedSettings === 'function') {
+        await window.saveCodexQuotaOverdraftFromAdvancedSettings();
+      }
+      if (!commitCustomRulesDraft()) return false;
+      if (hasWindow && typeof window.commitCooldownDetectionRules === 'function' && !window.commitCooldownDetectionRules()) {
+        return false;
+      }
+      closeCustomRulesModal();
+      return true;
+    } catch (error) {
+      switchAdvancedSettingsTab('credential');
+      const message = error?.message || t(
+        'channels.codex.quotaOverdraftSaveFailed',
+        'Failed to save quota overage setting'
+      );
+      if (hasWindow && typeof window.showError === 'function') window.showError(message);
+      return false;
+    } finally {
+      if (confirmButton) {
+        confirmButton.disabled = false;
+        confirmButton.removeAttribute('aria-busy');
+      }
+    }
   }
 
   function showCustomRulesHelp(target) {
@@ -507,7 +605,8 @@
   if (hasWindow) {
     window.openCustomRulesModal = openCustomRulesModal;
     window.closeCustomRulesModal = closeCustomRulesModal;
-    window.applyCustomRulesFromForm = applyCustomRulesFromForm;
+    window.switchAdvancedSettingsTab = switchAdvancedSettingsTab;
+    window.applyAdvancedSettingsFromForm = applyAdvancedSettingsFromForm;
     window.addCustomRule = addCustomRule;
     window.removeCustomRule = removeCustomRule;
     window.closeCustomRulesHelp = closeCustomRulesHelp;
@@ -519,6 +618,7 @@
   if (typeof module !== 'undefined' && module.exports) {
     module.exports = {
       validateRulesLocally,
+      applyAdvancedSettingsFromForm,
       collectCustomRulesForSubmit,
       resetCustomRulesState,
       cloneRules,

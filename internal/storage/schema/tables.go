@@ -10,7 +10,10 @@ func DefineChannelsTable() *TableBuilder {
 		Column("rpm_limit INT NOT NULL DEFAULT 0").
 		Column("max_concurrency INT NOT NULL DEFAULT 0").
 		Column("channel_type VARCHAR(64) NOT NULL DEFAULT 'anthropic'").
-		Column("protocol_transform_mode VARCHAR(32) NOT NULL DEFAULT 'local'").
+		Column("auth_type VARCHAR(32) NOT NULL DEFAULT 'api_key'").
+		Column("oauth_credential TEXT").
+		Column("websockets TINYINT NOT NULL DEFAULT 0").
+		Column("protocol_transform_mode VARCHAR(32) NOT NULL DEFAULT 'auto'").
 		Column("enabled TINYINT NOT NULL DEFAULT 1").
 		Column("scheduled_check_enabled TINYINT NOT NULL DEFAULT 0").
 		Column("scheduled_check_model VARCHAR(191) NOT NULL DEFAULT ''").
@@ -19,12 +22,15 @@ func DefineChannelsTable() *TableBuilder {
 		Column("daily_cost_limit DOUBLE NOT NULL DEFAULT 0").
 		Column("cost_multiplier DOUBLE NOT NULL DEFAULT 1").
 		Column("custom_request_rules TEXT").
+		Column("cooldown_detection_rules TEXT").
 		Column("proxy_url VARCHAR(255) NOT NULL DEFAULT ''").
+		Column("available_time_start VARCHAR(5) NOT NULL DEFAULT ''").
+		Column("available_time_end VARCHAR(5) NOT NULL DEFAULT ''").
+		Column("retry_other_keys_on_failure TINYINT NOT NULL DEFAULT 0").
 		Column("created_at BIGINT NOT NULL").
 		Column("updated_at BIGINT NOT NULL").
 		Index("idx_channels_enabled", "enabled").
 		Index("idx_channels_priority", "priority DESC").
-		Index("idx_channels_type_enabled", "channel_type, enabled").
 		Index("idx_channels_cooldown", "cooldown_until")
 }
 
@@ -54,20 +60,25 @@ func DefineChannelModelsTable() *TableBuilder {
 		Column("channel_id INT NOT NULL").
 		Column("model VARCHAR(191) NOT NULL").
 		Column("redirect_model VARCHAR(191) NOT NULL DEFAULT ''"). // 重定向目标模型（空表示不重定向）
+		Column("disabled TINYINT NOT NULL DEFAULT 0").
 		Column("created_at BIGINT NOT NULL DEFAULT 0").
 		Column("PRIMARY KEY (channel_id, model)").
 		Column("FOREIGN KEY (channel_id) REFERENCES channels(id) ON DELETE CASCADE").
 		Index("idx_channel_models_model", "model")
 }
 
-// DefineChannelProtocolTransformsTable 定义渠道协议转换表结构
-func DefineChannelProtocolTransformsTable() *TableBuilder {
-	return NewTable("channel_protocol_transforms").
+// DefineChannelModelCooldownsTable 定义渠道模型运行时冷却状态。
+// 独立于 channel_models：冷却键是实际上游模型，可能是 redirect_model，不一定是对外暴露的模型名。
+func DefineChannelModelCooldownsTable() *TableBuilder {
+	return NewTable("channel_model_cooldowns").
 		Column("channel_id INT NOT NULL").
-		Column("protocol VARCHAR(64) NOT NULL").
-		Column("PRIMARY KEY (channel_id, protocol)").
+		Column("model VARCHAR(191) NOT NULL").
+		Column("cooldown_until BIGINT NOT NULL").
+		Column("cooldown_duration_ms BIGINT NOT NULL DEFAULT 0").
+		Column("updated_at BIGINT NOT NULL").
+		Column("PRIMARY KEY (channel_id, model)").
 		Column("FOREIGN KEY (channel_id) REFERENCES channels(id) ON DELETE CASCADE").
-		Index("idx_channel_protocol_transforms_protocol", "protocol")
+		Index("idx_channel_model_cooldowns_until", "cooldown_until")
 }
 
 // DefineChannelURLStatesTable 定义渠道URL运行状态持久化表（当前仅记录手动禁用URL）
@@ -108,8 +119,15 @@ func DefineAuthTokensTable() *TableBuilder {
 		Column("effective_cost_usd DOUBLE NOT NULL DEFAULT 0.0").
 		Column("cost_used_microusd BIGINT NOT NULL DEFAULT 0").
 		Column("cost_limit_microusd BIGINT NOT NULL DEFAULT 0").
+		Column("cost_daily_used_microusd BIGINT NOT NULL DEFAULT 0").
+		Column("cost_daily_limit_microusd BIGINT NOT NULL DEFAULT 0").
+		Column("cost_daily_period_start BIGINT NOT NULL DEFAULT 0").
+		Column("cost_monthly_used_microusd BIGINT NOT NULL DEFAULT 0").
+		Column("cost_monthly_limit_microusd BIGINT NOT NULL DEFAULT 0").
+		Column("cost_monthly_period_start BIGINT NOT NULL DEFAULT 0").
 		Column("allowed_models VARCHAR(2000) NOT NULL DEFAULT ''").
 		Column("allowed_channel_ids VARCHAR(2000) NOT NULL DEFAULT ''").
+		Column("channel_restriction_mode VARCHAR(16) NOT NULL DEFAULT 'allow'").
 		Column("max_concurrency INT NOT NULL DEFAULT 0").
 		Index("idx_auth_tokens_active", "is_active").
 		Index("idx_auth_tokens_expires", "expires_at")
@@ -126,13 +144,15 @@ func DefineSystemSettingsTable() *TableBuilder {
 		Column("updated_at BIGINT NOT NULL")
 }
 
-// DefineAdminSessionsTable 定义admin_sessions表结构
-func DefineAdminSessionsTable() *TableBuilder {
-	return NewTable("admin_sessions").
-		Column("token VARCHAR(64) PRIMARY KEY"). // SHA256哈希(64字符十六进制,2025-12改为存储哈希而非明文)
+// DefineWebSessionsTable defines role-aware browser sessions.
+func DefineWebSessionsTable() *TableBuilder {
+	return NewTable("web_sessions").
+		Column("token_hash VARCHAR(64) PRIMARY KEY").
+		Column("role VARCHAR(16) NOT NULL").
+		Column("auth_token_id BIGINT NOT NULL DEFAULT 0").
 		Column("expires_at BIGINT NOT NULL").
 		Column("created_at BIGINT NOT NULL").
-		Index("idx_admin_sessions_expires", "expires_at")
+		Index("idx_web_sessions_expires", "expires_at")
 }
 
 // DefineSchemaMigrationsTable 定义schema_migrations表结构（迁移版本控制）
@@ -156,10 +176,13 @@ func DefineLogsTable() *TableBuilder {
 		Column("message TEXT NOT NULL").
 		Column("duration DOUBLE NOT NULL DEFAULT 0.0").
 		Column("is_streaming TINYINT NOT NULL DEFAULT 0").
+		Column("upstream_websocket TINYINT NOT NULL DEFAULT 0").
 		Column("first_byte_time DOUBLE NOT NULL DEFAULT 0.0").
 		Column("api_key_used VARCHAR(191) NOT NULL DEFAULT ''").
 		Column("api_key_hash VARCHAR(64) NOT NULL DEFAULT ''"). // API Key SHA256（用于精确定位 key_index）
 		Column("auth_token_id BIGINT NOT NULL DEFAULT 0").      // 客户端使用的API令牌ID（新增2025-12）
+		Column("client_protocol VARCHAR(32) NOT NULL DEFAULT ''").
+		Column("upstream_protocol VARCHAR(32) NOT NULL DEFAULT ''").
 		Column("client_ip VARCHAR(45) NOT NULL DEFAULT ''").    // 客户端IP地址（新增2025-12）
 		Column("base_url VARCHAR(500) NOT NULL DEFAULT ''").    // 请求使用的上游URL（多URL场景）
 		Column("service_tier VARCHAR(20) NOT NULL DEFAULT ''"). // OpenAI service_tier: priority/flex
@@ -186,7 +209,7 @@ func DefineLogsTable() *TableBuilder {
 		Index("idx_logs_source_minute", "log_source, minute_bucket")
 }
 
-// DefineDebugLogsTable 定义debug_logs表结构（上游请求/响应原始数据）
+// DefineDebugLogsTable 定义debug_logs表结构
 // log_id 与 logs.id 1:1 对应，直接作为主键，无需独立自增ID
 func DefineDebugLogsTable() *TableBuilder {
 	return NewTable("debug_logs").
@@ -199,5 +222,13 @@ func DefineDebugLogsTable() *TableBuilder {
 		Column("resp_status INT NOT NULL DEFAULT 0").
 		Column("resp_headers TEXT NOT NULL").
 		Column("resp_body LONGBLOB").
+		Column("upstream_error TEXT").
+		Column("protocol_transformed TINYINT NOT NULL DEFAULT 0").
+		Column("original_req_url TEXT").
+		Column("original_req_headers TEXT").
+		Column("original_req_body LONGBLOB").
+		Column("translated_resp_status INT NOT NULL DEFAULT 0").
+		Column("translated_resp_headers TEXT").
+		Column("translated_resp_body LONGBLOB").
 		Index("idx_debug_logs_created_at", "created_at")
 }

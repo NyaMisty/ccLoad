@@ -5,9 +5,11 @@ import (
 	"errors"
 	"net/http"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
+	"ccLoad/internal/config"
 	"ccLoad/internal/model"
 
 	"github.com/gin-gonic/gin"
@@ -21,6 +23,7 @@ type LogsBootstrapResponse struct {
 	AuthTokens                []*model.AuthToken    `json:"auth_tokens"`
 	Models                    []string              `json:"models"`
 	Channels                  []model.ChannelNameID `json:"channels"`
+	StatusCodes               []int                 `json:"status_codes"`
 }
 
 // HandleLogsBootstrap 聚合 logs 页首屏 5 个独立请求，并发组装后一次性返回
@@ -28,6 +31,10 @@ type LogsBootstrapResponse struct {
 func (s *Server) HandleLogsBootstrap(c *gin.Context) {
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 10*time.Second)
 	defer cancel()
+	if isAPITokenWebRequest(c) {
+		s.handleTokenLogsBootstrap(ctx, c)
+		return
+	}
 
 	// 解析时间范围（与 HandleGetModels 保持一致）
 	params := ParsePaginationParams(c)
@@ -35,8 +42,13 @@ func (s *Server) HandleLogsBootstrap(c *gin.Context) {
 		params.Range = "this_month"
 	}
 	since, until := params.GetTimeRange()
-	channelType := c.Query("channel_type")
-	logFilter := &model.LogFilter{LogSource: model.LogSourceProxy}
+	logFilter := &model.LogFilter{
+		LogSource:        model.LogSourceProxy,
+		UpstreamProtocol: strings.ToLower(strings.TrimSpace(c.Query("upstream_protocol"))),
+	}
+	if logFilter.UpstreamProtocol == "all" {
+		logFilter.UpstreamProtocol = ""
+	}
 
 	var (
 		resp     LogsBootstrapResponse
@@ -55,16 +67,18 @@ func (s *Server) HandleLogsBootstrap(c *gin.Context) {
 
 	// goroutine 1: channel_test_content
 	wg.Go(func() {
+		content := config.DefaultChannelTestContent
 		setting, err := s.configService.GetSettingFresh(ctx, "channel_test_content")
 		if err != nil && !errors.Is(err, model.ErrSettingNotFound) {
 			setErr(err)
 			return
 		}
-		if setting != nil {
-			mu.Lock()
-			resp.ChannelTestContent = setting.Value
-			mu.Unlock()
+		if setting != nil && strings.TrimSpace(setting.Value) != "" {
+			content = setting.Value
 		}
+		mu.Lock()
+		resp.ChannelTestContent = content
+		mu.Unlock()
 	})
 
 	// goroutine 2: log_channel_click_action
@@ -83,17 +97,20 @@ func (s *Server) HandleLogsBootstrap(c *gin.Context) {
 
 	// goroutine 3: channel_check_interval_hours
 	wg.Go(func() {
+		hours := defaultChannelCheckIntervalHours
 		setting, err := s.configService.GetSettingFresh(ctx, "channel_check_interval_hours")
 		if err != nil && !errors.Is(err, model.ErrSettingNotFound) {
 			setErr(err)
 			return
 		}
 		if setting != nil {
-			n, _ := strconv.ParseFloat(setting.Value, 64)
-			mu.Lock()
-			resp.ChannelCheckIntervalHours = n
-			mu.Unlock()
+			if parsed, parseErr := strconv.ParseFloat(setting.Value, 64); parseErr == nil {
+				hours = normalizeChannelCheckIntervalHours(parsed)
+			}
 		}
+		mu.Lock()
+		resp.ChannelCheckIntervalHours = hours
+		mu.Unlock()
 	})
 
 	// goroutine 4: auth tokens
@@ -111,14 +128,19 @@ func (s *Server) HandleLogsBootstrap(c *gin.Context) {
 		mu.Unlock()
 	})
 
-	// goroutine 5: distinct models + channels（顺序调用，共享同一 goroutine）
+	// goroutine 5: distinct models + channels + status codes（顺序调用，共享同一 goroutine）
 	wg.Go(func() {
-		models, err := s.store.GetDistinctModels(ctx, since, until, channelType, logFilter)
+		models, err := s.store.GetDistinctModels(ctx, since, until, logFilter)
 		if err != nil {
 			setErr(err)
 			return
 		}
-		channels, err := s.store.GetDistinctChannels(ctx, since, until, channelType, logFilter)
+		channels, err := s.store.GetDistinctChannels(ctx, since, until, logFilter)
+		if err != nil {
+			setErr(err)
+			return
+		}
+		statusCodes, err := s.store.GetDistinctStatusCodes(ctx, since, until, logFilter)
 		if err != nil {
 			setErr(err)
 			return
@@ -129,9 +151,13 @@ func (s *Server) HandleLogsBootstrap(c *gin.Context) {
 		if channels == nil {
 			channels = make([]model.ChannelNameID, 0)
 		}
+		if statusCodes == nil {
+			statusCodes = make([]int, 0)
+		}
 		mu.Lock()
 		resp.Models = models
 		resp.Channels = channels
+		resp.StatusCodes = statusCodes
 		mu.Unlock()
 	})
 
@@ -152,6 +178,49 @@ func (s *Server) HandleLogsBootstrap(c *gin.Context) {
 	if resp.Channels == nil {
 		resp.Channels = make([]model.ChannelNameID, 0)
 	}
+	if resp.StatusCodes == nil {
+		resp.StatusCodes = make([]int, 0)
+	}
 
 	RespondJSON(c, http.StatusOK, resp)
+}
+
+func (s *Server) handleTokenLogsBootstrap(ctx context.Context, c *gin.Context) {
+	params := ParsePaginationParams(c)
+	if params.Range == "" {
+		params.Range = "this_month"
+	}
+	since, until := params.GetTimeRange()
+	filter := BuildLogFilter(c)
+	filter.LogSource = model.LogSourceProxy
+	models, err := s.store.GetDistinctModels(ctx, since, until, &filter)
+	if err != nil {
+		RespondError(c, http.StatusInternalServerError, err)
+		return
+	}
+	if models == nil {
+		models = make([]string, 0)
+	}
+	channels, err := s.store.GetDistinctChannels(ctx, since, until, &filter)
+	if err != nil {
+		RespondError(c, http.StatusInternalServerError, err)
+		return
+	}
+	if channels == nil {
+		channels = make([]model.ChannelNameID, 0)
+	}
+	statusCodes, err := s.store.GetDistinctStatusCodes(ctx, since, until, &filter)
+	if err != nil {
+		RespondError(c, http.StatusInternalServerError, err)
+		return
+	}
+	if statusCodes == nil {
+		statusCodes = make([]int, 0)
+	}
+	RespondJSON(c, http.StatusOK, LogsBootstrapResponse{
+		AuthTokens:  make([]*model.AuthToken, 0),
+		Models:      models,
+		Channels:    channels,
+		StatusCodes: statusCodes,
+	})
 }

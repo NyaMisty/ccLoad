@@ -22,6 +22,10 @@ func TestAuthService_LoginLogoutAndCleanup(t *testing.T) {
 
 	svc := NewAuthService("pass", limiter, store)
 	t.Cleanup(svc.Close)
+	revoked := make(map[string]int)
+	svc.RegisterWebSessionRevokeHook(func(sessionHash string) {
+		revoked[sessionHash]++
+	})
 
 	mkCtx := func(method string, body []byte) (*gin.Context, *httptest.ResponseRecorder) {
 		req := newJSONRequestBytes(method, "/admin/login", body)
@@ -38,7 +42,7 @@ func TestAuthService_LoginLogoutAndCleanup(t *testing.T) {
 	})
 
 	t.Run("wrong password", func(t *testing.T) {
-		c, w := mkCtx(http.MethodPost, []byte(`{"password":"nope"}`))
+		c, w := mkCtx(http.MethodPost, []byte(`{"mode":"admin","password":"nope"}`))
 		svc.HandleLogin(c)
 		if w.Code != http.StatusUnauthorized {
 			t.Fatalf("status=%d, want %d", w.Code, http.StatusUnauthorized)
@@ -47,7 +51,7 @@ func TestAuthService_LoginLogoutAndCleanup(t *testing.T) {
 
 	var token string
 	t.Run("success login", func(t *testing.T) {
-		c, w := mkCtx(http.MethodPost, []byte(`{"password":"pass"}`))
+		c, w := mkCtx(http.MethodPost, []byte(`{"mode":"admin","password":"pass"}`))
 		svc.HandleLogin(c)
 		if w.Code != http.StatusOK {
 			t.Fatalf("status=%d, want %d, body=%s", w.Code, http.StatusOK, w.Body.String())
@@ -74,7 +78,7 @@ func TestAuthService_LoginLogoutAndCleanup(t *testing.T) {
 		// 数据库中应存在会话
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()
-		if _, exists, err := store.GetAdminSession(ctx, token); err != nil || !exists {
+		if _, exists, err := store.GetWebSession(ctx, token); err != nil || !exists {
 			t.Fatalf("expected session in DB: exists=%v err=%v", exists, err)
 		}
 	})
@@ -91,10 +95,13 @@ func TestAuthService_LoginLogoutAndCleanup(t *testing.T) {
 		if svc.isValidToken(token) {
 			t.Fatalf("expected token invalid after logout")
 		}
+		if got := revoked[model.HashToken(token)]; got != 1 {
+			t.Fatalf("logout revoke hook calls=%d, want 1", got)
+		}
 
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()
-		if _, exists, err := store.GetAdminSession(ctx, token); err != nil || exists {
+		if _, exists, err := store.GetWebSession(ctx, token); err != nil || exists {
 			t.Fatalf("expected session removed from DB: exists=%v err=%v", exists, err)
 		}
 	})
@@ -102,13 +109,13 @@ func TestAuthService_LoginLogoutAndCleanup(t *testing.T) {
 	t.Run("rate limited", func(t *testing.T) {
 		// 连续失败超过 maxAttempts(5) 后，第6次应返回 429
 		for i := 0; i < 5; i++ {
-			c, w := mkCtx(http.MethodPost, []byte(`{"password":"nope"}`))
+			c, w := mkCtx(http.MethodPost, []byte(`{"mode":"admin","password":"nope"}`))
 			svc.HandleLogin(c)
 			if w.Code != http.StatusUnauthorized {
 				t.Fatalf("attempt %d: status=%d, want %d", i+1, w.Code, http.StatusUnauthorized)
 			}
 		}
-		c, w := mkCtx(http.MethodPost, []byte(`{"password":"nope"}`))
+		c, w := mkCtx(http.MethodPost, []byte(`{"mode":"admin","password":"nope"}`))
 		svc.HandleLogin(c)
 		if w.Code != http.StatusTooManyRequests {
 			t.Fatalf("status=%d, want %d", w.Code, http.StatusTooManyRequests)
@@ -122,14 +129,14 @@ func TestAuthService_LoginLogoutAndCleanup(t *testing.T) {
 		validHash := model.HashToken(validPlain)
 
 		svc.tokensMux.Lock()
-		svc.validTokens[expiredHash] = time.Now().Add(-time.Second)
-		svc.validTokens[validHash] = time.Now().Add(1 * time.Hour)
+		svc.validTokens[expiredHash] = model.WebSession{TokenHash: expiredHash, Role: model.WebRoleAdmin, ExpiresAt: time.Now().Add(-time.Second)}
+		svc.validTokens[validHash] = model.WebSession{TokenHash: validHash, Role: model.WebRoleAdmin, ExpiresAt: time.Now().Add(time.Hour)}
 		svc.tokensMux.Unlock()
 
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()
-		_ = store.CreateAdminSession(ctx, expiredPlain, time.Now().Add(-time.Hour))
-		_ = store.CreateAdminSession(ctx, validPlain, time.Now().Add(1*time.Hour))
+		_ = store.CreateWebSession(ctx, expiredPlain, model.WebSession{Role: model.WebRoleAdmin, ExpiresAt: time.Now().Add(-time.Hour)})
+		_ = store.CreateWebSession(ctx, validPlain, model.WebSession{Role: model.WebRoleAdmin, ExpiresAt: time.Now().Add(time.Hour)})
 
 		svc.CleanExpiredTokens()
 
@@ -140,10 +147,16 @@ func TestAuthService_LoginLogoutAndCleanup(t *testing.T) {
 		if expiredStill || !validStill {
 			t.Fatalf("unexpected memory tokens: expired=%v valid=%v", expiredStill, validStill)
 		}
+		if got := revoked[expiredHash]; got != 1 {
+			t.Fatalf("expiry revoke hook calls=%d, want 1", got)
+		}
+		if got := revoked[validHash]; got != 0 {
+			t.Fatalf("valid session revoke hook calls=%d, want 0", got)
+		}
 
-		sessions, err := store.LoadAllSessions(ctx)
+		sessions, err := store.LoadWebSessions(ctx)
 		if err != nil {
-			t.Fatalf("LoadAllSessions failed: %v", err)
+			t.Fatalf("LoadWebSessions failed: %v", err)
 		}
 		if _, ok := sessions[expiredHash]; ok {
 			t.Fatalf("expected expired session removed from DB")

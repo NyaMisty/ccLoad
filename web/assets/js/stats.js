@@ -6,7 +6,6 @@
     let rpmStats = null; // 全局RPM统计（峰值、平均、最近一分钟）
     let isToday = true;  // 是否为本日（本日才显示最近一分钟）
     let durationSeconds = 0; // 时间跨度（秒），用于计算RPM
-    let currentChannelType = 'all'; // 当前选中的渠道类型
     let currentStatsCustomTimeRange = null;
     let authTokens = []; // 令牌列表
     let hideZeroSuccess = true; // 是否隐藏0成功的模型（默认开启）
@@ -116,17 +115,16 @@
 
         const params = buildStatsRequestParams();
         // 后端返回格式: {"success":true,"data":{"stats":[...],"duration_seconds":...,"rpm_stats":{...},"is_today":...}}
-        statsData = (await fetchDataWithAuth('/admin/stats?' + params.toString())) || { stats: [] };
+        statsData = (await fetchDataWithAuth('/dashboard/stats?' + params.toString())) || { stats: [] };
         durationSeconds = statsData.duration_seconds || 1; // 防止除零
         rpmStats = statsData.rpm_stats || null;
         isToday = statsData.is_today !== false;
         populateStatsComboboxOptions();
 
-        // 初始化时应用默认排序(渠道类型→优先级→渠道名称→模型名称)
+        // 初始化时应用默认排序（优先级→渠道名称→模型名称）
         applyDefaultSorting();
 
         renderStatsTable();
-        updateStatsCount();
         updateRpmHeader(); // 更新表头标题
 
         // 如果当前是图表视图，同步更新图表
@@ -205,7 +203,7 @@
     }
 
     function applySorting() {
-      // 如果没有排序状态,从原始数据恢复默认排序(渠道类型→优先级→渠道名称→模型名称)
+      // 如果没有排序状态，从原始数据恢复默认排序（优先级→渠道名称→模型名称）
       if (!sortState.column || !sortState.order) {
         if (statsData && statsData.originalStats) {
           statsData.stats = [...statsData.originalStats];
@@ -613,6 +611,57 @@
       loadStats();
     }
 
+    function getDefaultStatsFilters() {
+      if (window.FilterState && typeof window.FilterState.restore === 'function') {
+        return window.FilterState.restore({
+          search: '',
+          savedFilters: null,
+          fields: STATS_FILTER_FIELDS
+        });
+      }
+
+      return STATS_FILTER_FIELDS.reduce((values, field) => {
+        values[field.key] = Object.prototype.hasOwnProperty.call(field, 'defaultValue')
+          ? field.defaultValue
+          : '';
+        return values;
+      }, {});
+    }
+
+    function resetStatsFilters() {
+      const defaults = getDefaultStatsFilters();
+
+      currentStatsCustomTimeRange = null;
+      hideZeroSuccess = true;
+      rememberExactStatsFilters({
+        ...defaults,
+        channelNameExact: false,
+        modelExact: false
+      });
+
+      window.applyFilterControlValues(defaults, {
+        range: 'f_hours',
+        clientProtocol: 'f_client_protocol',
+        authToken: 'f_auth_token'
+      });
+      statsChannelNameCombobox?.setValue('', t('stats.allChannels'));
+      statsModelCombobox?.setValue('', t('trend.allModels'));
+
+      const hideZeroCheckbox = document.getElementById('f_hide_zero_success');
+      if (hideZeroCheckbox) hideZeroCheckbox.checked = true;
+
+      window.persistFilterState({
+        key: STATS_FILTER_KEY,
+        values: getStatsFilters(),
+        search: location.search,
+        pathname: location.pathname,
+        fields: STATS_FILTER_FIELDS,
+        preserveExistingParams: true,
+        historyMethod: 'replaceState'
+      });
+      loadStats();
+    }
+
     function initStatsChannelNameCombobox(initialValue) {
       statsChannelNameCombobox = window.createSearchableCombobox({
         inputId: 'f_name',
@@ -660,10 +709,7 @@
       try {
         const params = new URLSearchParams();
         appendStatsTimeRangeParams(params, getStatsFilters());
-        if (currentChannelType && currentChannelType !== 'all') {
-          params.set('channel_type', currentChannelType);
-        }
-        const data = await fetchDataWithAuth('/admin/stats/filter-options?' + params.toString());
+        const data = await fetchDataWithAuth('/dashboard/stats/filter-options?' + params.toString());
         if (data) {
           statsChannelNameOptions = data.channel_names || [];
           statsModelOptions = data.models || [];
@@ -687,6 +733,7 @@
       const name = restoredFilters.channelName || '';
       const range = restoredFilters.range || 'today';
       const model = restoredFilters.model || '';
+      const clientProtocol = restoredFilters.clientProtocol || '';
       const authToken = restoredFilters.authToken || '';
 
       window.initSavedDateRangeFilter({
@@ -712,6 +759,12 @@
       initStatsChannelNameCombobox(name);
       initStatsModelCombobox(model);
 
+      const clientProtocolSelect = document.getElementById('f_client_protocol');
+      if (clientProtocolSelect) {
+        clientProtocolSelect.value = clientProtocol;
+        clientProtocolSelect.addEventListener('change', applyFilter);
+      }
+
       window.initAuthTokenFilter({
         selectId: 'f_auth_token',
         value: authToken,
@@ -729,23 +782,13 @@
 
       // 事件监听
       document.getElementById('btn_filter').addEventListener('click', applyFilter);
+      document.getElementById('btn_clear_filters')?.addEventListener('click', resetStatsFilters);
 
       window.bindFilterApplyInputs({
         apply: applyFilter,
         debounceInputIds: [],
-        enterInputIds: ['f_hours', 'f_auth_token']
+        enterInputIds: ['f_hours', 'f_client_protocol', 'f_auth_token']
       });
-    }
-
-    function updateStatsCount() {
-      // 更新筛选器统计信息（显示过滤后的记录数）
-      const statsCountEl = document.getElementById('statsCount');
-      if (statsCountEl && statsData && statsData.stats) {
-        const count = hideZeroSuccess
-          ? statsData.stats.filter(entry => (entry.success || 0) > 0).length
-          : statsData.stats.length;
-        statsCountEl.textContent = count;
-      }
     }
 
     // 根据是否本日更新RPM表头标题
@@ -781,14 +824,9 @@
         return;
       }
 
-      // 按渠道类型升序,同类型按渠道优先级降序,再按渠道名称和模型名称升序
+      // 按渠道优先级降序，再按渠道名称和模型名称升序
       statsData.stats.sort((a, b) => {
-        const typeA = (a.channel_type || '').toLowerCase();
-        const typeB = (b.channel_type || '').toLowerCase();
-        const typeCompare = typeA.localeCompare(typeB, 'zh-CN');
-        if (typeCompare !== 0) return typeCompare;
-
-        // 同类型按优先级降序(数值大的在前)
+        // 按优先级降序（数值大的在前）
         const priorityA = a.channel_priority ?? 0;
         const priorityB = b.channel_priority ?? 0;
         if (priorityA !== priorityB) return priorityB - priorityA;
@@ -999,6 +1037,7 @@ ${t('stats.tooltipCost')}: $${point.cost.toFixed(4)}`;
         }
       },
       { key: 'channelId', queryKeys: ['channel_id'], defaultValue: '' },
+      { key: 'clientProtocol', queryKeys: ['client_protocol'], defaultValue: '' },
       {
         key: 'channelName',
         queryKeys: ['channel_name', 'channel_name_like'],
@@ -1014,17 +1053,6 @@ ${t('stats.tooltipCost')}: $${point.cost.toFixed(4)}`;
         defaultValue: ''
       },
       { key: 'authToken', queryKeys: ['auth_token_id'], defaultValue: '' },
-      {
-        key: 'channelType',
-        queryKeys: ['channel_type'],
-        defaultValue: 'all',
-        includeInQuery(value) {
-          return Boolean(value) && value !== 'all';
-        },
-        includeInRequest(value) {
-          return Boolean(value) && value !== 'all';
-        }
-      }
     ];
 
     function getStatsFilters() {
@@ -1032,6 +1060,7 @@ ${t('stats.tooltipCost')}: $${point.cost.toFixed(4)}`;
       const model = statsModelCombobox ? statsModelCombobox.getValue() : '';
       const baseValues = window.readFilterControlValues({
         range: { id: 'f_hours', defaultValue: 'today', trim: true },
+        clientProtocol: { id: 'f_client_protocol', trim: true },
         authToken: { id: 'f_auth_token', trim: true }
       });
       const hasCustomRange = baseValues.range === 'custom' && currentStatsCustomTimeRange;
@@ -1043,7 +1072,6 @@ ${t('stats.tooltipCost')}: $${point.cost.toFixed(4)}`;
         channelNameExact: isExactStatsChannelNameFilter(channelName),
         model,
         modelExact: isExactStatsModelFilter(model),
-        channelType: currentChannelType,
         hideZeroSuccess: hideZeroSuccess
       };
     }
@@ -1104,8 +1132,6 @@ ${t('stats.tooltipCost')}: $${point.cost.toFixed(4)}`;
         channelNameExact: !hasUrlParams && savedFilters?.channelNameExact === true,
         modelExact: !hasUrlParams && savedFilters?.modelExact === true
       }, hasUrlParams ? u : null);
-      currentChannelType = restoredFilters.channelType || 'all';
-
       // 恢复隐藏0成功选项状态（从 localStorage 读取，默认 true）
       hideZeroSuccess = savedFilters?.hideZeroSuccess !== false;
       const hideZeroCheckbox = document.getElementById('f_hide_zero_success');
@@ -1118,20 +1144,8 @@ ${t('stats.tooltipCost')}: $${point.cost.toFixed(4)}`;
             getValues: getStatsFilters
           });
           renderStatsTable();
-          updateStatsCount();
         });
       }
-
-      // 并行化：渠道类型过滤器初始化与数据加载同时进行，消除串行等待
-      const channelTypeReady = window.initChannelTypeFilter('f_channel_type', currentChannelType, (value) => {
-        currentChannelType = value;
-        window.persistFilterState({
-          key: STATS_FILTER_KEY,
-          getValues: getStatsFilters
-        });
-        loadStatsFilterOptions();
-        loadStats();
-      });
 
       initFilters(restoredFilters);
 
@@ -1144,10 +1158,8 @@ ${t('stats.tooltipCost')}: $${point.cost.toFixed(4)}`;
         });
       }
 
-      await Promise.all([
-        loadStats().then(() => restoreViewState()),
-        channelTypeReady
-      ]);
+      await loadStats();
+      restoreViewState();
 
       // 注册语言切换回调，重新渲染动态内容
       window.i18n.onLocaleChange(() => {

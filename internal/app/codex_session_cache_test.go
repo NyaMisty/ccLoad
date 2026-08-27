@@ -235,10 +235,9 @@ func TestBuildProxyRequest_CodexSessionInjection_Anthropic(t *testing.T) {
 	srv := newInMemoryServer(t)
 
 	cfg := &model.Config{
-		ID:          1,
-		Name:        "codex-ch",
-		URL:         "https://api.example.com",
-		ChannelType: "openai",
+		ID:   1,
+		Name: "codex-ch",
+		URLs: model.ChannelURLs{{URL: "https://api.example.com"}},
 	}
 
 	originalBody := []byte(`{"metadata":{"user_id":"claude-code-user-42"}}`)
@@ -263,7 +262,7 @@ func TestBuildProxyRequest_CodexSessionInjection_Anthropic(t *testing.T) {
 		http.Header{"Content-Type": []string{"application/json"}},
 		"",
 		"/v1/responses",
-		cfg.URL,
+		cfg.GetURLs()[0],
 	)
 	if err != nil {
 		t.Fatalf("buildProxyRequest failed: %v", err)
@@ -288,10 +287,9 @@ func TestBuildProxyRequest_CodexSessionInjection_NonCodexUpstreamSkipped(t *test
 	srv := newInMemoryServer(t)
 
 	cfg := &model.Config{
-		ID:          1,
-		Name:        "anthropic-ch",
-		URL:         "https://api.example.com",
-		ChannelType: "anthropic",
+		ID:   1,
+		Name: "anthropic-ch",
+		URLs: model.ChannelURLs{{URL: "https://api.example.com"}},
 	}
 
 	reqCtx := &requestContext{
@@ -312,7 +310,7 @@ func TestBuildProxyRequest_CodexSessionInjection_NonCodexUpstreamSkipped(t *test
 		http.Header{"Content-Type": []string{"application/json"}},
 		"",
 		"/v1/messages",
-		cfg.URL,
+		cfg.GetURLs()[0],
 	)
 	if err != nil {
 		t.Fatalf("buildProxyRequest failed: %v", err)
@@ -328,10 +326,9 @@ func TestBuildProxyRequest_CodexSessionInjection_ClientHeaderNotOverwritten(t *t
 	srv := newInMemoryServer(t)
 
 	cfg := &model.Config{
-		ID:          1,
-		Name:        "codex-ch",
-		URL:         "https://api.example.com",
-		ChannelType: "openai",
+		ID:   1,
+		Name: "codex-ch",
+		URLs: model.ChannelURLs{{URL: "https://api.example.com"}},
 	}
 
 	reqCtx := &requestContext{
@@ -355,7 +352,7 @@ func TestBuildProxyRequest_CodexSessionInjection_ClientHeaderNotOverwritten(t *t
 		},
 		"",
 		"/v1/responses",
-		cfg.URL,
+		cfg.GetURLs()[0],
 	)
 	if err != nil {
 		t.Fatalf("buildProxyRequest failed: %v", err)
@@ -363,5 +360,55 @@ func TestBuildProxyRequest_CodexSessionInjection_ClientHeaderNotOverwritten(t *t
 
 	if got := req.Header.Get("Session_id"); got != "client-session" {
 		t.Fatalf("expected client Session_id preserved, got %q", got)
+	}
+}
+
+func TestBuildProxyRequest_CodexIdentityHeadersAndTurnState(t *testing.T) {
+	resetCodexSessionCache()
+	srv := newInMemoryServer(t)
+
+	cfg := &model.Config{
+		ID:   1,
+		Name: "codex-ch",
+		URLs: model.ChannelURLs{{URL: "https://api.example.com"}},
+	}
+	reqCtx := &requestContext{
+		ctx:              context.Background(),
+		startTime:        time.Now(),
+		clientProtocol:   protocol.Codex,
+		upstreamProtocol: protocol.Codex,
+		originalModel:    "gpt-5-codex",
+		originalBody:     []byte(`{"model":"gpt-5-codex","input":[]}`),
+	}
+
+	req, err := srv.buildProxyRequest(
+		reqCtx,
+		cfg,
+		"sk-test",
+		http.MethodPost,
+		reqCtx.originalBody,
+		http.Header{
+			"User-Agent":         []string{"codex-tui/9.9.9"},
+			"Originator":         []string{"other-client"},
+			"Version":            []string{"9.9.9"},
+			"X-Codex-Turn-State": []string{"turn-state-token"},
+		},
+		"",
+		"/v1/responses",
+		cfg.GetURLs()[0],
+	)
+	if err != nil {
+		t.Fatalf("buildProxyRequest failed: %v", err)
+	}
+
+	for name, want := range map[string]string{
+		"User-Agent":         codexUserAgent,
+		"Originator":         codexOriginator,
+		"Version":            codexVersion,
+		"X-Codex-Turn-State": "turn-state-token",
+	} {
+		if got := req.Header.Get(name); got != want {
+			t.Errorf("%s = %q, want %q", name, got, want)
+		}
 	}
 }

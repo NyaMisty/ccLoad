@@ -12,35 +12,46 @@ import (
 // 从 forwardOnceAsync 提取，遵循SRP原则
 // 补充首字节超时管控（可选）
 type requestContext struct {
-	ctx               context.Context
-	cancel            context.CancelFunc // [INFO] 总是非 nil（即使是 noop），调用方无需检查
-	startTime         time.Time
-	isStreaming       bool
-	transformPlan     protocol.TransformPlan
-	clientProtocol    protocol.Protocol
-	upstreamProtocol  protocol.Protocol
-	originalModel     string
-	originalBody      []byte
-	translatedBody    []byte
-	firstByteTimeout  time.Duration
-	nonStreamTimeout  time.Duration
-	firstByteTimer    *time.Timer
-	firstByteTimedOut atomic.Bool
+	ctx                           context.Context
+	cancel                        context.CancelFunc // [INFO] 总是非 nil（即使是 noop），调用方无需检查
+	startTime                     time.Time
+	isStreaming                   bool
+	transformPlan                 protocol.TransformPlan
+	clientProtocol                protocol.Protocol
+	upstreamProtocol              protocol.Protocol
+	originalModel                 string
+	originalBody                  []byte
+	translatedBody                []byte
+	firstByteTimeout              time.Duration
+	streamTimeout                 time.Duration
+	nonStreamTimeout              time.Duration
+	responsesSSEUpstreamNonStream bool
+	antigravityOAuth              bool
+	anthropicClaudeCodeWire       bool
+	// codexMultiAgentV2Optimized records that this attempt renamed the
+	// collaboration namespace and therefore needs response restoration.
+	codexMultiAgentV2Optimized bool
+	executionIdentity          string
+	firstByteTimer             *time.Timer
+	streamTimer                *time.Timer
+	firstByteTimedOut          atomic.Bool
+	streamTimedOut             atomic.Bool
 }
 
 // newRequestContext 创建请求上下文（处理超时控制）
 // 设计原则：
-// - 流式请求：使用 firstByteTimeout（首字节超时），之后不限制
+// - 流式请求：使用 firstByteTimeout（首字节超时）和 streamTimeout（总超时）
 // - 非流式请求：使用 nonStreamTimeout（整体超时），超时主动关闭上游连接
 // [INFO] Go 1.21+ 改进：总是返回非 nil 的 cancel，调用方无需检查（符合 Go 惯用法）
 func (s *Server) newRequestContext(parentCtx context.Context, requestPath string, body []byte) *requestContext {
-	return s.newRequestContextWithTimeouts(parentCtx, requestPath, body, channelTypeTimeoutConfig{
+	return s.newRequestContextWithTimeouts(parentCtx, requestPath, body, protocolTimeoutConfig{
 		FirstByteTimeout: s.firstByteTimeout,
+		StreamTimeout:    s.streamTimeout,
 		NonStreamTimeout: s.nonStreamTimeout,
 	})
 }
 
-func (s *Server) newRequestContextWithTimeouts(parentCtx context.Context, requestPath string, body []byte, timeouts channelTypeTimeoutConfig) *requestContext {
+func (s *Server) newRequestContextWithTimeouts(parentCtx context.Context, requestPath string, body []byte, timeouts protocolTimeoutConfig) *requestContext {
 	isStreaming := isStreamingRequest(requestPath, body)
 
 	// [INFO] 关键改动：总是使用 WithCancel 包裹（即使无超时配置也能正常取消）
@@ -64,7 +75,15 @@ func (s *Server) newRequestContextWithTimeouts(parentCtx context.Context, reques
 		startTime:        time.Now(),
 		isStreaming:      isStreaming,
 		firstByteTimeout: timeouts.FirstByteTimeout,
+		streamTimeout:    timeouts.StreamTimeout,
 		nonStreamTimeout: timeouts.NonStreamTimeout,
+	}
+
+	if isStreaming && timeouts.StreamTimeout > 0 {
+		reqCtx.streamTimer = time.AfterFunc(timeouts.StreamTimeout, func() {
+			reqCtx.streamTimedOut.Store(true)
+			cancel()
+		})
 	}
 
 	// 流式请求的首字节超时定时器
@@ -88,6 +107,10 @@ func (rc *requestContext) firstByteTimeoutTriggered() bool {
 	return rc.firstByteTimedOut.Load()
 }
 
+func (rc *requestContext) streamTimeoutTriggered() bool {
+	return rc.streamTimedOut.Load()
+}
+
 // Duration 返回从请求开始到现在的时间
 func (rc *requestContext) Duration() time.Duration {
 	return time.Since(rc.startTime)
@@ -97,5 +120,8 @@ func (rc *requestContext) Duration() time.Duration {
 // [INFO] 符合 Go 惯用法：defer reqCtx.cleanup() 一行搞定
 func (rc *requestContext) cleanup() {
 	rc.stopFirstByteTimer() // 停止首字节超时定时器
-	rc.cancel()             // 取消 context（总是非 nil，无需检查）
+	if rc.streamTimer != nil {
+		rc.streamTimer.Stop()
+	}
+	rc.cancel() // 取消 context（总是非 nil，无需检查）
 }

@@ -2,13 +2,14 @@
 package testutil
 
 import (
-	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
 	"net/http"
 	"strings"
 	"time"
 
+	"ccLoad/internal/codexauth"
 	"ccLoad/internal/model"
 	"ccLoad/internal/util"
 	"ccLoad/internal/version"
@@ -24,7 +25,7 @@ func patchMessagesInBody(body []byte, key string, messages any) ([]byte, error) 
 		return nil, err
 	}
 	obj[key] = messages
-	return sonic.Marshal(obj)
+	return sonic.ConfigStd.Marshal(obj)
 }
 
 func parseDataURLImage(dataURL string) (mimeType, data string, ok bool) {
@@ -281,7 +282,7 @@ func patchBodyObject(body []byte, mutate func(map[string]any)) ([]byte, error) {
 		return nil, err
 	}
 	mutate(obj)
-	return sonic.Marshal(obj)
+	return sonic.ConfigStd.Marshal(obj)
 }
 
 func hasTestSamplingOptions(req *TestChannelRequest) bool {
@@ -349,15 +350,6 @@ func applyGeminiSamplingAndSystemPrompt(obj map[string]any, req *TestChannelRequ
 			"parts": []any{map[string]any{"text": prompt}},
 		}
 	}
-}
-
-func appendAnthropicSystemPrompt(obj map[string]any, prompt string) {
-	prompt = strings.TrimSpace(prompt)
-	if prompt == "" {
-		return
-	}
-	system, _ := obj["system"].([]any)
-	obj["system"] = append(system, map[string]any{"type": "text", "text": prompt})
 }
 
 func normalizeTestThinkingEffort(effort string) string {
@@ -442,7 +434,7 @@ func appendTestTool(obj map[string]any, tool map[string]any) {
 
 func applyOpenAITestOptions(body []byte, req *TestChannelRequest) ([]byte, error) {
 	effort := normalizeTestThinkingEffort(req.ThinkingEffort)
-	if effort == "" && !req.BuiltinSearch && !hasTestSamplingOptions(req) {
+	if effort == "" && !req.BuiltinSearch && !hasTestSamplingOptions(req) && req.ImageGeneration == nil {
 		return body, nil
 	}
 	return patchBodyObject(body, func(obj map[string]any) {
@@ -455,6 +447,19 @@ func applyOpenAITestOptions(body []byte, req *TestChannelRequest) ([]byte, error
 		}
 		if req.BuiltinSearch {
 			obj["web_search_options"] = map[string]any{}
+		}
+		if req.ImageGeneration != nil {
+			obj["modalities"] = []string{"image"}
+			imageConfig := map[string]any{}
+			if aspectRatio := strings.TrimSpace(req.ImageGeneration.AspectRatio); aspectRatio != "" {
+				imageConfig["aspect_ratio"] = aspectRatio
+			}
+			if imageSize := strings.TrimSpace(req.ImageGeneration.ImageSize); imageSize != "" {
+				imageConfig["image_size"] = imageSize
+			}
+			if len(imageConfig) > 0 {
+				obj["image_config"] = imageConfig
+			}
 		}
 	})
 }
@@ -517,28 +522,89 @@ func applyGeminiTestOptions(body []byte, req *TestChannelRequest) ([]byte, error
 
 func applyAnthropicTestOptions(body []byte, req *TestChannelRequest) ([]byte, error) {
 	effort := normalizeTestThinkingEffort(req.ThinkingEffort)
-	if effort == "" && !req.BuiltinSearch && !hasTestSamplingOptions(req) {
+	if len(req.Messages) == 0 && effort == "" && !req.BuiltinSearch &&
+		req.Temperature == nil && req.TopP == nil && strings.TrimSpace(req.SystemPrompt) == "" {
 		return body, nil
 	}
-	return patchBodyObject(body, func(obj map[string]any) {
-		setOpenAILikeSampling(obj, req, "max_tokens")
-		appendAnthropicSystemPrompt(obj, req.SystemPrompt)
-		if effort == "none" {
-			obj["thinking"] = map[string]any{"type": "disabled"}
-		} else if effort != "" {
-			obj["thinking"] = map[string]any{"type": "adaptive"}
-			obj["output_config"] = map[string]any{"effort": testAnthropicOutputEffort(effort)}
+
+	// RawMessage keeps the template's nested objects byte-for-byte while this
+	// struct fixes the top-level Anthropic field order. Decoding into map here
+	// used to scramble Claude Code's request fingerprint whenever sampling
+	// options were present.
+	type anthropicRequestBody struct {
+		Model        sonic.NoCopyRawMessage `json:"model"`
+		Messages     sonic.NoCopyRawMessage `json:"messages"`
+		System       sonic.NoCopyRawMessage `json:"system"`
+		Tools        sonic.NoCopyRawMessage `json:"tools"`
+		Metadata     sonic.NoCopyRawMessage `json:"metadata"`
+		MaxTokens    int                    `json:"max_tokens"`
+		Temperature  *float64               `json:"temperature,omitempty"`
+		TopP         *float64               `json:"top_p,omitempty"`
+		Thinking     map[string]any         `json:"thinking,omitempty"`
+		OutputConfig map[string]any         `json:"output_config,omitempty"`
+		Stream       bool                   `json:"stream"`
+	}
+
+	var obj anthropicRequestBody
+	if err := sonic.Unmarshal(body, &obj); err != nil {
+		return nil, err
+	}
+	obj.Temperature = req.Temperature
+	obj.TopP = req.TopP
+
+	if len(req.Messages) > 0 {
+		messages, err := sonic.Marshal(toAnthropicMessages(req.Messages))
+		if err != nil {
+			return nil, err
 		}
-		if req.BuiltinSearch {
-			appendTestTool(obj, map[string]any{
-				"type": "web_search_20250305",
-				"name": "web_search",
-			})
+		obj.Messages = sonic.NoCopyRawMessage(messages)
+	}
+
+	appendRawArrayItem := func(raw sonic.NoCopyRawMessage, item any) (sonic.NoCopyRawMessage, error) {
+		var items []sonic.NoCopyRawMessage
+		if err := sonic.Unmarshal(raw, &items); err != nil {
+			return nil, err
 		}
-	})
+		encoded, err := sonic.Marshal(item)
+		if err != nil {
+			return nil, err
+		}
+		items = append(items, sonic.NoCopyRawMessage(encoded))
+		encoded, err = sonic.Marshal(items)
+		return sonic.NoCopyRawMessage(encoded), err
+	}
+
+	if prompt := strings.TrimSpace(req.SystemPrompt); prompt != "" {
+		var err error
+		obj.System, err = appendRawArrayItem(obj.System, struct {
+			Type string `json:"type"`
+			Text string `json:"text"`
+		}{Type: "text", Text: prompt})
+		if err != nil {
+			return nil, err
+		}
+	}
+	if effort == "none" {
+		obj.Thinking = map[string]any{"type": "disabled"}
+	} else if effort != "" {
+		obj.Thinking = map[string]any{"type": "adaptive"}
+		obj.OutputConfig = map[string]any{"effort": testAnthropicOutputEffort(effort)}
+	}
+	if req.BuiltinSearch {
+		var err error
+		obj.Tools, err = appendRawArrayItem(obj.Tools, struct {
+			Type string `json:"type"`
+			Name string `json:"name"`
+		}{Type: "web_search_20250305", Name: "web_search"})
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	return sonic.Marshal(obj)
 }
 
-// ChannelTester 定义不同渠道类型的测试协议（OCP：新增类型无需修改调用方）
+// ChannelTester 定义不同上游协议的测试器（OCP：新增协议无需修改调用方）
 type ChannelTester interface {
 	// Build 构造完整请求：URL、基础请求头、请求体
 	// apiKey: 实际使用的API Key字符串（由调用方从数据库查询）
@@ -638,7 +704,7 @@ func buildTesterURL(baseURL, endpointSuffix string) string {
 	return strings.TrimRight(strings.TrimSpace(baseURL), "/") + endpointSuffix
 }
 
-// CodexTester 兼容 Codex 风格（渠道类型: codex）
+// CodexTester 兼容 Codex 风格协议。
 type CodexTester struct{}
 
 // Build 构建 Codex 格式的 API 请求
@@ -647,7 +713,7 @@ func (t *CodexTester) Build(cfg *model.Config, apiKey string, req *TestChannelRe
 	if strings.TrimSpace(testContent) == "" && len(req.Messages) == 0 {
 		testContent = "test"
 	}
-	sessionID := newTestSessionID()
+	sessionID := req.ResolveSessionID()
 	turnID := newTestSessionID()
 	windowID := sessionID + ":0"
 	turnMetadata, err := newCodexTurnMetadata(sessionID, turnID, windowID)
@@ -660,7 +726,7 @@ func (t *CodexTester) Build(cfg *model.Config, apiKey string, req *TestChannelRe
 		"STREAM":          req.Stream,
 		"CONTENT":         testContent,
 		"SESSION_ID":      sessionID,
-		"INSTALLATION_ID": newTestSessionID(),
+		"INSTALLATION_ID": util.NewUUIDv5(util.NameSpaceOID, "ccload:admin-test-installation:"+sessionID),
 	})
 	if err != nil {
 		return "", nil, nil, err
@@ -683,8 +749,8 @@ func (t *CodexTester) Build(cfg *model.Config, apiKey string, req *TestChannelRe
 	h.Set("Content-Type", "application/json")
 	h.Set("Authorization", "Bearer "+apiKey)
 	h.Set("X-Api-Key", apiKey)
-	h.Set("User-Agent", "codex-tui/0.137.0 (Mac OS 26.5.1; arm64) iTerm.app/3.7.0beta3 (codex-tui; 0.137.0)")
-	h.Set("Originator", "codex-tui")
+	h.Set("User-Agent", codexauth.DefaultUserAgent)
+	h.Set("Originator", codexauth.DefaultOriginator)
 	h.Set("Session-Id", sessionID)
 	h.Set("Thread-Id", sessionID)
 	h.Set("X-Client-Request-Id", sessionID)
@@ -710,7 +776,7 @@ func newCodexTurnMetadata(sessionID, turnID, windowID string) (string, error) {
 		"request_kind":            "turn",
 		"window_id":               windowID,
 	}
-	data, err := sonic.Marshal(payload)
+	data, err := sonic.ConfigStd.Marshal(payload)
 	if err != nil {
 		return "", fmt.Errorf("marshal codex turn metadata: %w", err)
 	}
@@ -758,7 +824,7 @@ func (t *CodexTester) Parse(_ int, respBody []byte) map[string]any {
 	return parseAPIResponse(respBody, extractCodexResponseText, "usage")
 }
 
-// OpenAITester 标准OpenAI API格式（渠道类型: openai）
+// OpenAITester 使用标准 OpenAI API 格式。
 type OpenAITester struct{}
 
 // Build 构建 OpenAI 格式的 API 请求
@@ -767,7 +833,7 @@ func (t *OpenAITester) Build(cfg *model.Config, apiKey string, req *TestChannelR
 	if strings.TrimSpace(testContent) == "" && len(req.Messages) == 0 {
 		testContent = "test"
 	}
-	sessionID := newTestSessionID()
+	sessionID := req.ResolveSessionID()
 
 	body, err := buildRequestFromTemplate("openai", map[string]any{
 		"MODEL":      req.Model,
@@ -918,15 +984,14 @@ func newTestSessionID() string {
 type AnthropicTester struct{}
 
 // newClaudeCLIUserID 生成 Claude CLI 用户ID
-func newClaudeCLIUserID() string {
+func newClaudeCLIUserID(sessionID string) string {
 	// Claude Code 真实格式：metadata.user_id 是一个 JSON 字符串
 	// 例如：{"device_id":"76efe6...","account_uuid":"","session_id":"ce6c5d34-..."}
-	deviceID := make([]byte, 32)
-	if _, err := rand.Read(deviceID); err != nil {
-		return `{"device_id":"0000000000000000000000000000000000000000000000000000000000000000","account_uuid":"","session_id":"00000000-0000-0000-0000-000000000000"}`
+	if strings.TrimSpace(sessionID) == "" {
+		sessionID = newTestSessionID()
 	}
-
-	return fmt.Sprintf(`{"device_id":"%s","account_uuid":"","session_id":"%s"}`, hex.EncodeToString(deviceID), newTestSessionID())
+	deviceID := sha256.Sum256([]byte("ccload:admin-test-device:" + sessionID))
+	return fmt.Sprintf(`{"device_id":"%s","account_uuid":"","session_id":"%s"}`, hex.EncodeToString(deviceID[:]), sessionID)
 }
 
 // Build 构建 Anthropic 格式的 API 请求
@@ -936,24 +1001,19 @@ func (t *AnthropicTester) Build(cfg *model.Config, apiKey string, req *TestChann
 		maxTokens = 32000
 	}
 	testContent := req.Content
+	sessionID := req.ResolveSessionID()
 
 	body, err := buildRequestFromTemplate("anthropic", map[string]any{
 		"MODEL":      req.Model,
 		"STREAM":     req.Stream,
 		"CONTENT":    testContent,
 		"MAX_TOKENS": maxTokens,
-		"USER_ID":    newClaudeCLIUserID(),
+		"USER_ID":    newClaudeCLIUserID(sessionID),
 	})
 	if err != nil {
 		return "", nil, nil, err
 	}
 
-	if len(req.Messages) > 0 {
-		body, err = patchMessagesInBody(body, "messages", toAnthropicMessages(req.Messages))
-		if err != nil {
-			return "", nil, nil, err
-		}
-	}
 	body, err = applyAnthropicTestOptions(body, req)
 	if err != nil {
 		return "", nil, nil, err
@@ -966,7 +1026,7 @@ func (t *AnthropicTester) Build(cfg *model.Config, apiKey string, req *TestChann
 	h.Set("Content-Type", "application/json")
 	h.Set("Authorization", "Bearer "+apiKey)
 	// Claude Code CLI headers
-	h.Set("User-Agent", "claude-cli/2.1.97 (external, cli)")
+	h.Set("User-Agent", "claude-cli/2.1.209 (external, cli)")
 	h.Set("x-app", "cli")
 	h.Set("anthropic-version", "2023-06-01")
 	h.Set("anthropic-beta", "claude-code-20250219,context-1m-2025-08-07,interleaved-thinking-2025-05-14,context-management-2025-06-27,prompt-caching-scope-2026-01-05,advanced-tool-use-2025-11-20,effort-2025-11-24")
@@ -980,7 +1040,7 @@ func (t *AnthropicTester) Build(cfg *model.Config, apiKey string, req *TestChann
 	h.Set("x-stainless-runtime", "node")
 	h.Set("x-stainless-runtime-version", "v24.3.0")
 	h.Set("x-stainless-timeout", "300")
-	h.Set("X-Claude-Code-Session-Id", newTestSessionID())
+	h.Set("X-Claude-Code-Session-Id", sessionID)
 	if req.Stream {
 		h.Set("x-stainless-helper-method", "stream")
 	}

@@ -20,6 +20,7 @@ func TestClientRequestMetadataDetectsClientProtocolFromPath(t *testing.T) {
 		{"Claude Messages", "/v1/messages", protocol.Anthropic},
 		{"Claude Count Tokens", "/v1/messages/count_tokens", protocol.Anthropic},
 		{"Codex Responses", "/v1/responses", protocol.Codex},
+		{"Codex Alpha Search", "/v1/alpha/search", protocol.Codex},
 		{"OpenAI Chat", "/v1/chat/completions", protocol.OpenAI},
 		{"OpenAI Completions", "/v1/completions", protocol.OpenAI},
 		{"OpenAI Embeddings", "/v1/embeddings", protocol.OpenAI},
@@ -98,6 +99,29 @@ func TestClientRequestMetadataUsesCapturedIngressValues(t *testing.T) {
 
 	if w.Code != http.StatusNoContent {
 		t.Fatalf("status = %d, want %d: %s", w.Code, http.StatusNoContent, w.Body.String())
+	}
+}
+
+func TestDashboardProxyMetadataRestoresCanonicalProxyPath(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	r.Use(captureDashboardProxyMetadata())
+	r.POST("/dashboard/v1/*path", func(c *gin.Context) {
+		clientProtocol, clientPath := clientRequestMetadata(c)
+		if clientProtocol != protocol.Anthropic {
+			t.Fatalf("clientProtocol = %s, want %s", clientProtocol, protocol.Anthropic)
+		}
+		if clientPath != "/v1/messages" || c.Request.URL.Path != "/v1/messages" {
+			t.Fatalf("paths = (%q,%q), want canonical /v1/messages", clientPath, c.Request.URL.Path)
+		}
+		c.Status(http.StatusNoContent)
+	})
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/dashboard/v1/messages", nil)
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, want %d", w.Code, http.StatusNoContent)
 	}
 }
 

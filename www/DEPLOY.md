@@ -1,13 +1,13 @@
 # ccLoad 介绍网站部署指南
 
-这是 ccLoad 项目的独立介绍网站，可以部署到任何静态 Web 服务器。
+这是 ccLoad 项目的独立介绍网站。执行 `make www-setup` 复制共享资源后，可以部署到任何静态 Web 服务器。
 
 ## 📁 目录说明
 
-`www/` 目录是一个**完全独立**的静态网站，包含：
+执行 `make www-setup` 后，`www/` 目录是一个**完全独立**的静态网站，包含：
 
 - ✅ HTML/CSS/JS（无框架依赖）
-- ✅ 中英双语支持
+- ✅ 首页、导航、页面标题和摘要支持中英文切换（详细文档正文目前为英文）
 - ✅ 主题切换（light/dark/system）
 - ✅ 响应式设计
 - ✅ 可直接复制到任何 Web 服务器
@@ -148,6 +148,7 @@ cp ../web/assets/css/styles.css assets/css/
 cp ../web/assets/js/i18n.js assets/js/
 cp ../web/assets/js/theme-init.js assets/js/
 cp ../web/favicon.* ../web/apple-touch-icon.png .
+cp ../web/brand-mark.svg ../web/brand-wordmark.svg .
 mkdir -p assets/images
 cp ../images/ccload.jpg ../images/ccload-dashboard.jpeg ../images/ccload-logs.jpg assets/images/
 
@@ -165,6 +166,8 @@ www/
 ├── feedback.html           # 反馈渠道
 ├── favicon.svg/ico         # 图标
 ├── apple-touch-icon.png
+├── brand-mark.svg          # 共享品牌图标
+├── brand-wordmark.svg      # 共享品牌字标
 ├── assets/
 │   ├── css/
 │   │   ├── styles.css      # 共享设计系统（复制自 web）
@@ -236,7 +239,7 @@ sudo certbot --apache -d your-domain.com
 
 ### 图标未显示
 
-确认 `favicon.svg` 和 `favicon.ico` 已复制到 www 根目录。
+确认 `favicon.svg`、`favicon.ico`、`brand-mark.svg` 和 `brand-wordmark.svg` 已复制到 www 根目录。
 
 ### 相对路径问题
 

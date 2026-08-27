@@ -2,12 +2,14 @@ package app
 
 import (
 	"context"
+	"log"
 	"net/http"
 	"strconv"
 	"sync"
 	"time"
 
 	"ccLoad/internal/model"
+	"ccLoad/internal/protocol"
 	"ccLoad/internal/util"
 	"ccLoad/internal/version"
 
@@ -30,19 +32,58 @@ func (s *Server) HandleErrors(c *gin.Context) {
 		return
 	}
 
-	// 从内存缓存按 log ID 回填 attempt_index 与 is_final（非持久化字段，logs 表无此列）
-	for _, e := range logs {
-		if idx, isFinal, ok := s.logService.LookupAttemptIndex(e.ID); ok {
-			e.AttemptIndex = idx
-			e.IsFinal = isFinal
+	if isAPITokenWebRequest(c) {
+		channels, err := s.tokenLogChannels(c.Request.Context(), logs)
+		if err != nil {
+			log.Printf("[ERROR] 加载 API Token 日志脱敏元数据失败: %v", err)
+			RespondErrorMsg(c, http.StatusInternalServerError, "读取日志脱敏元数据失败")
+			return
+		}
+		RespondJSONWithCount(c, http.StatusOK, projectTokenLogs(logs, channels), total)
+		return
+	}
+	RespondJSONWithCount(c, http.StatusOK, projectDashboardLogs(logs), total)
+}
+
+func (s *Server) tokenLogChannels(ctx context.Context, logs []*model.LogEntry) (map[int64]tokenLogChannelMetadata, error) {
+	needed := make(map[int64]struct{})
+	for _, entry := range logs {
+		if entry != nil && entry.ChannelID > 0 {
+			needed[entry.ChannelID] = struct{}{}
 		}
 	}
-
-	RespondJSONWithCount(c, http.StatusOK, logs, total)
+	channels := make(map[int64]tokenLogChannelMetadata, len(needed))
+	if len(needed) == 0 {
+		return channels, nil
+	}
+	configs, err := s.store.ListConfigs(ctx)
+	if err != nil {
+		return nil, err
+	}
+	apiKeysByChannel, err := s.store.GetAllAPIKeys(ctx)
+	if err != nil {
+		return nil, err
+	}
+	for _, cfg := range configs {
+		if _, ok := needed[cfg.ID]; !ok {
+			continue
+		}
+		metadata := tokenLogChannelMetadata{
+			APIKeyHashes: make(map[string]struct{}, len(apiKeysByChannel[cfg.ID])),
+		}
+		for _, apiKey := range apiKeysByChannel[cfg.ID] {
+			if apiKey != nil && apiKey.APIKey != "" {
+				metadata.APIKeys = append(metadata.APIKeys, apiKey.APIKey)
+				metadata.APIKeyHashes[util.HashAPIKey(apiKey.APIKey)] = struct{}{}
+			}
+		}
+		channels[cfg.ID] = metadata
+	}
+	return channels, nil
 }
 
 // HandleMetrics 获取聚合指标数据
-// GET /admin/metrics?range=today&bucket_min=5&channel_type=anthropic&model=claude-3-5-sonnet-20241022&channel_id=1&channel_name_like=xxx
+// GET /admin/metrics?range=today&bucket_min=5&upstream_protocol=anthropic&model=claude-3-5-sonnet-20241022&channel_id=1&channel_name_like=xxx
 func (s *Server) HandleMetrics(c *gin.Context) {
 	params := ParsePaginationParams(c)
 	bucketMin, _ := strconv.Atoi(c.DefaultQuery("bucket_min", "5"))
@@ -50,7 +91,7 @@ func (s *Server) HandleMetrics(c *gin.Context) {
 		bucketMin = 5
 	}
 
-	// 使用统一的筛选参数构建器（支持 channel_type、channel_id、channel_name_like、model、auth_token_id）
+	// 使用统一的筛选参数构建器。
 	lf := BuildLogFilter(c)
 	lf.LogSource = model.LogSourceProxy
 
@@ -61,7 +102,6 @@ func (s *Server) HandleMetrics(c *gin.Context) {
 		RespondError(c, http.StatusInternalServerError, err)
 		return
 	}
-
 	RespondJSON(c, http.StatusOK, pts)
 }
 
@@ -82,6 +122,9 @@ func (s *Server) HandleStats(c *gin.Context) {
 		RespondError(c, http.StatusInternalServerError, err)
 		return
 	}
+	if isAPITokenWebRequest(c) {
+		stats = projectTokenStats(stats)
+	}
 
 	// 计算时间跨度（秒），用于前端计算RPM和QPS
 	durationSeconds := endTime.Sub(startTime).Seconds()
@@ -96,7 +139,6 @@ func (s *Server) HandleStats(c *gin.Context) {
 		return
 	}
 
-	// 计算健康时间线（固定48个时间点，当日显示最近4小时）
 	channelHealth := s.fillHealthTimeline(c.Request.Context(), stats, startTime, endTime, &lf, isToday)
 
 	RespondJSON(c, http.StatusOK, gin.H{
@@ -108,12 +150,21 @@ func (s *Server) HandleStats(c *gin.Context) {
 	})
 }
 
+func projectTokenStats(stats []model.StatsEntry) []model.StatsEntry {
+	projected := make([]model.StatsEntry, len(stats))
+	copy(projected, stats)
+	for i := range projected {
+		projected[i].LastRequestMessage = ""
+	}
+	return projected
+}
+
 // HandlePublicSummary 获取基础统计摘要(公开端点,无需认证)
 // GET /public/summary?range=today
-// 按渠道类型分组统计，Claude和Codex类型包含Token和成本信息
+// 按客户端入口协议分组统计。
 //
 // [SECURITY NOTE] 该端点故意设计为公开访问，用于首页仪表盘展示。
-// 如需隐藏运营数据，可在 server.go:SetupRoutes 中添加 RequireTokenAuth 中间件。
+// 认证仪表盘使用 /dashboard/summary，并由 Web 身份强制作用域。
 func (s *Server) HandlePublicSummary(c *gin.Context) {
 	params := ParsePaginationParams(c)
 	startTime, endTime := params.GetTimeRange()
@@ -121,41 +172,36 @@ func (s *Server) HandlePublicSummary(c *gin.Context) {
 	// 判断是否为本日（本日才计算最近一分钟）
 	isToday := params.Range == "today" || params.Range == ""
 	ctx := c.Request.Context()
+	logFilter := &model.LogFilter{LogSource: model.LogSourceProxy}
+	if _, ok := WebIdentityFromContext(c); ok {
+		filter := BuildLogFilter(c)
+		filter.LogSource = model.LogSourceProxy
+		logFilter = &filter
+	}
 
-	// [OPT] P1: 并行执行三个独立查询
+	// 协议摘要与 RPM 相互独立，并行查询。
 	var (
-		stats        []model.StatsEntry
-		rpmStats     *model.RPMStats
-		channelTypes map[int64]string
-		statsErr     error
-		rpmErr       error
-		typesErr     error
-		wg           sync.WaitGroup
+		stats    []model.ClientProtocolStats
+		rpmStats *model.RPMStats
+		statsErr error
+		rpmErr   error
+		wg       sync.WaitGroup
 	)
 
-	wg.Add(3)
+	wg.Add(2)
 
-	// 查询1: 基础统计（使用 Lite 版本跳过 fillStatsRPM）
 	go func() {
 		defer wg.Done()
-		stats, statsErr = s.statsCache.GetStatsLite(ctx, startTime, endTime, nil)
+		stats, statsErr = s.statsCache.GetClientProtocolStats(ctx, startTime, endTime, logFilter)
 	}()
 
-	// 查询2: RPM统计
 	go func() {
 		defer wg.Done()
-		rpmStats, rpmErr = s.statsCache.GetRPMStats(ctx, startTime, endTime, nil, isToday)
-	}()
-
-	// 查询3: 渠道类型映射（带缓存）
-	go func() {
-		defer wg.Done()
-		channelTypes, typesErr = s.getChannelTypesMapCached(ctx)
+		rpmStats, rpmErr = s.statsCache.GetRPMStats(ctx, startTime, endTime, logFilter, isToday)
 	}()
 
 	wg.Wait()
 
-	// 错误处理
 	if statsErr != nil {
 		RespondError(c, http.StatusInternalServerError, statsErr)
 		return
@@ -164,213 +210,99 @@ func (s *Server) HandlePublicSummary(c *gin.Context) {
 		RespondError(c, http.StatusInternalServerError, rpmErr)
 		return
 	}
-	if typesErr != nil {
-		RespondError(c, http.StatusInternalServerError, typesErr)
-		return
-	}
-
 	// 计算时间跨度（秒），用于前端计算RPM和QPS
 	durationSeconds := endTime.Sub(startTime).Seconds()
 	if durationSeconds < 1 {
 		durationSeconds = 1 // 防止除零
 	}
 
-	// 按渠道类型分组统计
-	typeStats := make(map[string]*TypeSummary)
+	byClientProtocol := make(map[string]model.ClientProtocolStats)
 	totalSuccess := 0
 	totalError := 0
 
 	for _, stat := range stats {
-		// 获取渠道类型，跳过无法确定类型的记录（已删除的渠道）
-		var channelType string
-		if stat.ChannelID != nil {
-			if ct, ok := channelTypes[int64(*stat.ChannelID)]; ok {
-				channelType = ct
-			}
-		}
-		if channelType == "" {
-			// 渠道已删除或类型未知，不计入按类型统计（与 /admin/stats 保持一致）
-			continue
-		}
+		totalSuccess += stat.SuccessRequests
+		totalError += stat.ErrorRequests
 
-		totalSuccess += stat.Success
-		totalError += stat.Error
-
-		// 初始化类型统计
-		if _, exists := typeStats[channelType]; !exists {
-			typeStats[channelType] = &TypeSummary{
-				ChannelType:     channelType,
-				TotalRequests:   0,
-				SuccessRequests: 0,
-				ErrorRequests:   0,
-			}
-		}
-
-		ts := typeStats[channelType]
-		ts.TotalRequests += stat.Success + stat.Error
-		ts.SuccessRequests += stat.Success
-		ts.ErrorRequests += stat.Error
-
-		// 所有渠道类型都统计Token和成本
-		if stat.TotalInputTokens != nil {
-			ts.TotalInputTokens += *stat.TotalInputTokens
-		}
-		if stat.TotalOutputTokens != nil {
-			ts.TotalOutputTokens += *stat.TotalOutputTokens
-		}
-		if stat.TotalCost != nil {
-			ts.TotalCost += *stat.TotalCost
-		}
-		if stat.EffectiveCost != nil {
-			if ts.EffectiveCost == nil {
-				ts.EffectiveCost = new(float64)
-			}
-			*ts.EffectiveCost += *stat.EffectiveCost
-		} else if stat.TotalCost != nil {
-			if ts.EffectiveCost == nil {
-				ts.EffectiveCost = new(float64)
-			}
-			*ts.EffectiveCost += *stat.TotalCost
-		}
-
-		// Claude和Codex类型额外统计缓存（其他类型不支持prompt caching）
-		if channelType == "anthropic" || channelType == "codex" {
-			if stat.TotalCacheReadInputTokens != nil {
-				ts.TotalCacheReadTokens += *stat.TotalCacheReadInputTokens
-			}
-			if stat.TotalCacheCreationInputTokens != nil {
-				ts.TotalCacheCreationTokens += *stat.TotalCacheCreationInputTokens
-			}
+		if protocol.IsValid(protocol.Protocol(stat.ClientProtocol)) {
+			byClientProtocol[stat.ClientProtocol] = stat
 		}
 	}
 
 	response := gin.H{
-		"total_requests":   totalSuccess + totalError,
-		"success_requests": totalSuccess,
-		"error_requests":   totalError,
-		"range":            params.Range,
-		"duration_seconds": durationSeconds,
-		"rpm_stats":        rpmStats,
-		"is_today":         isToday,
-		"by_type":          typeStats, // 按渠道类型分组的统计
+		"total_requests":     totalSuccess + totalError,
+		"success_requests":   totalSuccess,
+		"error_requests":     totalError,
+		"range":              params.Range,
+		"duration_seconds":   durationSeconds,
+		"rpm_stats":          rpmStats,
+		"is_today":           isToday,
+		"by_client_protocol": byClientProtocol,
 	}
 
 	RespondJSON(c, http.StatusOK, response)
 }
 
-// TypeSummary 按渠道类型的统计摘要
-type TypeSummary struct {
-	ChannelType              string   `json:"channel_type"`
-	TotalRequests            int      `json:"total_requests"`
-	SuccessRequests          int      `json:"success_requests"`
-	ErrorRequests            int      `json:"error_requests"`
-	TotalInputTokens         int64    `json:"total_input_tokens,omitempty"`          // 所有类型
-	TotalOutputTokens        int64    `json:"total_output_tokens,omitempty"`         // 所有类型
-	TotalCacheReadTokens     int64    `json:"total_cache_read_tokens,omitempty"`     // Claude/Codex专用（prompt caching）
-	TotalCacheCreationTokens int64    `json:"total_cache_creation_tokens,omitempty"` // Claude/Codex专用（prompt caching）
-	TotalCost                float64  `json:"total_cost,omitempty"`                  // 标准成本
-	EffectiveCost            *float64 `json:"effective_cost,omitempty"`              // 倍率后成本
-}
-
-// fetchChannelTypesMap 查询所有渠道的类型映射
-func (s *Server) fetchChannelTypesMap(ctx context.Context) (map[int64]string, error) {
-	configs, err := s.store.ListConfigs(ctx)
-	if err != nil {
-		return nil, err
-	}
-
-	channelTypes := make(map[int64]string, len(configs))
-	for _, cfg := range configs {
-		channelTypes[cfg.ID] = cfg.ChannelType
-	}
-	return channelTypes, nil
-}
-
-// getChannelTypesMapCached 带 TTL 缓存的渠道类型映射查询
-// [OPT] P3: 渠道类型变化频率极低，使用 60 秒缓存减少数据库查询
-const channelTypesCacheTTL = 60 * time.Second
-
-func (s *Server) getChannelTypesMapCached(ctx context.Context) (map[int64]string, error) {
-	// 读锁检查缓存
-	s.channelTypesCacheMu.RLock()
-	if s.channelTypesCache != nil && time.Since(s.channelTypesCacheTime) < channelTypesCacheTTL {
-		result := s.channelTypesCache
-		s.channelTypesCacheMu.RUnlock()
-		return result, nil
-	}
-	s.channelTypesCacheMu.RUnlock()
-
-	// 写锁更新缓存
-	s.channelTypesCacheMu.Lock()
-	defer s.channelTypesCacheMu.Unlock()
-
-	// 双重检查：可能其他 goroutine 已更新
-	if s.channelTypesCache != nil && time.Since(s.channelTypesCacheTime) < channelTypesCacheTTL {
-		return s.channelTypesCache, nil
-	}
-
-	channelTypes, err := s.fetchChannelTypesMap(ctx)
-	if err != nil {
-		return nil, err
-	}
-
-	s.channelTypesCache = channelTypes
-	s.channelTypesCacheTime = time.Now()
-	return channelTypes, nil
-}
-
-// HandleGetChannelTypes 获取渠道类型配置(公开端点,前端动态加载)
-// GET /public/channel-types
+// HandleGetProtocols 获取支持的协议列表(公开端点,前端动态加载)
+// GET /public/protocols
 // 编译时常量，浏览器缓存24小时减少HF Spaces等高延迟环境的网络往返
-func (s *Server) HandleGetChannelTypes(c *gin.Context) {
+func (s *Server) HandleGetProtocols(c *gin.Context) {
 	c.Header("Cache-Control", "public, max-age=86400")
-	RespondJSON(c, http.StatusOK, util.ChannelTypes)
+	RespondJSON(c, http.StatusOK, protocol.AllProtocols())
 }
 
 // HandlePublicVersion 获取当前版本信息(公开端点,前端显示版本)
 // GET /public/version
-// 版本信息变化频率极低（后台每4小时检查一次），缓存5分钟
+// 版本信息变化频率极低，缓存5分钟。
 func (s *Server) HandlePublicVersion(c *gin.Context) {
 	c.Header("Cache-Control", "public, max-age=300")
-	hasUpdate, latestVersion, releaseURL := version.GetUpdateInfo()
+	state := version.UpdateState{}
+	if s.updateManager != nil {
+		state = s.updateManager.State()
+	}
 	RespondJSON(c, http.StatusOK, gin.H{
 		"version":        version.Version,
-		"has_update":     hasUpdate,
-		"latest_version": latestVersion,
-		"release_url":    releaseURL,
+		"has_update":     state.HasUpdate,
+		"latest_version": state.LatestVersion,
+		"release_url":    state.ReleaseURL,
 	})
 }
 
-// ModelsChannelsResponse 模型和渠道列表响应
+// ModelsChannelsResponse 日志筛选所需的模型、渠道和状态码列表响应。
 type ModelsChannelsResponse struct {
-	Models   []string              `json:"models"`
-	Channels []model.ChannelNameID `json:"channels"`
+	Models      []string              `json:"models"`
+	Channels    []model.ChannelNameID `json:"channels"`
+	StatusCodes []int                 `json:"status_codes"`
 }
 
-// HandleGetModels 获取数据库中有日志的模型和渠道列表（去重）
+// HandleGetModels 获取数据库中有日志的模型、渠道和状态码列表（去重）。
 // GET /admin/models
-// 支持参数：range（时间范围）、channel_type（渠道类型筛选）
+// 支持参数：range（时间范围）、upstream_protocol（实际上游协议筛选）
 func (s *Server) HandleGetModels(c *gin.Context) {
 	rangeParam := c.DefaultQuery("range", "this_month")
 	params := ParsePaginationParams(c)
 	params.Range = rangeParam
 	since, until := params.GetTimeRange()
 
-	channelType := c.Query("channel_type")
-	logFilter := &model.LogFilter{LogSource: model.LogSourceProxy}
+	logFilter := BuildLogFilter(c)
+	logFilter.LogSource = model.LogSourceProxy
 
 	var (
-		models                 []string
-		channels               []model.ChannelNameID
-		wg                     sync.WaitGroup
-		modelsErr, channelsErr error
+		models                              []string
+		channels                            []model.ChannelNameID
+		statusCodes                         []int
+		wg                                  sync.WaitGroup
+		modelsErr, channelsErr, statusesErr error
 	)
 
 	wg.Go(func() {
-		models, modelsErr = s.store.GetDistinctModels(c.Request.Context(), since, until, channelType, logFilter)
+		models, modelsErr = s.store.GetDistinctModels(c.Request.Context(), since, until, &logFilter)
 	})
 	wg.Go(func() {
-		channels, channelsErr = s.store.GetDistinctChannels(c.Request.Context(), since, until, channelType, logFilter)
+		channels, channelsErr = s.store.GetDistinctChannels(c.Request.Context(), since, until, &logFilter)
+	})
+	wg.Go(func() {
+		statusCodes, statusesErr = s.store.GetDistinctStatusCodes(c.Request.Context(), since, until, &logFilter)
 	})
 	wg.Wait()
 
@@ -382,8 +314,21 @@ func (s *Server) HandleGetModels(c *gin.Context) {
 		RespondError(c, http.StatusInternalServerError, channelsErr)
 		return
 	}
+	if statusesErr != nil {
+		RespondError(c, http.StatusInternalServerError, statusesErr)
+		return
+	}
+	if models == nil {
+		models = make([]string, 0)
+	}
+	if channels == nil {
+		channels = make([]model.ChannelNameID, 0)
+	}
+	if statusCodes == nil {
+		statusCodes = make([]int, 0)
+	}
 
-	RespondJSON(c, http.StatusOK, ModelsChannelsResponse{Models: models, Channels: channels})
+	RespondJSON(c, http.StatusOK, ModelsChannelsResponse{Models: models, Channels: channels, StatusCodes: statusCodes})
 }
 
 // HandleHealth 健康检查端点(公开访问,无需认证)
@@ -581,7 +526,7 @@ func (s *Server) fillHealthTimeline(ctx context.Context, stats []model.StatsEntr
 
 // HandleStatsFilterOptions 返回统计页筛选下拉的全集（渠道名/模型），
 // 从指定时间范围内的日志记录中提取，与表格数据解耦。
-// GET /admin/stats/filter-options?range=today&channel_type=
+// GET /admin/stats/filter-options?range=today&upstream_protocol=
 func (s *Server) HandleStatsFilterOptions(c *gin.Context) {
 	params := ParsePaginationParams(c)
 	startTime, endTime := params.GetTimeRange()
@@ -589,18 +534,13 @@ func (s *Server) HandleStatsFilterOptions(c *gin.Context) {
 	lf := BuildLogFilter(c)
 	lf.LogSource = model.LogSourceProxy
 
-	channelType := c.Query("channel_type")
-	if channelType == "all" {
-		channelType = ""
-	}
-
-	channels, err := s.store.GetDistinctChannels(c.Request.Context(), startTime, endTime, channelType, &lf)
+	channels, err := s.store.GetDistinctChannels(c.Request.Context(), startTime, endTime, &lf)
 	if err != nil {
 		RespondError(c, http.StatusInternalServerError, err)
 		return
 	}
 
-	models, err := s.store.GetDistinctModels(c.Request.Context(), startTime, endTime, channelType, &lf)
+	models, err := s.store.GetDistinctModels(c.Request.Context(), startTime, endTime, &lf)
 	if err != nil {
 		RespondError(c, http.StatusInternalServerError, err)
 		return

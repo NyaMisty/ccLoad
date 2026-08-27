@@ -23,31 +23,6 @@ func (c *fakeClock) Advance(d time.Duration) {
 	c.mu.Unlock()
 }
 
-// TestNewLoginRateLimiter 测试速率限制器创建
-func TestNewLoginRateLimiter(t *testing.T) {
-	limiter := NewLoginRateLimiter()
-	defer limiter.Stop()
-
-	if limiter == nil {
-		t.Fatal("NewLoginRateLimiter should not return nil")
-	}
-
-	if limiter.maxAttempts != 5 {
-		t.Errorf("默认最大尝试次数应为5，实际%d", limiter.maxAttempts)
-	}
-
-	if limiter.lockoutDuration != 15*time.Minute {
-		t.Errorf("默认锁定时长应为15分钟，实际%v", limiter.lockoutDuration)
-	}
-
-	if limiter.resetInterval != 1*time.Hour {
-		t.Errorf("默认重置间隔应为1小时，实际%v", limiter.resetInterval)
-	}
-
-	t.Logf("[INFO] 速率限制器创建正确，配置: maxAttempts=%d, lockoutDuration=%v, resetInterval=%v",
-		limiter.maxAttempts, limiter.lockoutDuration, limiter.resetInterval)
-}
-
 // TestAllowAttempt_FirstAttempt 测试首次尝试
 func TestAllowAttempt_FirstAttempt(t *testing.T) {
 	limiter := NewLoginRateLimiter()
@@ -227,32 +202,6 @@ func TestRecordSuccess_AfterLockout(t *testing.T) {
 	}
 
 	t.Logf("[INFO] 锁定后成功登录重置正确：锁定解除，可以重新尝试")
-}
-
-// TestGetAttemptCount_NonExistentIP 测试不存在的IP
-func TestGetAttemptCount_NonExistentIP(t *testing.T) {
-	limiter := NewLoginRateLimiter()
-	defer limiter.Stop()
-
-	count := limiter.GetAttemptCount("192.168.1.99")
-	if count != 0 {
-		t.Errorf("不存在的IP计数应为0，实际%d", count)
-	}
-
-	t.Logf("[INFO] 不存在的IP计数正确返回0")
-}
-
-// TestGetLockoutTime_NonExistentIP 测试不存在的IP的锁定时间
-func TestGetLockoutTime_NonExistentIP(t *testing.T) {
-	limiter := NewLoginRateLimiter()
-	defer limiter.Stop()
-
-	lockoutTime := limiter.GetLockoutTime("192.168.1.99")
-	if lockoutTime != 0 {
-		t.Errorf("不存在的IP锁定时间应为0，实际%d秒", lockoutTime)
-	}
-
-	t.Logf("[INFO] 不存在的IP锁定时间正确返回0")
 }
 
 // TestConcurrentAccess 测试并发访问

@@ -1,11 +1,11 @@
 const TEST_MODE_CHANNEL = 'channel';
 const TEST_MODE_MODEL = 'model';
 const TEST_MODE_CHAT = 'chat';
+const TEST_MODE_IMAGE = 'image';
 
 // localStorage keys
 const STORAGE_KEY_TEST_MODE = 'ccload_model_test_mode';
 const STORAGE_KEY_SELECTED_CHANNEL_ID = 'ccload_model_test_channel_id';
-const STORAGE_KEY_SELECTED_MODEL_TYPE = 'ccload_model_test_model_type';
 const STORAGE_KEY_SELECTED_MODEL_NAME = 'ccload_model_test_model_name';
 const STORAGE_KEY_SELECTED_PROTOCOL = 'ccload_model_test_protocol';
 const STORAGE_KEY_STREAM_ENABLED = 'ccload_model_test_stream_enabled';
@@ -18,7 +18,10 @@ const STORAGE_KEY_CHAT_MESSAGES = 'ccload_model_test_chat_messages';
 
 let channelsList = [];
 let selectedChannel = null;
-let selectedModelType = '';
+let channelKeys = [];
+const channelKeysById = new Map();
+let selectedKeyIndex = null;
+let channelKeyLoadRequestId = 0;
 let selectedModelName = '';
 let selectedProtocol = '';
 let selectedModelModeProtocol = '';
@@ -30,11 +33,18 @@ let isTestingModels = false;
 // Chat 模式状态
 let chatMessages = [];
 let chatMessageSummaries = [];
+const chatSessionState = window.ModelTestChatSession.createSessionState(() => crypto.randomUUID());
 let chatChannel = null;
+let chatChannelSelection = null;
+let chatChannelKeys = [];
+let chatSelectedKeyIndex = null;
+let chatChannelKeyLoadRequestId = 0;
+let chatChannelKeyCombobox = null;
 let chatModel = '';
 let isChatSending = false;
 let chatChannelCombobox = null;
 let chatModelCombobox = null;
+let chatProtocolCombobox = null;
 let chatThinkingCombobox = null;
 let chatThinkingEffort = '';
 let chatPendingImages = [];
@@ -47,17 +57,17 @@ let chatAdvancedOptions = {
 };
 
 let channelSelectCombobox = null;
+let channelKeyCombobox = null;
 let modelSelectCombobox = null;
+let clientProtocolCombobox = null;
 
 const headRow = document.getElementById('model-test-head-row');
 const tbody = document.getElementById('model-test-tbody');
 const toolbar = document.querySelector('.model-test-toolbar');
 const channelSelectorLabel = document.getElementById('channelSelectorLabel');
-const modelTypeLabel = document.getElementById('modelTypeLabel');
-const modelTypeSelect = document.getElementById('testModelType');
+const keySelectorLabel = document.getElementById('keySelectorLabel');
 const modelSelectorLabel = document.getElementById('modelSelectorLabel');
-const protocolTransformContainer = document.getElementById('protocolTransformContainer');
-const protocolTransformOptions = document.getElementById('protocolTransformOptions');
+const clientProtocolSelect = document.getElementById('clientProtocolSelect');
 const modelSelect = document.getElementById('testModelSelect');
 const mobileNameFilterInput = document.getElementById('modelTestMobileNameFilter');
 const chatToolbar = document.getElementById('chatToolbar');
@@ -512,10 +522,10 @@ function normalizeProtocol(value) {
 
 function protocolLabel(protocol) {
   const labels = {
-    anthropic: 'channels.protocolTransformAnthropic',
-    codex: 'channels.protocolTransformCodex',
-    openai: 'channels.protocolTransformOpenAI',
-    gemini: 'channels.protocolTransformGemini'
+    anthropic: 'modelTest.clientProtocolAnthropic',
+    codex: 'modelTest.clientProtocolCodex',
+    openai: 'modelTest.clientProtocolOpenAI',
+    gemini: 'modelTest.clientProtocolGemini'
   };
   const key = labels[protocol] || protocol;
   return i18nText(key, protocol);
@@ -563,7 +573,7 @@ function chatStatPart(labelKey, fallback, valueHtml) {
 }
 
 const MODEL_TEST_PRIORITY_MIN = -99999;
-const MODEL_TEST_PRIORITY_MAX = 99999;
+const MODEL_TEST_PRIORITY_MAX = 9999999;
 let modelTestPrioritySaveTimers = new Map();
 
 function normalizeModelTestPriorityValue(value, fallback) {
@@ -639,43 +649,89 @@ function flushModelTestPrioritySave(input) {
   return saveModelTestInlinePriority(input);
 }
 
-function updateLocalModelTestChannelEnabled(channelId, enabled) {
-  if (!Array.isArray(channelsList)) return;
-  channelsList.forEach((ch) => {
-    if (Number(ch.id) === channelId) ch.enabled = enabled;
-  });
+function findChannelModelEntry(channel, modelName) {
+  const target = String(modelName || '').trim().toLowerCase();
+  if (!channel || !target || !Array.isArray(channel.models)) return null;
+  return channel.models.find(entry => String(getModelName(entry) || '').trim().toLowerCase() === target) || null;
 }
 
-function applyModelTestRowEnabledStyle(row, enabled) {
+function isChannelModelEnabled(channel, modelName) {
+  const entry = findChannelModelEntry(channel, modelName);
+  return !entry || entry.disabled !== true;
+}
+
+function updateLocalModelTestModelDisabled(channelId, modelName, disabled) {
+  const channel = Array.isArray(channelsList)
+    ? channelsList.find(ch => Number(ch.id) === channelId)
+    : null;
+  const entry = findChannelModelEntry(channel, modelName);
+  if (!entry) return null;
+  const previous = entry.disabled === true;
+  entry.disabled = disabled === true;
+  return () => {
+    entry.disabled = previous;
+  };
+}
+
+function isModelTestChannelEnabled(channel) {
+  return channel?.enabled !== false;
+}
+
+function formatModelTestRowDisplayName(baseName, channelEnabled, modelEnabled) {
+  const tags = [];
+  if (!channelEnabled) tags.push(i18nText('channels.statusDisabled', '已禁用'));
+  if (!modelEnabled) tags.push(i18nText('channels.modelStatusDisabled', '已停用'));
+  if (tags.length === 0) return baseName;
+  return `${baseName} [${tags.join('] [')}]`;
+}
+
+function applyModelTestRowMuted(row, muted) {
   if (!row) return;
+  row.classList.toggle('model-test-row--muted', Boolean(muted));
+}
+
+function applyModelTestRowEnabledStyle(row, modelEnabled) {
+  if (!row) return;
+  const channelEnabled = row.dataset.channelEnabled !== 'false';
   const btn = row.querySelector('.channel-enable-switch');
   if (btn) {
-    btn.dataset.enabled = String(enabled);
-    btn.setAttribute('aria-checked', String(enabled));
-    btn.classList.toggle('channel-enable-switch--on', enabled);
-    btn.classList.toggle('channel-enable-switch--off', !enabled);
-    btn.title = enabled ? i18nText('channels.toggleDisable', '禁用') : i18nText('channels.toggleEnable', '启用');
+    btn.dataset.enabled = String(modelEnabled);
+    btn.setAttribute('aria-checked', String(modelEnabled));
+    btn.classList.toggle('channel-enable-switch--on', modelEnabled);
+    btn.classList.toggle('channel-enable-switch--off', !modelEnabled);
+    btn.title = modelEnabled ? i18nText('modelTest.toggleDisable', '禁用模型') : i18nText('modelTest.toggleEnable', '启用模型');
     btn.setAttribute('aria-label', btn.title);
   }
-  row.style.background = enabled ? '' : 'rgba(148, 163, 184, 0.14)';
-  row.style.color = enabled ? '' : 'var(--color-text-secondary)';
+  const link = row.querySelector('.channel-link');
+  const baseName = row.dataset.channelBaseName || '';
+  if (link && baseName) {
+    const displayName = formatModelTestRowDisplayName(baseName, channelEnabled, modelEnabled);
+    link.textContent = displayName;
+    link.title = displayName;
+  }
+  applyModelTestRowMuted(row, !channelEnabled || !modelEnabled);
 }
 
-async function toggleModelTestChannelEnabled(row, channelId, newEnabled) {
-  updateLocalModelTestChannelEnabled(channelId, newEnabled);
+async function toggleModelTestModelEnabled(row, channelId, modelName, newEnabled) {
+  const rollback = updateLocalModelTestModelDisabled(channelId, modelName, !newEnabled);
+  if (!rollback) {
+    showError(i18nText('modelTest.modelNotInChannel', '该渠道没有独立的该模型条目'));
+    return;
+  }
   applyModelTestRowEnabledStyle(row, newEnabled);
 
   try {
     const resp = await fetchAPIWithAuth(`/admin/channels/${channelId}`, {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ enabled: newEnabled })
+      body: JSON.stringify({ model: modelName, disabled: !newEnabled })
     });
     if (!resp.success) throw new Error(resp.error || 'failed');
   } catch (e) {
-    console.error('Toggle channel enabled failed:', e);
-    updateLocalModelTestChannelEnabled(channelId, !newEnabled);
+    console.error('Toggle model enabled failed:', e);
+    rollback();
     applyModelTestRowEnabledStyle(row, !newEnabled);
+    showError(i18nText('modelTest.toggleModelFailed', '切换模型启用状态失败'));
   }
 }
 
@@ -1266,73 +1322,13 @@ function getModelName(entry) {
   return (typeof entry === 'string') ? entry : entry?.model;
 }
 
-function getChannelType(channel) {
-  return normalizeProtocol(channel?.channel_type) || 'anthropic';
-}
-
-function channelMatchesModelType(channel, modelType = selectedModelType) {
-  const normalizedModelType = normalizeProtocol(modelType);
-  if (!normalizedModelType) return true;
-  return getChannelType(channel) === normalizedModelType;
-}
-
-function getAvailableChannelTypes() {
-  return Array.from(new Set(channelsList.map(ch => getChannelType(ch)))).sort((a, b) => a.localeCompare(b));
-}
-
-function ensureSelectedModelType() {
-  const channelTypes = getAvailableChannelTypes();
-  if (!channelTypes.length) {
-    selectedModelType = '';
-    return;
-  }
-
-  if (!selectedModelType || !channelTypes.includes(selectedModelType)) {
-    selectedModelType = channelTypes[0];
-  }
-}
-
-function populateModelTypeSelect() {
-  if (!modelTypeSelect) return;
-
-  ensureSelectedModelType();
-  const channelTypes = getAvailableChannelTypes();
-  modelTypeSelect.innerHTML = channelTypes.map((channelType) => `
-    <option value="${channelType}" ${selectedModelType === channelType ? 'selected' : ''}>${protocolLabel(channelType)}</option>
-  `).join('');
-}
-
-function getSupportedProtocols(channel) {
-  const upstreamProtocol = getChannelType(channel);
-  if (!ALL_PROTOCOLS.includes(upstreamProtocol)) {
-    return [upstreamProtocol];
-  }
+function getClientProtocols() {
   return [...ALL_PROTOCOLS];
 }
 
-function getExposedProtocols(channel) {
-  const upstreamProtocol = getChannelType(channel);
-  const protocols = new Set([upstreamProtocol]);
-  const transforms = Array.isArray(channel?.protocol_transforms) ? channel.protocol_transforms : [];
-  transforms.forEach((protocol) => {
-    const normalized = normalizeProtocol(protocol);
-    if (!normalized || normalized === upstreamProtocol) return;
-    if (!ALL_PROTOCOLS.includes(normalized)) return;
-    protocols.add(normalized);
-  });
-  return Array.from(protocols);
-}
-
-function channelExposesProtocol(channel, protocol) {
-  return getExposedProtocols(channel).includes(normalizeProtocol(protocol));
-}
-
-function getAllModelsForProtocol(protocol) {
-  const normalizedProtocol = normalizeProtocol(protocol);
+function getAllModels() {
   const modelSet = new Set();
   channelsList.forEach(ch => {
-    const include = channelMatchesModelType(ch) && channelExposesProtocol(ch, normalizedProtocol);
-    if (!include) return;
     (ch.models || []).forEach(entry => {
       const modelName = getModelName(entry);
       if (modelName) modelSet.add(modelName);
@@ -1342,74 +1338,91 @@ function getAllModelsForProtocol(protocol) {
 }
 
 function ensureSelectedProtocolForCurrentMode() {
-  if (testMode === TEST_MODE_CHANNEL && selectedChannel) {
-    const supportedProtocols = getSupportedProtocols(selectedChannel);
-    if (!selectedProtocol || !supportedProtocols.includes(selectedProtocol)) {
-      selectedProtocol = getChannelType(selectedChannel);
-    }
+  if (!getClientProtocols().includes(selectedProtocol)) selectedProtocol = 'anthropic';
+}
+
+function syncClientProtocolCombobox() {
+  ensureSelectedProtocolForCurrentMode();
+
+  if (!clientProtocolCombobox && clientProtocolSelect && typeof window.createSearchableCombobox === 'function') {
+    clientProtocolCombobox = window.createSearchableCombobox({
+      attachMode: true,
+      inputId: 'clientProtocolSelect',
+      dropdownId: 'clientProtocolSelectDropdown',
+      initialValue: selectedProtocol,
+      initialLabel: protocolLabel(selectedProtocol),
+      getOptions: () => ALL_PROTOCOLS.map(protocol => ({
+        value: protocol,
+        label: protocolLabel(protocol)
+      })),
+      onSelect: (value) => selectClientProtocol(value)
+    });
+  }
+
+  const label = protocolLabel(selectedProtocol);
+  if (clientProtocolCombobox) {
+    clientProtocolCombobox.setValue(selectedProtocol, label);
+    clientProtocolCombobox.refresh();
+  } else if (clientProtocolSelect) {
+    clientProtocolSelect.value = label;
+  }
+}
+
+function syncChatClientProtocolCombobox() {
+  if (!chatProtocolCombobox) return;
+  ensureSelectedProtocolForCurrentMode();
+  chatProtocolCombobox.setValue(selectedProtocol, protocolLabel(selectedProtocol));
+  chatProtocolCombobox.refresh();
+}
+
+function selectClientProtocol(value) {
+  const protocol = normalizeProtocol(value);
+  if (!ALL_PROTOCOLS.includes(protocol)) {
+    syncClientProtocolCombobox();
+    syncChatClientProtocolCombobox();
     return;
   }
 
-  if (selectedProtocol) return;
-  selectedProtocol = selectedModelType || (channelsList[0] ? getChannelType(channelsList[0]) : 'anthropic');
-}
-
-function renderProtocolTransformOptions() {
-  if (!protocolTransformOptions) return;
-
-  ensureSelectedProtocolForCurrentMode();
-
-  const supported = testMode === TEST_MODE_CHANNEL && selectedChannel
-    ? new Set(getSupportedProtocols(selectedChannel))
-    : null;
-
-  if (supported && !supported.has(selectedProtocol)) {
-    selectedProtocol = getChannelType(selectedChannel);
+  selectedProtocol = protocol;
+  if (testMode === TEST_MODE_MODEL) {
+    selectedModelModeProtocol = selectedProtocol;
   }
+  saveSelectedProtocolToStorage(selectedProtocol);
+  clearProgress();
+  syncClientProtocolCombobox();
+  syncChatClientProtocolCombobox();
 
-  protocolTransformOptions.innerHTML = ALL_PROTOCOLS.map((protocol) => {
-    const disabled = Boolean(supported) && !supported.has(protocol);
-    const checked = selectedProtocol === protocol;
-    return `
-      <label class="channel-editor-radio-option">
-        <input type="radio"
-               name="modelTestProtocolTransform"
-               value="${protocol}"
-               ${checked ? 'checked' : ''}
-               ${disabled ? 'disabled' : ''}>
-        <span>${protocolLabel(protocol)}</span>
-      </label>
-    `;
-  }).join('');
+  if (testMode === TEST_MODE_MODEL) {
+    renderModelModeRows();
+  }
 }
 
 function isModelSupported(channel, modelName) {
   if (!channel || !modelName || !Array.isArray(channel.models)) return false;
-  return channel.models.some(entry => getModelName(entry) === modelName);
+  return channel.models.some(entry => {
+    const configuredModel = getModelName(entry);
+    return configuredModel === '*' || configuredModel === modelName;
+  });
 }
 
-function getChannelsSupportingModel(protocol, modelName) {
-  const normalizedProtocol = normalizeProtocol(protocol);
+function getChannelsSupportingModel(modelName) {
   return channelsList
-    // 模型类型只用于缩小模型候选，不应把同模型的转换渠道挡掉。
-    .filter(ch => channelExposesProtocol(ch, normalizedProtocol) && isModelSupported(ch, modelName))
+    .filter(ch => isModelSupported(ch, modelName))
     .sort((a, b) => b.priority - a.priority || a.name.localeCompare(b.name));
 }
 
-function isExactModelInProtocol(protocol, modelName) {
+function isExactModel(modelName) {
   if (!modelName) return false;
   const target = String(modelName).trim().toLowerCase();
   if (!target) return false;
-  return getAllModelsForProtocol(protocol).some(m => m.toLowerCase() === target);
+  return getAllModels().some(m => m.toLowerCase() === target);
 }
 
-function getChannelModelPairsMatching(protocol, keyword) {
+function getChannelModelPairsMatching(keyword) {
   const trimmed = String(keyword || '').trim().toLowerCase();
   if (!trimmed) return [];
-  const normalizedProtocol = normalizeProtocol(protocol);
   const pairs = [];
   channelsList
-    .filter(ch => channelExposesProtocol(ch, normalizedProtocol))
     .sort((a, b) => b.priority - a.priority || a.name.localeCompare(b.name))
     .forEach(ch => {
       (ch.models || []).forEach(entry => {
@@ -1450,7 +1463,7 @@ function ensureModelSelectCombobox() {
     initialLabel: selectedModelName,
     allowCustomInput: true,
     getOptions: () => {
-      const models = getAllModelsForProtocol(selectedProtocol);
+      const models = getAllModels();
       const options = models.map(name => ({ value: name, label: name }));
 
       const typedModel = getModelInputValue();
@@ -1547,9 +1560,11 @@ function renderChannelModeRows() {
   }
 
   const fragment = document.createDocumentFragment();
+  const channelEnabled = isModelTestChannelEnabled(selectedChannel);
   models.forEach(entry => {
     const modelName = getModelName(entry);
     if (!modelName) return;
+    const modelEnabled = entry?.disabled !== true;
     const row = TemplateEngine.render('tpl-model-row', {
       model: modelName,
       displayName: modelName,
@@ -1557,7 +1572,10 @@ function renderChannelModeRows() {
       costMultiplier: normalizeModelTestCostMultiplier(selectedChannel.cost_multiplier),
       ...getResultRowMobileLabels('common.model', '模型')
     });
-    if (row) fragment.appendChild(row);
+    if (row) {
+      applyModelTestRowMuted(row, !channelEnabled || !modelEnabled);
+      fragment.appendChild(row);
+    }
   });
 
   tbody.innerHTML = '';
@@ -1566,8 +1584,7 @@ function renderChannelModeRows() {
 }
 
 function populateModelSelector() {
-  ensureSelectedModelType();
-  const models = getAllModelsForProtocol(selectedProtocol);
+  const models = getAllModels();
   const typedModel = getModelInputValue();
 
   if (models.length === 0) {
@@ -1577,7 +1594,7 @@ function populateModelSelector() {
     return;
   }
 
-  // 输入框有用户输入（含模糊关键字）→ 保留；否则当前选择不在新协议下时回退到首项。
+  // 输入框有用户输入（含模糊关键字）→ 保留；否则当前选择不在模型全集时回退到首项。
   if (typedModel && models.includes(typedModel)) {
     selectedModelName = typedModel;
   } else if (!selectedModelName || !models.includes(selectedModelName)) {
@@ -1590,15 +1607,14 @@ function populateModelSelector() {
 
 function renderModelModeRows() {
   const previousSelectionState = captureRowSelectionState();
-  ensureSelectedModelType();
   if (!selectedProtocol) {
-    renderEmptyRow(i18nText('modelTest.selectProtocolFirst', '请先选择协议转换'));
+    renderEmptyRow(i18nText('modelTest.selectProtocolFirst', '请先选择请求协议'));
     return;
   }
 
-  const models = getAllModelsForProtocol(selectedProtocol);
+  const models = getAllModels();
   if (models.length === 0) {
-    renderEmptyRow(i18nText('modelTest.noModelForProtocol', '该协议下没有可用模型'));
+    renderEmptyRow(i18nText('modelTest.noModelsAvailable', '没有可用模型'));
     return;
   }
 
@@ -1612,11 +1628,11 @@ function renderModelModeRows() {
     }
   }
 
-  const isExact = isExactModelInProtocol(selectedProtocol, selectedModelName);
+  const isExact = isExactModel(selectedModelName);
   const pairs = isExact
-    ? getChannelsSupportingModel(selectedProtocol, selectedModelName)
+    ? getChannelsSupportingModel(selectedModelName)
         .map(ch => ({ channel: ch, model: selectedModelName }))
-    : getChannelModelPairsMatching(selectedProtocol, selectedModelName);
+    : getChannelModelPairsMatching(selectedModelName);
 
   if (pairs.length === 0) {
     renderEmptyRow(i18nText('modelTest.noChannelSupportsModel', '没有渠道支持该模型'));
@@ -1625,20 +1641,22 @@ function renderModelModeRows() {
 
   const fragment = document.createDocumentFragment();
   pairs.forEach(({ channel: ch, model }) => {
-    const isEnabled = ch.enabled !== false;
+    const modelEnabled = isChannelModelEnabled(ch, model);
+    const channelEnabled = isModelTestChannelEnabled(ch);
+    const available = channelEnabled && modelEnabled;
     const baseName = isExact ? ch.name : `${ch.name} · ${model}`;
-    const channelName = isEnabled
-      ? baseName
-      : `${baseName} [${i18nText('common.disabled', '已禁用')}]`;
+    const channelName = formatModelTestRowDisplayName(baseName, channelEnabled, modelEnabled);
     const priorityValue = (ch.priority !== null && ch.priority !== undefined && Number.isFinite(Number(ch.priority))) ? Number(ch.priority) : 0;
 
     const row = TemplateEngine.render('tpl-channel-row-by-model', {
       channelId: String(ch.id),
       channelName,
+      channelBaseName: baseName,
+      channelEnabled: String(channelEnabled),
       channelPriority: String(priorityValue),
-      channelEnabled: String(isEnabled),
-      toggleSwitchClass: isEnabled ? 'channel-enable-switch--on' : 'channel-enable-switch--off',
-      toggleTitle: isEnabled ? i18nText('channels.toggleDisable', '禁用') : i18nText('channels.toggleEnable', '启用'),
+      modelEnabled: String(modelEnabled),
+      toggleSwitchClass: modelEnabled ? 'channel-enable-switch--on' : 'channel-enable-switch--off',
+      toggleTitle: modelEnabled ? i18nText('modelTest.toggleDisable', '禁用模型') : i18nText('modelTest.toggleEnable', '启用模型'),
       costMultiplier: normalizeModelTestCostMultiplier(ch.cost_multiplier),
       model,
       ...getResultRowMobileLabels('modelTest.channel', '渠道')
@@ -1647,13 +1665,9 @@ function renderModelModeRows() {
     if (row) {
       const checkbox = row.querySelector('.channel-checkbox');
       if (checkbox) {
-        restoreRowSelectionState(row, previousSelectionState, isEnabled);
+        restoreRowSelectionState(row, previousSelectionState, available);
       }
-
-      if (!isEnabled) {
-        row.style.background = 'rgba(148, 163, 184, 0.14)';
-        row.style.color = 'var(--color-text-secondary)';
-      }
+      applyModelTestRowEnabledStyle(row, modelEnabled);
     }
 
     if (row) fragment.appendChild(row);
@@ -1672,38 +1686,83 @@ function renderRowsByMode() {
   }
 }
 
+const MODEL_TEST_MODE_TABS = [
+  { id: 'modeTabChat', mode: TEST_MODE_CHAT },
+  { id: 'modeTabImage', mode: TEST_MODE_IMAGE },
+  { id: 'modeTabChannel', mode: TEST_MODE_CHANNEL },
+  { id: 'modeTabModel', mode: TEST_MODE_MODEL }
+];
+
+function syncModeTabState() {
+  MODEL_TEST_MODE_TABS.forEach(({ id, mode }) => {
+    const tab = document.getElementById(id);
+    if (!tab) return;
+    const active = testMode === mode;
+    tab.classList.toggle('active', active);
+    tab.setAttribute('aria-selected', active ? 'true' : 'false');
+    tab.tabIndex = active ? 0 : -1;
+  });
+
+  const tablePanel = document.getElementById('modelTestTablePanel');
+  if (tablePanel && (testMode === TEST_MODE_CHANNEL || testMode === TEST_MODE_MODEL)) {
+    tablePanel.setAttribute('aria-labelledby', testMode === TEST_MODE_MODEL ? 'modeTabModel' : 'modeTabChannel');
+  }
+}
+
+function initModeTabKeyboard() {
+  const tablist = document.querySelector('.model-test-tabs[role="tablist"]');
+  if (!tablist) return;
+  tablist.addEventListener('keydown', (event) => {
+    const currentTab = event.target.closest('[role="tab"]');
+    if (!currentTab || !tablist.contains(currentTab)) return;
+    const tabs = MODEL_TEST_MODE_TABS
+      .map(({ id }) => document.getElementById(id))
+      .filter(tab => tab && !tab.disabled);
+    const currentIndex = tabs.indexOf(currentTab);
+    if (currentIndex < 0) return;
+
+    let nextIndex;
+    if (event.key === 'ArrowRight') nextIndex = (currentIndex + 1) % tabs.length;
+    else if (event.key === 'ArrowLeft') nextIndex = (currentIndex - 1 + tabs.length) % tabs.length;
+    else if (event.key === 'Home') nextIndex = 0;
+    else if (event.key === 'End') nextIndex = tabs.length - 1;
+    else return;
+
+    event.preventDefault();
+    const nextTab = tabs[nextIndex];
+    setTestMode(nextTab.dataset.mode || '');
+    nextTab.focus();
+  });
+}
+
 function updateModeUI() {
   const isModelMode = testMode === TEST_MODE_MODEL;
   const isChatMode = testMode === TEST_MODE_CHAT;
+  const isImageMode = testMode === TEST_MODE_IMAGE;
+  const isStandaloneMode = isChatMode || isImageMode;
   const fetchModelsBtn = getFetchModelsBtn();
   const addModelsBtn = getAddModelsBtn();
   const deleteModelsBtn = getDeleteModelsBtn();
 
-  const modeTabChannel = document.getElementById('modeTabChannel');
-  const modeTabModel = document.getElementById('modeTabModel');
-  const modeTabChat = document.getElementById('modeTabChat');
-  modeTabChannel.classList.toggle('active', testMode === TEST_MODE_CHANNEL);
-  modeTabModel.classList.toggle('active', isModelMode);
-  if (modeTabChat) modeTabChat.classList.toggle('active', isChatMode);
+  syncModeTabState();
 
-  // chat 模式：隐藏测试工具栏与表格，显示对话面板
-  const tableContainer = document.querySelector('.model-test-table-container');
+  const tablePanel = document.getElementById('modelTestTablePanel');
   const chatPanel = document.getElementById('chatPanel');
+  const imagePanel = document.getElementById('imagePanel');
   const modelTestCard = document.getElementById('modelTestCard');
-  if (toolbar) toolbar.style.display = isChatMode ? 'none' : '';
-  if (tableContainer) tableContainer.style.display = isChatMode ? 'none' : '';
+  tablePanel?.classList.toggle('hidden', isStandaloneMode);
   chatToolbar?.classList.toggle('hidden', !isChatMode);
-  if (chatPanel) chatPanel.classList.toggle('hidden', !isChatMode);
+  chatPanel?.classList.toggle('hidden', !isChatMode);
+  imagePanel?.classList.toggle('hidden', !isImageMode);
   modelTestCard?.classList.toggle('model-test-card--chat-mode', isChatMode);
 
-  if (isChatMode) return;
+  if (isStandaloneMode) return;
 
   toolbar?.classList.toggle('model-test-toolbar--model-mode', isModelMode);
 
   channelSelectorLabel.style.display = isModelMode ? 'none' : 'flex';
-  if (modelTypeLabel) {
-    modelTypeLabel.style.display = isModelMode ? 'flex' : 'none';
-    modelTypeLabel.classList.toggle('hidden', !isModelMode);
+  if (keySelectorLabel) {
+    keySelectorLabel.style.display = isModelMode ? 'none' : 'flex';
   }
   if (modelSelectorLabel) {
     modelSelectorLabel.style.display = isModelMode ? 'flex' : 'none';
@@ -1720,10 +1779,7 @@ function updateModeUI() {
     deleteModelsBtn.disabled = false;
     deleteModelsBtn.title = isModelMode ? i18nText('modelTest.deleteBySelectionHint', '按勾选记录删除对应渠道中的模型') : '';
   }
-  if (isModelMode) {
-    populateModelTypeSelect();
-  }
-  renderProtocolTransformOptions();
+  syncClientProtocolCombobox();
 }
 
 function getSelectedTargets() {
@@ -1742,7 +1798,8 @@ function getSelectedTargets() {
           row,
           model: row.dataset.model || selectedModelName,
           channelId: channel.id,
-          protocolTransform: selectedProtocol
+          clientProtocol: selectedProtocol,
+          keyIndex: normalizeModelTestKeyIndex(getPreferredModelTestKey(channelKeysById.get(channel.id))?.key_index)
         };
       }
 
@@ -1751,10 +1808,25 @@ function getSelectedTargets() {
         row,
         model: row.dataset.model,
         channelId: selectedChannel.id,
-        protocolTransform: selectedProtocol
+        clientProtocol: selectedProtocol,
+        keyIndex: selectedKeyIndex
       };
     })
     .filter(Boolean);
+}
+
+async function attachModelModeKeySelection(targets) {
+  if (testMode !== TEST_MODE_MODEL || !Array.isArray(targets) || targets.length === 0) {
+    return targets;
+  }
+
+  const channelIDs = [...new Set(targets.map(target => target.channelId).filter(Number.isFinite))];
+  await Promise.all(channelIDs.map(channelId => getModelTestChannelKeys(channelId)));
+
+  return targets.map(target => ({
+    ...target,
+    keyIndex: normalizeModelTestKeyIndex(getPreferredModelTestKey(channelKeysById.get(target.channelId))?.key_index)
+  }));
 }
 
 function resetRowStatus(row) {
@@ -1942,12 +2014,16 @@ async function runBatchTests(targets) {
   targets.forEach(({ row }) => resetRowStatus(row));
 
   const testOne = async (target) => {
-    const { row, model, channelId, protocolTransform } = target;
-    const selectedProtocol = protocolTransform;
+    const { row, model, channelId, clientProtocol } = target;
+    const selectedProtocol = clientProtocol;
     row.querySelector('.response').textContent = i18nText('modelTest.testing', '测试中...');
 
     try {
-      const data = await fetchModelTestWithRPMWait(target, { model, stream: streamEnabled, content, protocol_transform: selectedProtocol });
+      const payload = { model, stream: streamEnabled, content, client_protocol: selectedProtocol };
+      if (Number.isInteger(target.keyIndex)) {
+        payload.key_index = target.keyIndex;
+      }
+      const data = await fetchModelTestWithRPMWait(target, payload);
       applyTestResultToRow(row, data);
     } catch (e) {
       row.style.background = 'rgba(239, 68, 68, 0.1)';
@@ -2015,7 +2091,7 @@ async function runModelTests() {
     return;
   }
 
-  const targets = getSelectedTargets();
+  let targets = getSelectedTargets();
   if (targets.length === 0) {
     showError(i18nText('modelTest.selectAtLeastOne', '请至少选择一条记录'));
     return;
@@ -2025,6 +2101,7 @@ async function runModelTests() {
   clearProgress();
   setRunTestButtonDisabled(true);
   try {
+    targets = await attachModelModeKeySelection(targets);
     await runBatchTests(targets);
   } catch (error) {
     console.error('runModelTests failed:', error);
@@ -2349,28 +2426,7 @@ async function executeDeletePlan(deletePlan, progress = null) {
   return { failed, successCount, totalChannelCount };
 }
 
-function parseBatchModelInput(value) {
-  const seen = new Set();
-  return String(value || '')
-    .split(/[,\n]+/)
-    .map(item => item.trim())
-    .filter(Boolean)
-    .filter((modelName) => {
-      const key = modelName.toLowerCase();
-      if (seen.has(key)) return false;
-      seen.add(key);
-      return true;
-    });
-}
-
-function buildModelEntriesFromNames(modelNames) {
-  return modelNames.map(modelName => ({
-    model: modelName,
-    redirect_model: ''
-  }));
-}
-
-function appendModelsToChannelCache(channel, modelNames) {
+function appendModelsToChannelCache(channel, modelEntries) {
   if (!channel) return 0;
   if (!Array.isArray(channel.models)) {
     channel.models = [];
@@ -2384,13 +2440,13 @@ function appendModelsToChannelCache(channel, modelNames) {
   );
 
   let addedCount = 0;
-  modelNames.forEach((modelName) => {
-    const key = modelName.toLowerCase();
+  modelEntries.forEach((entry) => {
+    const key = entry.model.toLowerCase();
     if (existing.has(key)) return;
 
     channel.models.push({
-      model: modelName,
-      redirect_model: ''
+      model: entry.model,
+      redirect_model: entry.redirect_model
     });
     existing.add(key);
     addedCount++;
@@ -2423,11 +2479,10 @@ function formatAddFailDetails(failed, maxItems = 5) {
   return formatDeleteFailDetails(failed, maxItems);
 }
 
-async function executeAddModelsToChannels(modelNames, targets) {
+async function executeAddModelsToChannels(modelEntries, targets) {
   const failed = [];
   let successCount = 0;
   let addedModelCount = 0;
-  const modelEntries = buildModelEntriesFromNames(modelNames);
 
   for (const target of targets) {
     try {
@@ -2446,7 +2501,7 @@ async function executeAddModelsToChannels(modelNames, targets) {
       }
 
       successCount++;
-      addedModelCount += appendModelsToChannelCache(target.channel, modelNames);
+      addedModelCount += appendModelsToChannelCache(target.channel, modelEntries);
     } catch (error) {
       failed.push({
         channelId: target.channelId,
@@ -2509,8 +2564,8 @@ function openAddModelsModal() {
 async function confirmAddModelsFromModal() {
   if (isAddingModels) return;
 
-  const modelNames = parseBatchModelInput(addModelsTextarea?.value || '');
-  if (modelNames.length === 0) {
+  const modelEntries = window.ModelEntryParser.parseModelEntries(addModelsTextarea?.value || '');
+  if (modelEntries.length === 0) {
     showError(i18nText('modelTest.addModelsEmpty', '请输入要添加的模型'));
     return;
   }
@@ -2523,7 +2578,7 @@ async function confirmAddModelsFromModal() {
 
   setAddModelsModalBusy(true);
   try {
-    const result = await executeAddModelsToChannels(modelNames, targets);
+    const result = await executeAddModelsToChannels(modelEntries, targets);
     setAddModelsModalBusy(false);
 
     populateModelSelector();
@@ -2581,9 +2636,8 @@ async function fetchAndAddModels() {
     return;
   }
 
-  const channelType = getChannelType(selectedChannel);
   try {
-    const resp = await fetchAPIWithAuth(`/admin/channels/${selectedChannel.id}/models/fetch?channel_type=${channelType}`);
+    const resp = await fetchAPIWithAuth(`/admin/channels/${selectedChannel.id}/models/fetch`);
     if (!resp.success || !resp.data?.models) {
       showError(resp.error || i18nText('modelTest.fetchModelsFailed', '获取模型失败'));
       return;
@@ -2732,14 +2786,14 @@ async function deleteSelectedModels() {
 
 async function onChannelChange() {
   if (!selectedChannel) {
-    renderProtocolTransformOptions();
+    await loadChannelKeys(null);
+    syncClientProtocolCombobox();
     renderEmptyRow(i18nText('modelTest.selectChannelFirst', '请先选择渠道'));
     return;
   }
 
-  selectedProtocol = getChannelType(selectedChannel);
-  renderProtocolTransformOptions();
-  populateModelTypeSelect();
+  await loadChannelKeys(selectedChannel.id);
+  syncClientProtocolCombobox();
   populateModelSelector();
 
   if (testMode === TEST_MODE_CHANNEL) {
@@ -2752,11 +2806,120 @@ async function onChannelChange() {
 
 function formatModelTestChannelOptionLabel(ch) {
   if (!ch) return '';
-  return `[${getChannelType(ch)}] ${ch.name}`;
+  return ch.name;
 }
 
 function getModelTestChannelOptionClass(ch) {
   return ch?.enabled === false ? 'filter-dropdown-item--disabled' : '';
+}
+
+function normalizeModelTestKeyIndex(value) {
+  const index = Number(value);
+  return Number.isInteger(index) && index >= 0 ? index : null;
+}
+
+function formatModelTestKeyLabel(key) {
+  const raw = String(key?.api_key || '').trim();
+  if (!raw) return `#${key?.key_index ?? '?'}`;
+  if (raw.length <= 6) return raw;
+  return `${raw.slice(0, 3)}.${raw.slice(-3)}`;
+}
+
+function getModelTestKeyOptionClass(key) {
+  return key?.disabled === true ? 'filter-dropdown-item--disabled' : '';
+}
+
+function getFirstEnabledModelTestKey(keys) {
+  return (Array.isArray(keys) ? keys : []).find(key => key?.disabled !== true) || null;
+}
+
+function getPreferredModelTestKey(keys) {
+  const list = Array.isArray(keys) ? keys : [];
+  return getFirstEnabledModelTestKey(list) || list[0] || null;
+}
+
+async function fetchModelTestChannelKeys(channelId) {
+  if (!channelId) return [];
+  const keys = (await fetchDataWithAuth(`/admin/channels/${channelId}/keys`)) || [];
+  return Array.isArray(keys) ? keys : [];
+}
+
+async function getModelTestChannelKeys(channelId) {
+  const normalizedId = Number(channelId);
+  if (!Number.isFinite(normalizedId) || normalizedId <= 0) return [];
+  if (channelKeysById.has(normalizedId)) return channelKeysById.get(normalizedId);
+
+  const keys = await fetchModelTestChannelKeys(normalizedId);
+  channelKeysById.set(normalizedId, keys);
+  return keys;
+}
+
+function syncChannelKeyCombobox() {
+  let selectedKey = channelKeys.find(key => normalizeModelTestKeyIndex(key?.key_index) === selectedKeyIndex);
+  if (!selectedKey) {
+    selectedKeyIndex = normalizeModelTestKeyIndex(getFirstEnabledModelTestKey(channelKeys)?.key_index);
+    selectedKey = channelKeys.find(key => normalizeModelTestKeyIndex(key?.key_index) === selectedKeyIndex);
+  }
+
+  if (!channelKeyCombobox && typeof window.createSearchableCombobox === 'function') {
+    channelKeyCombobox = window.createSearchableCombobox({
+      attachMode: true,
+      inputId: 'channelKeySelect',
+      dropdownId: 'channelKeySelectDropdown',
+      placeholder: i18nText('channels.selectApiKey', '选择 API Key'),
+      initialValue: selectedKeyIndex === null ? '' : String(selectedKeyIndex),
+      initialLabel: selectedKeyIndex === null
+        ? ''
+        : formatModelTestKeyLabel(selectedKey),
+      getOptions: () => channelKeys.map(key => ({
+        value: String(key.key_index),
+        label: formatModelTestKeyLabel(key),
+        className: getModelTestKeyOptionClass(key)
+      })),
+      onSelect: (value) => {
+        selectedKeyIndex = normalizeModelTestKeyIndex(value);
+        clearProgress();
+      },
+      onCancel: () => syncChannelKeyCombobox()
+    });
+  }
+
+  const currentKey = channelKeys.find(key => normalizeModelTestKeyIndex(key?.key_index) === selectedKeyIndex);
+  const label = currentKey ? formatModelTestKeyLabel(currentKey) : '';
+  const input = channelKeyCombobox?.getInput?.() || document.getElementById('channelKeySelect');
+  if (input) {
+    input.placeholder = channelKeys.length > 0
+      ? i18nText('channels.selectApiKey', '选择 API Key')
+      : i18nText('channels.test.noApiKey', '没有可用的 API Key');
+  }
+  if (channelKeyCombobox) {
+    channelKeyCombobox.setValue(selectedKeyIndex === null ? '' : String(selectedKeyIndex), label);
+    channelKeyCombobox.refresh();
+  }
+}
+
+async function loadChannelKeys(channelId) {
+  const requestId = ++channelKeyLoadRequestId;
+  if (!channelId) {
+    channelKeys = [];
+    selectedKeyIndex = null;
+    syncChannelKeyCombobox();
+    return;
+  }
+
+  try {
+    const keys = await fetchModelTestChannelKeys(channelId);
+    if (requestId !== channelKeyLoadRequestId) return;
+    channelKeys = Array.isArray(keys) ? keys : [];
+    channelKeysById.set(Number(channelId), channelKeys);
+    selectedKeyIndex = normalizeModelTestKeyIndex(getFirstEnabledModelTestKey(channelKeys)?.key_index);
+  } catch (e) {
+    if (requestId !== channelKeyLoadRequestId) return;
+    console.error('加载渠道 API Key 失败:', e);
+    channelKeys = [];
+    selectedKeyIndex = null;
+  }
+  syncChannelKeyCombobox();
 }
 
 function renderSearchableChannelSelect() {
@@ -2788,13 +2951,14 @@ async function loadChannels(options = {}) {
   const { preserveSelection = false, preserveTableState = false } = options;
   const preservedChannelId = preserveSelection ? (selectedChannel?.id ?? null) : null;
   const preservedProtocol = preserveSelection ? selectedProtocol : '';
-  const preservedModelType = preserveSelection ? selectedModelType : '';
   const preservedModelName = preserveSelection ? selectedModelName : '';
   const preservedTableState = preserveTableState ? captureModelTestTableState() : null;
 
   try {
     const list = (await fetchDataWithAuth('/admin/channels')) || [];
-    channelsList = list.sort((a, b) => getChannelType(a).localeCompare(getChannelType(b)) || b.priority - a.priority);
+    channelKeysById.clear();
+    channelsList = list.sort((a, b) => b.priority - a.priority || String(a.name || '').localeCompare(String(b.name || '')));
+    window.ModelTestImage?.setChannels(channelsList);
 
     // 恢复选择或从 localStorage 加载
     if (preserveSelection && preservedChannelId !== null) {
@@ -2807,17 +2971,14 @@ async function loadChannels(options = {}) {
     }
 
     if (preserveSelection) {
-      if (preservedModelType) selectedModelType = preservedModelType;
       if (preservedModelName) selectedModelName = preservedModelName;
     } else {
-      const storedModelType = loadSelectedModelTypeFromStorage();
       const storedModelName = loadSelectedModelNameFromStorage();
-      if (storedModelType) selectedModelType = storedModelType;
       if (storedModelName) selectedModelName = storedModelName;
     }
 
     renderSearchableChannelSelect();
-    ensureSelectedModelType();
+    await loadChannelKeys(selectedChannel?.id);
 
     if (preserveSelection && preservedProtocol) {
       selectedProtocol = preservedProtocol;
@@ -2826,17 +2987,16 @@ async function loadChannels(options = {}) {
       if (storedProtocol) {
         selectedProtocol = storedProtocol;
       } else {
-        selectedProtocol = channelsList[0] ? getChannelType(channelsList[0]) : 'anthropic';
+        selectedProtocol = 'anthropic';
       }
     } else {
-      selectedProtocol = channelsList[0] ? getChannelType(channelsList[0]) : 'anthropic';
+      selectedProtocol = 'anthropic';
     }
     if (testMode === TEST_MODE_MODEL) {
       selectedModelModeProtocol = selectedProtocol;
     }
 
-    populateModelTypeSelect();
-    renderProtocolTransformOptions();
+    syncClientProtocolCombobox();
     populateModelSelector();
     renderRowsByMode();
 
@@ -2870,6 +3030,11 @@ async function loadDefaultTestContent() {
 
 function bindEvents() {
   ensureModelSelectCombobox();
+  syncClientProtocolCombobox();
+  window.addEventListener('localechange', () => {
+    syncClientProtocolCombobox();
+    syncChatClientProtocolCombobox();
+  });
   const streamEnabled = document.getElementById('streamEnabled');
   if (streamEnabled) {
     streamEnabled.addEventListener('change', () => {
@@ -2885,25 +3050,6 @@ function bindEvents() {
     });
   }
 
-  protocolTransformOptions?.addEventListener('change', (event) => {
-    const target = event.target;
-    if (!(target instanceof HTMLInputElement) || target.name !== 'modelTestProtocolTransform') return;
-    if (target.disabled) return;
-
-    selectedProtocol = normalizeProtocol(target.value) || selectedProtocol;
-    if (testMode === TEST_MODE_MODEL) {
-      selectedModelModeProtocol = selectedProtocol;
-    }
-    saveSelectedProtocolToStorage(selectedProtocol);
-    clearProgress();
-
-    if (testMode === TEST_MODE_MODEL) {
-      return;
-    }
-
-    renderProtocolTransformOptions();
-  });
-
   if (!modelSelectCombobox && modelSelect) {
     modelSelect.addEventListener('change', () => {
       selectedModelName = getModelInputValue();
@@ -2914,24 +3060,6 @@ function bindEvents() {
 
     modelSelect.addEventListener('input', () => {
       selectedModelName = getModelInputValue();
-      if (testMode === TEST_MODE_MODEL) {
-        renderModelModeRows();
-      }
-    });
-  }
-
-  if (modelTypeSelect) {
-    modelTypeSelect.addEventListener('change', () => {
-      selectedModelType = normalizeProtocol(modelTypeSelect.value) || selectedModelType;
-      saveSelectedModelTypeToStorage(selectedModelType);
-      if (selectedModelType) {
-        selectedProtocol = selectedModelType;
-        selectedModelModeProtocol = selectedProtocol;
-        saveSelectedProtocolToStorage(selectedProtocol);
-      }
-      clearProgress();
-      renderProtocolTransformOptions();
-      populateModelSelector();
       if (testMode === TEST_MODE_MODEL) {
         renderModelModeRows();
       }
@@ -2979,9 +3107,10 @@ function bindEvents() {
     if (enableSwitch) {
       const row = enableSwitch.closest('tr');
       const channelId = parseInt(enableSwitch.dataset.channelId, 10);
-      if (Number.isFinite(channelId) && channelId > 0 && row) {
+      const modelName = String(row?.dataset?.model || '').trim();
+      if (Number.isFinite(channelId) && channelId > 0 && row && modelName) {
         const currentEnabled = enableSwitch.dataset.enabled === 'true';
-        toggleModelTestChannelEnabled(row, channelId, !currentEnabled);
+        toggleModelTestModelEnabled(row, channelId, modelName, !currentEnabled);
       }
       return;
     }
@@ -3039,7 +3168,7 @@ function bindEvents() {
 }
 
 function setTestMode(mode) {
-  if (mode !== TEST_MODE_CHANNEL && mode !== TEST_MODE_MODEL && mode !== TEST_MODE_CHAT) return;
+  if (mode !== TEST_MODE_CHANNEL && mode !== TEST_MODE_MODEL && mode !== TEST_MODE_CHAT && mode !== TEST_MODE_IMAGE) return;
   if (testMode === mode) return;
 
   const previousMode = testMode;
@@ -3056,10 +3185,12 @@ function setTestMode(mode) {
     initChatPanel();
     return;
   }
-
-  if (testMode === TEST_MODE_CHANNEL && selectedChannel) {
-    selectedProtocol = getChannelType(selectedChannel);
+  if (testMode === TEST_MODE_IMAGE) {
+    updateModeUI();
+    window.ModelTestImage?.open();
+    return;
   }
+
   updateHeadByMode();
   updateModeUI();
 
@@ -3069,7 +3200,7 @@ function setTestMode(mode) {
     }
     if (selectedModelModeProtocol) {
       selectedProtocol = selectedModelModeProtocol;
-      renderProtocolTransformOptions();
+      syncClientProtocolCombobox();
     }
     populateModelSelector();
   }
@@ -3097,7 +3228,7 @@ function saveTestModeToStorage(mode) {
 function loadTestModeFromStorage() {
   try {
     const mode = localStorage.getItem(STORAGE_KEY_TEST_MODE);
-    if (mode === TEST_MODE_CHANNEL || mode === TEST_MODE_MODEL || mode === TEST_MODE_CHAT) {
+    if (mode === TEST_MODE_CHANNEL || mode === TEST_MODE_MODEL || mode === TEST_MODE_CHAT || mode === TEST_MODE_IMAGE) {
       return mode;
     }
   } catch (_) { /* ignore */ }
@@ -3123,23 +3254,6 @@ function loadSelectedChannelIdFromStorage() {
     }
   } catch (_) { /* ignore */ }
   return null;
-}
-
-function saveSelectedModelTypeToStorage(modelType) {
-  try {
-    if (modelType) {
-      localStorage.setItem(STORAGE_KEY_SELECTED_MODEL_TYPE, modelType);
-    } else {
-      localStorage.removeItem(STORAGE_KEY_SELECTED_MODEL_TYPE);
-    }
-  } catch (_) { /* ignore */ }
-}
-
-function loadSelectedModelTypeFromStorage() {
-  try {
-    return localStorage.getItem(STORAGE_KEY_SELECTED_MODEL_TYPE) || '';
-  } catch (_) { /* ignore */ }
-  return '';
 }
 
 function saveSelectedModelNameToStorage(modelName) {
@@ -3206,27 +3320,6 @@ function loadChatModelFromStorage() {
     return localStorage.getItem(STORAGE_KEY_CHAT_MODEL) || '';
   } catch (_) { /* ignore */ }
   return '';
-}
-
-function saveChatChannelIdToStorage(channelId) {
-  try {
-    if (channelId !== null && Number.isFinite(Number(channelId))) {
-      localStorage.setItem(STORAGE_KEY_CHAT_CHANNEL_ID, String(channelId));
-    } else {
-      localStorage.removeItem(STORAGE_KEY_CHAT_CHANNEL_ID);
-    }
-  } catch (_) { /* ignore */ }
-}
-
-function loadChatChannelIdFromStorage() {
-  try {
-    const value = localStorage.getItem(STORAGE_KEY_CHAT_CHANNEL_ID);
-    if (value) {
-      const channelId = parseInt(value, 10);
-      if (Number.isFinite(channelId)) return channelId;
-    }
-  } catch (_) { /* ignore */ }
-  return null;
 }
 
 function saveChatStreamEnabledToStorage(enabled) {
@@ -3378,10 +3471,9 @@ function saveChatAdvancedOptionsFromModal() {
 function saveChatMessagesToStorage() {
   try {
     const data = JSON.stringify({
+      session_id: chatSessionState.current(),
       messages: chatMessages,
-      summaries: chatMessageSummaries.slice(0, chatMessages.length),
-      model: chatModel,
-      channelId: chatChannel?.id || null,
+      summaries: chatMessageSummaries.slice(0, chatMessages.length)
     });
     localStorage.setItem(STORAGE_KEY_CHAT_MESSAGES, data);
   } catch (_) { /* quota exceeded or serialization error */ }
@@ -3397,10 +3489,6 @@ function loadChatMessagesFromStorage() {
   } catch (_) {
     return null;
   }
-}
-
-function clearChatMessagesFromStorage() {
-  localStorage.removeItem(STORAGE_KEY_CHAT_MESSAGES);
 }
 
 function cloneChatSummary(summary) {
@@ -3442,7 +3530,8 @@ function getChatThinkingOptions() {
     { value: 'low', label: i18nText('modelTest.chat.thinkingLow', '低') },
     { value: 'medium', label: i18nText('modelTest.chat.thinkingMedium', '中') },
     { value: 'high', label: i18nText('modelTest.chat.thinkingHigh', '高') },
-    { value: 'xhigh', label: i18nText('modelTest.chat.thinkingXHighMax', '最高 (xhigh/max)') }
+    { value: 'xhigh', label: i18nText('modelTest.chat.thinkingXHigh', '超高 (xhigh)') },
+    { value: 'max', label: i18nText('modelTest.chat.thinkingMax', '最高 (max)') }
   ];
 }
 
@@ -3450,6 +3539,71 @@ function getChatThinkingLabel(value) {
   const normalized = String(value || '').trim();
   const options = getChatThinkingOptions();
   return (options.find(option => option.value === normalized) || options[0]).label;
+}
+
+function syncChatChannelKeyCombobox() {
+  let selectedKey = chatChannelKeys.find(key => normalizeModelTestKeyIndex(key?.key_index) === chatSelectedKeyIndex);
+  if (!selectedKey) {
+    chatSelectedKeyIndex = normalizeModelTestKeyIndex(getFirstEnabledModelTestKey(chatChannelKeys)?.key_index);
+    selectedKey = chatChannelKeys.find(key => normalizeModelTestKeyIndex(key?.key_index) === chatSelectedKeyIndex);
+  }
+
+  if (!chatChannelKeyCombobox && typeof window.createSearchableCombobox === 'function') {
+    chatChannelKeyCombobox = window.createSearchableCombobox({
+      attachMode: true,
+      inputId: 'chatChannelKeySelect',
+      dropdownId: 'chatChannelKeySelectDropdown',
+      initialValue: chatSelectedKeyIndex === null ? '' : String(chatSelectedKeyIndex),
+      initialLabel: selectedKey ? formatModelTestKeyLabel(selectedKey) : '',
+      getOptions: () => chatChannelKeys.map(key => ({
+        value: String(key.key_index),
+        label: formatModelTestKeyLabel(key),
+        className: getModelTestKeyOptionClass(key)
+      })),
+      onSelect: (value) => {
+        chatSelectedKeyIndex = normalizeModelTestKeyIndex(value);
+      },
+      onCancel: () => syncChatChannelKeyCombobox()
+    });
+  }
+
+  const currentKey = chatChannelKeys.find(key => normalizeModelTestKeyIndex(key?.key_index) === chatSelectedKeyIndex);
+  const input = chatChannelKeyCombobox?.getInput?.() || document.getElementById('chatChannelKeySelect');
+  if (input) {
+    input.placeholder = chatChannelKeys.length > 0
+      ? i18nText('channels.selectApiKey', '选择 API Key')
+      : i18nText('channels.test.noApiKey', '没有可用的 API Key');
+  }
+  if (chatChannelKeyCombobox) {
+    chatChannelKeyCombobox.setValue(
+      chatSelectedKeyIndex === null ? '' : String(chatSelectedKeyIndex),
+      currentKey ? formatModelTestKeyLabel(currentKey) : ''
+    );
+    chatChannelKeyCombobox.refresh();
+  }
+}
+
+async function loadChatChannelKeys(channelId) {
+  const requestId = ++chatChannelKeyLoadRequestId;
+  if (!channelId) {
+    chatChannelKeys = [];
+    chatSelectedKeyIndex = null;
+    syncChatChannelKeyCombobox();
+    return;
+  }
+
+  try {
+    const keys = await getModelTestChannelKeys(channelId);
+    if (requestId !== chatChannelKeyLoadRequestId) return;
+    chatChannelKeys = keys;
+    chatSelectedKeyIndex = normalizeModelTestKeyIndex(getFirstEnabledModelTestKey(chatChannelKeys)?.key_index);
+  } catch (e) {
+    if (requestId !== chatChannelKeyLoadRequestId) return;
+    console.error('加载对话渠道 API Key 失败:', e);
+    chatChannelKeys = [];
+    chatSelectedKeyIndex = null;
+  }
+  syncChatChannelKeyCombobox();
 }
 
 /**
@@ -3490,6 +3644,25 @@ function initChatPanel() {
     chatModelCombobox.refresh();
   }
 
+  // 请求协议 combobox（与其他测试模式共享协议状态和持久化）
+  if (!chatProtocolCombobox) {
+    chatProtocolCombobox = window.createSearchableCombobox({
+      attachMode: true,
+      inputId: 'chatProtocolSelect',
+      dropdownId: 'chatProtocolSelectDropdown',
+      allowCustomInput: false,
+      initialValue: selectedProtocol,
+      initialLabel: protocolLabel(selectedProtocol),
+      getOptions: () => ALL_PROTOCOLS.map(protocol => ({
+        value: protocol,
+        label: protocolLabel(protocol)
+      })),
+      onSelect: (value) => selectClientProtocol(value),
+      onCancel: syncChatClientProtocolCombobox
+    });
+  }
+  syncChatClientProtocolCombobox();
+
   // 渠道 combobox（仅显示支持当前模型的渠道）
   if (!chatChannelCombobox) {
     chatChannelCombobox = window.createSearchableCombobox({
@@ -3508,12 +3681,16 @@ function initChatPanel() {
       onSelect: (value) => {
         const channelId = parseInt(value, 10);
         chatChannel = channelsList.find(c => c.id === channelId) || null;
-        saveChatChannelIdToStorage(chatChannel ? chatChannel.id : null);
+        chatChannelSelection.select(chatChannel);
+        loadChatChannelKeys(chatChannel?.id);
       }
     });
   } else {
     chatChannelCombobox.refresh();
   }
+
+  // 渠道右侧 Key combobox：默认选择第一个启用的 Key。
+  syncChatChannelKeyCombobox();
 
   // 思考等级 combobox（固定枚举，不允许提交自定义显示文本）
   if (!chatThinkingCombobox) {
@@ -3565,14 +3742,11 @@ function initChatPanel() {
 
   // Restore persisted chat messages
   const savedChat = loadChatMessagesFromStorage();
+  chatSessionState.restore(savedChat?.session_id);
   if (savedChat && savedChat.messages.length > 0) {
     chatMessages = savedChat.messages;
     chatMessageSummaries = normalizeChatMessageSummaries(savedChat.summaries, chatMessages.length);
-    if (savedChat.model) {
-      chatModel = savedChat.model;
-      const chatModelInput = document.getElementById('chatModelSelect');
-      if (chatModelInput) chatModelInput.value = chatModel;
-    }
+    saveChatMessagesToStorage();
     renderChatMessages();
   }
 }
@@ -3583,7 +3757,7 @@ function getAllChatModelOptions() {
   channelsList.forEach(ch => {
     (ch.models || []).forEach(entry => {
       const m = getModelName(entry);
-      if (m) set.add(m);
+      if (m && m !== '*') set.add(m);
     });
   });
   return Array.from(set).sort((a, b) => a.localeCompare(b));
@@ -3595,21 +3769,19 @@ function getChannelsForChatModel() {
   return channelsList.filter(ch => isModelSupported(ch, chatModel));
 }
 
-/** 模型变更后刷新渠道下拉，自动选第一个支持该模型的渠道 */
-function refreshChatChannelsByModel() {
+/** 模型变更后刷新渠道下拉；自动兜底不能覆盖用户持久化的渠道偏好。 */
+async function refreshChatChannelsByModel() {
   if (!chatChannelCombobox) return;
   chatChannelCombobox.refresh();
 
   const list = getChannelsForChatModel();
-  if (!chatChannel || !list.find(c => c.id === chatChannel.id)) {
-    chatChannel = list[0] || null;
-    saveChatChannelIdToStorage(chatChannel ? chatChannel.id : null);
-  }
+  chatChannel = chatChannelSelection.resolve(list);
   if (chatChannel) {
     chatChannelCombobox.setValue(String(chatChannel.id), formatModelTestChannelOptionLabel(chatChannel));
   } else {
     chatChannelCombobox.setValue('', '');
   }
+  await loadChatChannelKeys(chatChannel?.id);
 }
 
 function getChatThinkingEffort() {
@@ -3806,6 +3978,8 @@ function renderChatMessages() {
   chatMessages.forEach((msg, index) => {
     const bubble = appendChatBubble(msg.role, msg.content, index);
     if (msg.role === 'assistant') {
+      // thinking 仅 UI 持久化字段，恢复时必须重绘，否则刷新/重开页面会丢思考块
+      renderChatThinking(bubble, msg.thinking, false);
       renderChatBubbleStats(bubble, chatMessageSummaries[index]);
     }
   });
@@ -3909,13 +4083,18 @@ async function sendChatMessage() {
     const advancedAPI = getChatAdvancedOptionsAPI();
     const basePayload = {
       model: chatModel,
+      client_protocol: selectedProtocol,
+      ...(Number.isInteger(chatSelectedKeyIndex) ? { key_index: chatSelectedKeyIndex } : {}),
+      session_id: chatSessionState.current(),
       stream: chatStreamEnabled,
       thinking_effort: chatThinkingEffort,
       builtin_search: chatBuiltinSearch
     };
+    // API 消息只带 role/content；thinking 是本地 UI 字段，不能进上游请求
+    const apiMessages = chatMessages.map((msg) => ({ role: msg.role, content: msg.content }));
     const requestPayload = advancedAPI && typeof advancedAPI.buildChatRequestPayload === 'function'
-      ? advancedAPI.buildChatRequestPayload(basePayload, chatMessages, chatAdvancedOptions)
-      : { ...basePayload, messages: chatMessages };
+      ? advancedAPI.buildChatRequestPayload(basePayload, apiMessages, chatAdvancedOptions)
+      : { ...basePayload, messages: apiMessages };
     const resp = await fetch(`/admin/channels/${chatChannel.id}/chat`, {
       method: 'POST',
       headers: {
@@ -3981,7 +4160,10 @@ async function sendChatMessage() {
       renderChatMarkdown(contentEl, accText || '');
       if (assistantBubble) assistantBubble._rawText = accText || '';
       if (accText) {
-        const assistantMessageIndex = pushChatMessage({ role: 'assistant', content: accText }, assistantSummary);
+        const assistantMessage = { role: 'assistant', content: accText };
+        const thinkingText = String(accThinking || '').trim();
+        if (thinkingText) assistantMessage.thinking = thinkingText;
+        const assistantMessageIndex = pushChatMessage(assistantMessage, assistantSummary);
         if (assistantBubble) assistantBubble.dataset.chatIndex = String(assistantMessageIndex);
         saveChatMessagesToStorage();
       } else {
@@ -4206,7 +4388,8 @@ function clearChat() {
   chatMessages = [];
   chatMessageSummaries = [];
   chatPendingImages = [];
-  clearChatMessagesFromStorage();
+  chatSessionState.rotate();
+  saveChatMessagesToStorage();
   const messagesEl = document.getElementById('chatMessages');
   if (messagesEl) messagesEl.innerHTML = '';
   renderChatImagePreviews();
@@ -4255,6 +4438,15 @@ function buildChatMarkdownText() {
       : i18nText('modelTest.chat.roleAssistant', '助手');
     lines.push(`## ${roleLabel}`);
     lines.push('');
+    if (msg.role === 'assistant') {
+      const thinkingText = String(msg.thinking || '').trim();
+      if (thinkingText) {
+        lines.push(`### ${i18nText('modelTest.chat.thinking', '思考')}`);
+        lines.push('');
+        lines.push(thinkingText);
+        lines.push('');
+      }
+    }
     if (typeof msg.content === 'string') {
       lines.push(msg.content);
     } else if (Array.isArray(msg.content)) {
@@ -4401,6 +4593,10 @@ document.addEventListener('click', (e) => {
 });
 
 async function bootstrap() {
+  if (window.isAPITokenRole()) {
+    await window.TokenModelTest.init();
+    return;
+  }
   window.ChannelModalHooks = {
     afterSave: async () => {
       await loadChannels({ preserveSelection: true, preserveTableState: true });
@@ -4409,6 +4605,21 @@ async function bootstrap() {
   initModelTestActions();
   bindEvents();
   initChatExportDropdown();
+  initModeTabKeyboard();
+  window.ModelTestImage?.init({
+    t: i18nText,
+    getModelName,
+    getModelOptions: getAllChatModelOptions,
+    getChannelsForModel: model => model
+      ? channelsList.filter(channel => isModelSupported(channel, model))
+      : channelsList.slice(),
+    isModelSupported,
+    getChannelKeys: getModelTestChannelKeys,
+    formatChannelLabel: formatModelTestChannelOptionLabel,
+    getChannelOptionClass: getModelTestChannelOptionClass,
+    formatKeyLabel: formatModelTestKeyLabel,
+    getKeyOptionClass: getModelTestKeyOptionClass
+  });
 
   // 从 localStorage 恢复测试模式
   testMode = loadTestModeFromStorage();
@@ -4426,7 +4637,10 @@ async function bootstrap() {
   }
 
   chatModel = loadChatModelFromStorage();
-  const storedChatChannelId = loadChatChannelIdFromStorage();
+  chatChannelSelection = window.ModelTestChatChannelState.createSelection(
+    localStorage,
+    STORAGE_KEY_CHAT_CHANNEL_ID
+  );
   chatThinkingEffort = loadChatThinkingEffortFromStorage();
   chatAdvancedOptions = loadChatAdvancedOptionsFromStorage();
   updateChatAdvancedOptionsButton();
@@ -4443,24 +4657,16 @@ async function bootstrap() {
     loadDefaultTestContent()
   ]);
 
-  // 恢复对话渠道选择（必须在 loadChannels 之后）
-  if (storedChatChannelId !== null) {
-    chatChannel = channelsList.find(c => c.id === storedChatChannelId) || null;
-  }
+  // 渠道偏好只能在渠道列表加载完成后解析；自动兜底不写回偏好。
+  chatChannel = chatChannelSelection.resolve(getChannelsForChatModel());
   updateHeadByMode();
   updateModeUI();
   renderRowsByMode();
 
-  // 根据恢复的模式初始化 UI
-  const modeTabChannel = document.getElementById('modeTabChannel');
-  const modeTabModel = document.getElementById('modeTabModel');
-  const modeTabChat = document.getElementById('modeTabChat');
-  modeTabChannel?.classList.toggle('active', testMode === TEST_MODE_CHANNEL);
-  modeTabModel?.classList.toggle('active', testMode === TEST_MODE_MODEL);
-  modeTabChat?.classList.toggle('active', testMode === TEST_MODE_CHAT);
-
   if (testMode === TEST_MODE_CHAT) {
     initChatPanel();
+  } else if (testMode === TEST_MODE_IMAGE) {
+    window.ModelTestImage?.open();
   }
 }
 

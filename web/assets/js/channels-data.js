@@ -1,13 +1,13 @@
-function buildChannelsListParams(type = 'all') {
+function buildChannelsListParams() {
   const params = new URLSearchParams();
-  if (type && type !== 'all') {
-    params.set('type', type);
-  }
   if (filters.search) {
     params.set(filters.searchExact ? 'channel_name' : 'search', filters.search);
   }
   if (filters.status && filters.status !== 'all') {
     params.set('status', filters.status);
+  }
+  if (filters.authType && filters.authType !== 'all') {
+    params.set('auth_type', filters.authType);
   }
   if (filters.model && filters.model !== 'all') {
     params.set(filters.modelExact ? 'model' : 'model_like', filters.model);
@@ -17,10 +17,12 @@ function buildChannelsListParams(type = 'all') {
   return params;
 }
 
-async function loadChannels(type = 'all') {
+async function loadChannels(options = {}) {
   try {
-    const params = buildChannelsListParams(type);
-    const url = '/admin/channels?' + params.toString();
+    const params = buildChannelsListParams();
+    const listBase = channelsReadURL('/admin/channels', '/dashboard/channels');
+    params.set('range', channelStatsRange);
+    const url = listBase + '?' + params.toString();
     const resp = await fetchAPIWithAuth(url);
     if (!resp.success) {
       throw new Error(resp.error || window.t('channels.loadChannelsFailed'));
@@ -32,7 +34,7 @@ async function loadChannels(type = 'all') {
 
     if (channelsCurrentPage > channelsTotalPages) {
       channelsCurrentPage = channelsTotalPages;
-      return loadChannels(type);
+      return loadChannels(options);
     }
 
     if (typeof syncSelectedChannelsWithLoadedChannels === 'function') {
@@ -45,30 +47,32 @@ async function loadChannels(type = 'all') {
     }
   } catch (e) {
     console.error('Failed to load channels', e);
+    if (options.throwOnError) throw e;
     if (window.showError) window.showError(window.t('channels.loadChannelsFailed'));
   }
 }
 
 // CRUD 操作后同时刷新列表分页与筛选下拉全集
-async function reloadChannelsList(type = filters.channelType, status = filters.status) {
+async function reloadChannelsList(options = {}) {
   await Promise.all([
-    loadChannelsFilterOptions(type, status),
-    loadChannels(type)
+    loadChannelsFilterOptions(options),
+    loadChannels(options)
   ]);
 }
 
-// 加载渠道筛选下拉的全集（按 type/status 联动），与列表分页/搜索/模型筛选解耦
-async function loadChannelsFilterOptions(type = 'all', status = 'all') {
+// 加载渠道筛选下拉全集，与列表的分页和全部筛选条件彻底解耦
+async function loadChannelsFilterOptions(options = {}) {
   try {
     const params = new URLSearchParams();
-    if (type && type !== 'all') params.set('type', type);
-    if (status && status !== 'all') params.set('status', status);
-    const url = '/admin/channels/filter-options' + (params.toString() ? '?' + params.toString() : '');
+    const optionsBase = channelsReadURL('/admin/channels/filter-options', '/dashboard/channels/filter-options');
+    params.set('range', channelStatsRange);
+    const url = optionsBase + '?' + params.toString();
     const data = await fetchDataWithAuth(url);
     allAvailableChannelNames = Array.isArray(data && data.channel_names) ? data.channel_names : [];
     allAvailableModels = Array.isArray(data && data.models) ? data.models : [];
   } catch (e) {
     console.error('Failed to load filter options', e);
+    if (options.throwOnError) throw e;
     allAvailableChannelNames = [];
     allAvailableModels = [];
   }
@@ -90,7 +94,8 @@ async function loadChannelStatsRange() {
 async function loadChannelStats(range = channelStatsRange) {
   try {
     const params = new URLSearchParams({ range, limit: '500', offset: '0' });
-    const data = await fetchDataWithAuth(`/admin/stats?${params.toString()}`);
+    const statsBase = channelsReadURL('/admin/stats', '/dashboard/stats');
+    const data = await fetchDataWithAuth(`${statsBase}?${params.toString()}`);
     channelStatsById = aggregateChannelStats((data && data.stats) || [], data && data.channel_health);
     filterChannels();
   } catch (err) {
@@ -232,4 +237,8 @@ async function loadDefaultTestContent() {
   } catch (e) {
     console.warn('Failed to load default test content, using built-in default', e);
   }
+}
+
+if (typeof module !== 'undefined' && module.exports) {
+  module.exports = { loadChannels, loadChannelsFilterOptions, loadChannelStats };
 }

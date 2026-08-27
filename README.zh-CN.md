@@ -6,16 +6,29 @@
 
 **[English](README.md) | 简体中文**
 
-[![Go](https://img.shields.io/badge/Go-1.25+-00ADD8.svg)](https://golang.org)
+[![Go](https://img.shields.io/badge/Go-1.26+-00ADD8.svg)](https://golang.org)
 [![Gin](https://img.shields.io/badge/Gin-v1.12+-blue.svg)](https://github.com/gin-gonic/gin)
 [![Docker](https://img.shields.io/badge/Docker-Supported-2496ED.svg)](https://hub.docker.com)
 [![Hugging Face](https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-Spaces-yellow)](https://huggingface.co/spaces)
 [![GitHub Actions](https://img.shields.io/badge/CI%2FCD-GitHub%20Actions-2088FF.svg)](https://github.com/features/actions)
 [![License](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-> 智能路由 | 自动故障切换 | 指数冷却 | 多 URL 调度 | 协议转换 | 实时监控 | 成本控制
+> 智能路由 | 自动故障切换 | 模型感知冷却 | 多 URL 调度 | 协议转换 | 实时监控 | 成本控制
 
 ccLoad 用一个 Go 服务接住多上游 AI API 的复杂度：Claude Code、Codex、Gemini、OpenAI 兼容客户端统一接入同一个网关，渠道选择、故障切换、冷却、协议转换、请求可观测性和费用限制都在服务端处理，不再散落到每个客户端脚本里。
+
+## 🤖 使用 Codex 和 GPT-5.6 构建
+
+在 OpenAI Build Week 期间，项目把由 GPT-5.6 驱动的 Codex 作为主要工程代理，用于：
+
+- 追踪 Go 后端和内嵌 Web UI 中的请求路由、故障切换、冷却、协议转换和后台页面流程。
+- 实现并审查上游 `5xx`、Key 级 `429`、模型不可用 `404` 和明确表示模型退役的 `410` 的模型级冷却，避免无必要地冷却整个渠道。
+- 改进模型状态与调用统计界面，更新中英文文档，并通过聚焦的 Go 测试、构建和浏览器走查验证结果。
+- 准备可复现的演示和 Devpost 参赛材料；架构、安全和最终审查决策仍由人负责。
+
+GPT-5.6 也直接集成在产品中：ccLoad 可通过 OpenAI 兼容接口和 Codex Responses 接口代理 GPT-5.6，提供 Sol、Terra、Luna 模型预设，计算标准、priority、flex、缓存 Token 和长上下文费用，并像处理其他上游模型一样对其执行路由与模型级冷却。
+
+仓库中的 `AGENTS.md` 和 `CLAUDE.md` 固化了工程约束，确保 Codex 在每次会话中遵循同一套 KISS 优先的审查与测试规则。
 
 ## 🎯 解决什么问题
 
@@ -30,10 +43,11 @@ ccLoad 用一个 Go 服务接住多上游 AI API 的复杂度：Claude Code、Co
 ccLoad 直接处理这些问题：
 
 - 🎯 **智能路由**：高优先级渠道优先使用，同级渠道按平滑加权轮询分流。
-- 🔀 **自动故障切换**：按错误类型跳过故障 Key、渠道或 URL。
-- ⏰ **指数冷却**：异常上游自动退避，避免重试持续打到坏渠道。
+- 🔀 **自动故障切换**：按错误作用域跳过故障 Key、模型、渠道或 URL。
+- ⏰ **模型感知冷却**：结构化 `model_cooldown`、上游 HTTP 5xx、Key 级 429 限流、模型不可用 404 和明确表示模型退役的 410 都先只冷却当前实际模型，同渠道其他模型仍可用；只有所有配置模型或所有启用 Key 都在冷却时才升级为渠道冷却。
 - 🌐 **多 URL 调度**：一个渠道可配置多个上游 URL，按延迟和健康度分配流量。
-- 🔄 **协议转换**：Anthropic、OpenAI、Gemini、Codex 请求和响应可在网关层转换。
+- 🔄 **逐 URL 协议路由**：每个 URL 可声明实际支持的线协议；显式声明直接选路，留空则原生协议优先探测并缓存成功协议。
+- 🔌 **Responses WebSocket 桥接**：认证后的 Codex 客户端可保持下游 WebSocket，各候选渠道按配置使用原生 Codex WebSocket 或现有 HTTP/SSE 传输。
 - 📊 **实时监控**：活跃请求、日志、Token、TTFB、费用和上游详情在后台直接可见。
 - 🔍 **软错误检测**：HTTP 200 伪装成功也会触发故障切换。已覆盖：
   - `{"error": {...}}` 结构的 JSON 错误
@@ -49,98 +63,81 @@ ccLoad 直接处理这些问题：
 |------|------|------|
 | 🚀 **性能怪兽** | Gin框架 + Sonic JSON | 1000+并发，高性能缓存 |
 | 🧮 **本地算Token** | 不调API就能估算消耗 | 响应<5ms，准确度93%+ |
-| 🎯 **错误分类器** | Key级/渠道级/客户端错误 | 200伪装错误也能揪出来 |
+| 🎯 **错误分类器** | Key级/模型级/渠道级/客户端错误 | 200伪装错误也能揪出来 |
 | 🔀 **智能调度** | 优先级+平滑加权轮询+健康度排序 | 异常渠道自动降权 |
-| 🛡️ **故障秒切** | 指数退避冷却机制 | 2min→4min→8min→30min |
-| 📊 **数据大屏** | 趋势图+日志+Token统计 | 一眼看清用量情况 |
+| 🛡️ **故障秒切** | Key/模型/渠道统一指数退避，优先尊重上游精确恢复时间 | 单模型故障不误伤整个渠道 |
+| 📊 **数据大屏** | 趋势图+日志+Token统计+进程指标(CPU/RSS/GC) | 一眼看清用量与运行状态 |
 | 🎯 **多API兼容** | Claude Code/Codex/Gemini/OpenAI | 一套配置走天下 |
+| 🔑 **OAuth 渠道** | Codex(ChatGPT)/Anthropic(Claude)/Antigravity/xAI OAuth 凭证 + Codex 个人访问令牌(PAT) + Z.ai Coding Plan(ZCode) 浏览器授权或 API Key 导入 | 支持的提供商自动刷新令牌，支持文本/文件/聚合导入、批量额度刷新、失效凭证清理，凭证被上游永久拒绝时自动禁用渠道 |
+| 📅 **OAuth 额度成本** | 按凭证累计周/月标准成本，对齐上游额度窗口 | 有重置额度时可手动重置 Codex 配额 |
+| 🔌 **Responses WebSocket** | 下游长连接+原生 WS/HTTP-SSE 桥接 | 保留会话并按安全边界故障切换 |
 | 📦 **开箱即用** | 单文件+嵌入式SQLite | 零依赖，下载就能跑 |
 | 🐳 **云原生** | 多架构镜像+CI/CD | amd64/arm64都支持 |
 | 🤗 **免费托管** | Hugging Face免费托管 | 适合个人试用 |
 | 💰 **成本限额** | 渠道每日成本上限 | 达到限额自动跳过 |
 | 🚦 **渠道RPM限制** | 每渠道滚动60秒请求上限 | 0=不限，超限自动跳过 |
-| 🚧 **单 Key 并发限制** | 渠道内每个 API Key 的同时在飞请求上限 | 0=不限，满载时自动换 Key |
-| 🔐 **令牌限额** | API令牌费用上限+模型限制 | 精细化访问控制 |
+| 🚧 **渠道并发限制** | 每渠道同时在飞请求上限 | 0=不限，超限自动跳过 |
+| 🕒 **渠道可用时段** | HH:MM 起止时间，服务器本地时区，支持跨午夜 | 时段外渠道完全不参与路由 |
+| 🔐 **令牌限额** | 费用上限+模型/渠道限制+并发上限 | 精细化访问控制 |
 | ⏱️ **首字节监控** | 流式请求TTFB记录 | 便于诊断上游延迟 |
 | 🌐 **多URL负载均衡** | 单渠道多URL+加权随机 | 延迟低的URL自动多分流 |
+| 🧭 **渠道级代理** | http/https/socks5/socks5h 上游代理 | 每渠道独立连接池，互不干扰 |
 | 💵 **service_tier定价** | OpenAI priority/flex/default层级 | 费用倍率精准计算 |
 | 🖼️ **图像工具计费** | Responses image_generation/gpt-image-2 | 图像生成成本不漏算 |
 | 📉 **分层定价** | GPT-5.4/Qwen-Plus/Gemini长上下文 | 超量token自动降档计费 |
-| 🔄 **协议转换** | Anthropic/OpenAI/Gemini/Codex互转 | 保留采样与思考参数，一个渠道服务多种客户端协议 |
+| 🔄 **逐 URL 协议路由** | 每个 URL 显式声明 Anthropic/OpenAI/Codex/Gemini 能力 | 显式配置直接选路，留空时自动探测并缓存能力 |
 | 💬 **对话式模型测试** | 按渠道/按模型/对话三种模式 | 支持图片上传、思考等级、内置搜索与对话导出 |
+| 🎨 **图片生成测试** | 独立标签页，可选 Images API 或 Chat Completions | 尺寸/质量/背景/输出格式可调，直接看到生成结果 |
 | 🔍 **调试日志** | 上游请求/响应原始数据捕获 | 敏感头脱敏，排障利器 |
 | 🕐 **定时检测** | 渠道可用性后台定时探测 | 自动发现故障渠道 |
-| 🔄 **自动更新** | 默认每 12 小时检查新版本 | 可在设置页调整检测间隔 |
+| 🔄 **更新渠道** | 默认稳定版，可选择包含测试版 | 可在设置页调整渠道和检测间隔 |
 | 🧩 **自定义请求规则** | 渠道级请求头/JSON 请求体改写（remove/override/append） | 认证头保护 + CRLF 防护 + 容量上限 |
 | 🎛️ **日志列自定义** | 表格列显隐可配置，设置持久化到浏览器 | 按需查看，减少信息噪音 |
 
 ## 🏗️ 架构概览
 
-ccLoad 的请求链路很直接：
-
-从你的应用发请求到API返回结果，中间经过这几层：
-- **认证层** - 验证访问权限
-- **路由分发** - 判断请求协议与路径，按 Claude Code、Codex、Gemini、OpenAI 分流处理
-- **协议转换** - 客户端用OpenAI格式？上游是Anthropic？自动翻译，无感切换
-- **智能调度** - 从多个渠道中选择当前最合适的上游
-- **故障切换** - 选中的渠道失败后自动切换备用渠道
-
-核心亮点：**存储层用工厂模式**，SQLite 和 MySQL 共享代码，消除了 467 行重复代码。数据层边界清晰，切换数据库只需要调整环境变量。
+每个渠道默认接受四种客户端协议。实际上游协议由 `protocol_transform_mode` 和每个结构化 URL 的 `protocols` 声明共同决定：`upstream` 只直通客户端协议；`auto` 先尝试客户端协议，再按 OpenAI → Anthropic → Codex → Gemini 探测并跳过已试协议，仅在响应未提交的能力错误后继续；`local` 优先使用显式声明协议的 URL，并保持每个 URL 的声明顺序。只有全部 URL 都未声明协议时，`local` 才按 Anthropic → Codex → OpenAI → Gemini 尝试。不兼容 URL 不发请求、不冷却；自动探测成功结果按 URL 和请求族缓存到进程重启或渠道配置变更，全部协议不支持时 10 分钟后重新探测。
 
 ```mermaid
 graph TB
     subgraph "客户端"
-        A[用户应用] --> B[ccLoad代理]
+        A[Claude Code / Codex / Gemini / OpenAI 客户端]
     end
-    
-    subgraph "ccLoad服务"
-        B --> C[认证层]
-        C --> D[路由分发]
-        D --> E[渠道选择器]
-        E --> F[负载均衡器]
 
-        subgraph "核心组件"
-            F --> G[渠道A<br/>优先级:10]
-            F --> H[渠道B<br/>优先级:5]
-            F --> I[渠道C<br/>优先级:5]
-            G --> G1[URL选择器<br/>加权随机]
-            H --> H1[URL选择器<br/>加权随机]
-            I --> I1[URL选择器<br/>加权随机]
-        end
-        
-        subgraph "存储层"
-            J[(存储工厂)]
-            J3[Schema定义层]
-            J4[统一SQL层]
-            J1[(SQLite)]
-            J2[(MySQL)]
-            J --> J3
-            J3 --> J4
-            J4 --> J1
-            J4 --> J2
-        end
-        
-        subgraph "监控层"
-            K[日志系统]
-            L[统计分析]
-            M[趋势图表]
-        end
+    subgraph "ccLoad服务"
+        B[HTTP代理]
+        C[认证 + 路由分发]
+        D[渠道选择器<br/>优先级 + 平滑加权轮询]
+        E[协议 Registry<br/>原生透传 / 本地转换]
+        F[URL选择器<br/>探索 + 1/EWMA加权]
+        G[(存储工厂<br/>SQLite / MySQL / PostgreSQL)]
+        H[日志 + 指标 + 成本控制]
+
+        A --> B --> C --> D --> E --> F
+        D <--> G
+        H <--> G
+        B --> H
     end
-    
+
     subgraph "上游服务"
-        G1 --> N[Claude API]
-        H1 --> O[Claude API]
-        I1 --> P[Claude API]
+        U1[Anthropic]
+        U2[OpenAI兼容服务]
+        U3[Gemini]
+        U4[Codex Responses]
     end
-    
-    E <--> J
-    F <--> J
-    K <--> J
-    L <--> J
-    M <--> J
-    
+
+    F --> U1
+    F --> U2
+    F --> U3
+    F --> U4
+    U1 -. JSON / SSE .-> E
+    U2 -. JSON / SSE .-> E
+    U3 -. JSON / SSE .-> E
+    U4 -. JSON / SSE .-> E
+    E -. 客户端协议 .-> B
+
     style B fill:#4F46E5,stroke:#000,color:#fff
-    style F fill:#059669,stroke:#000,color:#fff
+    style D fill:#059669,stroke:#000,color:#fff
     style E fill:#0EA5E9,stroke:#000,color:#fff
 ```
 
@@ -163,8 +160,8 @@ graph TB
 ```bash
 # 方式 1: 使用 docker-compose（最简单）
 curl -o docker-compose.yml https://raw.githubusercontent.com/caidaoli/ccLoad/master/docker-compose.yml
-curl -o .env https://raw.githubusercontent.com/caidaoli/ccLoad/master/.env.example
-# 编辑 .env 文件设置密码
+curl -o .env https://raw.githubusercontent.com/caidaoli/ccLoad/master/.env.docker.example
+# 编辑 .env 文件设置 CCLOAD_PASS（必填，未设置服务会拒绝启动）
 docker-compose up -d
 
 # 方式 2: 直接运行镜像
@@ -185,6 +182,7 @@ git clone https://github.com/caidaoli/ccLoad.git
 cd ccLoad
 
 # 使用 docker-compose 构建并运行
+cp .env.docker.example .env  # 编辑 .env 设置 CCLOAD_PASS
 docker-compose -f docker-compose.build.yml up -d
 
 # 或手动构建
@@ -295,7 +293,7 @@ Hugging Face Spaces 提供免费的 Docker 托管和自动 HTTPS，适合个人�
 
    | 变量名 | 值 | 必填 | 说明 |
    |--------|-----|------|------|
-   | `CCLOAD_PASS` | `your_admin_password` | ✅ **必填** | 管理界面密码 |
+   | `CCLOAD_PASS` | 无 | ✅ **必填** | 管理界面密码 |
    | `CCLOAD_API_TOKENS` | `token1\|生产,token2\|开发` | 可选 | 启动时预置 API 访问令牌 |
 
    **注意**:
@@ -341,28 +339,29 @@ Hugging Face Spaces 提供免费的 Docker 托管和自动 HTTPS，适合个人�
 
 **重要**: Hugging Face Spaces 的存储策略
 
-由于 Hugging Face Spaces 的限制（`/tmp` 目录重启后清空），**强烈推荐使用外部 MySQL 数据库**实现完整的数据持久化：
+由于 Hugging Face Spaces 的限制（`/tmp` 目录重启后清空），**强烈推荐使用外部 MySQL 或 PostgreSQL 数据库**实现完整的数据持久化：
 
 **方案一：混合存储模式（推荐，性能最优）**
-- ✅ **极速查询**: 所有读写走本地 SQLite，延迟 <1ms（免费 MySQL 延迟 800ms+）
-- ✅ **重启不丢数据**: 异步同步到 MySQL，启动时自动恢复
+- ✅ **本地权威读写**: 配置、凭据、Key、冷却与日志都先提交 SQLite，远程数据库延迟不进入调度热路径
+- ✅ **后台最终一致**: 主库写入按实体合并，失败后每 10 秒重试
+- ⚠️ **单实例语义**: 不支持多个混合实例或外部程序同时写主库；进程退出可能丢失尚未同步的内存任务
 - ✅ **统计缓存**: 智能 TTL 缓存，减少重复聚合查询
-- 配置方法: 在 Secrets 中添加 `CCLOAD_MYSQL` + `CCLOAD_ENABLE_SQLITE_REPLICA=1`
+- 配置方法: 在 Secrets 中添加一个主库 DSN（`CCLOAD_MYSQL` 或 `CCLOAD_POSTGRES`），再加 `CCLOAD_ENABLE_SQLITE_REPLICA=1`
 
 **Dockerfile 示例（混合模式）**:
 ```dockerfile
 FROM ghcr.io/caidaoli/ccload:latest
 ENV TZ=Asia/Shanghai
 ENV PORT=7860
-# Secrets 中配置: CCLOAD_MYSQL + CCLOAD_ENABLE_SQLITE_REPLICA=1
+# Secrets 中配置: CCLOAD_MYSQL 或 CCLOAD_POSTGRES，再加 CCLOAD_ENABLE_SQLITE_REPLICA=1
 EXPOSE 7860
 ```
 
-**方案二：纯 MySQL 模式**
+**方案二：纯外部数据库模式**
 - ✅ **完整持久化**: 渠道配置、日志记录、统计数据全部保留
 - ✅ **重启不丢数据**: 数据存储在外部数据库，不受 Space 重启影响
-- ⚠️ **查询较慢**: 免费 MySQL 延迟较高，统计页面响应慢
-- 配置方法: 在 Secrets 中添加 `CCLOAD_MYSQL` 环境变量
+- ⚠️ **数据库延迟**: 统计页面响应时间取决于远程数据库和部署地域
+- 配置方法: 在 Secrets 中二选一配置 `CCLOAD_MYSQL` 或 `CCLOAD_POSTGRES`
 
 **推荐的免费 MySQL 服务**:
 - [TiDB Cloud Serverless](https://tidbcloud.com/) - 免费 5GB 存储，MySQL 兼容，无连接数限制，推荐首选
@@ -376,12 +375,19 @@ EXPOSE 7860
 5. **（可选）启用混合模式**: 添加 `CCLOAD_ENABLE_SQLITE_REPLICA=1` 获得最佳性能
 6. 重启 Space，所有数据将自动持久化到 MySQL
 
-**Dockerfile 示例（纯 MySQL）**:
+**PostgreSQL 配置示例**:
+```bash
+CCLOAD_POSTGRES=postgres://user:password@host:5432/ccload?sslmode=require
+```
+
+支持 URL 和 libpq 关键字 DSN。`CCLOAD_MYSQL` 与 `CCLOAD_POSTGRES` 不能同时配置。
+
+**Dockerfile 示例（纯外部数据库）**:
 ```dockerfile
 FROM ghcr.io/caidaoli/ccload:latest
 ENV TZ=Asia/Shanghai
 ENV PORT=7860
-# 不需要 SQLITE_PATH，使用 CCLOAD_MYSQL 环境变量
+# 在 Secrets 中配置 CCLOAD_MYSQL 或 CCLOAD_POSTGRES，不需要 SQLITE_PATH
 EXPOSE 7860
 ```
 
@@ -418,7 +424,7 @@ EXPOSE 7860
 
 ### 基本配置
 
-部署完成后，按场景选择 SQLite 或 MySQL：
+部署完成后，按场景选择 SQLite、MySQL 或 PostgreSQL。MySQL 与 PostgreSQL 互斥。
 
 **SQLite 模式（默认）**：
 个人或小团队可优先使用 SQLite，零外部依赖，单文件持久化：
@@ -454,6 +460,19 @@ echo "CCLOAD_MYSQL=user:password@tcp(localhost:3306)/ccload?charset=utf8mb4" >> 
 echo "PORT=8080" >> .env
 
 # 3. 启动服务（自动创建表结构）
+./ccload
+```
+
+**PostgreSQL 模式**：
+```bash
+# 1. 在 PostgreSQL 中创建数据库和用户
+
+# 2. 设置环境变量
+export CCLOAD_PASS=your_admin_password
+export CCLOAD_POSTGRES="postgres://user:password@localhost:5432/ccload?sslmode=disable"
+export PORT=8080
+
+# 3. 启动服务（自动创建和迁移表结构）
 ./ccload
 ```
 
@@ -503,6 +522,15 @@ docker run -d --name ccload \
   -p 8080:8080 \
   -e CCLOAD_PASS=your_admin_password \
   -e CCLOAD_MYSQL="user:pass@tcp(mysql_host:3306)/ccload?charset=utf8mb4" \
+  ghcr.io/caidaoli/ccload:latest
+```
+
+**Docker + PostgreSQL**（需要已有 PostgreSQL 服务）:
+```bash
+docker run -d --name ccload \
+  -p 8080:8080 \
+  -e CCLOAD_PASS=your_admin_password \
+  -e CCLOAD_POSTGRES="postgres://user:pass@postgres_host:5432/ccload?sslmode=require" \
   ghcr.io/caidaoli/ccload:latest
 ```
 
@@ -558,6 +586,71 @@ curl -X POST http://localhost:8080/v1/chat/completions \
   }'
 ```
 
+**Codex Responses WebSocket**：
+
+下游 WebSocket 和上游 WebSocket 是两个独立开关：认证后的客户端始终可以升级 `GET /v1/responses`，也可以使用 Codex 直连别名 `GET /backend-api/codex/responses`；渠道的 `websockets` 只决定 ccLoad 是否尝试连接原生 Codex 上游 WebSocket。未启用该字段的渠道仍可通过 HTTP/SSE 桥接参与候选和故障切换。
+
+在 `/web/channels.html` 中选择包含 Codex 能力 URL 的渠道，勾选“原生 WebSocket”并点击“检测”即可启用。使用 Admin API 时对应的关键字段如下；URL 仍填写 `http://` 或 `https://` 地址，ccLoad 会在原生 WS 请求时转换为 `ws://` 或 `wss://`：
+
+```json
+{
+  "urls": [{"url": "https://upstream.example.com", "protocols": ["codex"]}],
+  "websockets": true
+}
+```
+
+以 `websocat` 为例连接下游：
+
+```bash
+websocat \
+  -H='Authorization: Bearer your-api-token' \
+  -H='Session-Id: stable-conversation-id' \
+  ws://localhost:8080/v1/responses
+```
+
+连接后发送文本帧。第一轮必须使用 `response.create` 并包含 `model`；后续轮次可使用 `response.append` 和上一轮返回的 `response.id`：
+
+```json
+{"type":"response.create","model":"your-model","input":[{"type":"message","role":"user","content":"Hello"}]}
+```
+
+```json
+{"type":"response.append","previous_response_id":"resp_xxx","input":[{"type":"message","role":"user","content":"Continue"}]}
+```
+
+客户端持续读取 Responses 事件，直到收到 `response.completed`、`response.done`、`response.incomplete`、`response.failed` 或 `error`。只支持文本帧；二进制帧会返回 `unsupported_frame`。
+
+故障切换只处理分类为可重试的 Key、模型或渠道级上游错误。客户端参数错误、无法转换的请求和消息过大不会切换。跨 Key、URL、渠道或传输的切换只发生在下游尚未提交任何可见的非心跳事件时；原生 WS 在同一上游上的一次内部重连使用下面单独说明的语义边界。
+
+| 当前上游 | 后续动作 | ccLoad 行为 | 客户端行为 |
+|---|---|---|---|
+| HTTP/SSE 在提交可见事件前失败 | 切换到另一个 HTTP/SSE 候选 | 内部切换并重放完整 transcript | 无需处理 |
+| 原生 WS 连接中断或 `previous_response_not_found`，且尚无语义事件 | 重连同一上游 | 内部重连一次并重放完整 transcript | 无需处理 |
+| 原生 WS 在提交可见事件前失败 | 切换到 HTTP/SSE 或另一个原生 WS 候选 | 内部切换并重放完整 transcript | 无需处理 |
+| 原生 WS 握手被拒绝或握手 EOF | 回退同渠道、同 Key、同 URL 的 HTTP/SSE | 内部回退并重放完整 transcript | 无需处理 |
+| HTTP/SSE | 下一候选是原生 WS | 发送 `502/server_error/upstream_unavailable`，随后以 close code `1011` 关闭下游 | 使用相同会话标识重连，并发送不带 `previous_response_id` 的完整会话输入 |
+
+原生 WS 的同一上游内部重连把 `response.created`、`response.queued` 和 `response.in_progress` 视为非语义事件，因此在这些事件之后仍可重连一次；其他事件都越过该重连边界。注意，这三个生命周期事件仍是已经提交给下游的可见事件，不能据此承诺继续跨候选切换。一旦文本、推理、工具调用或其他实际输出已经转发，ccLoad 不再切换或重放，避免重复输出、工具调用和费用。消息过大使用 close code `1009`，也不会故障切换。
+
+重连时必须使用相同的 API 令牌和稳定的 execution 请求头。`Session-Id` 表示顶层 Codex 会话；存在 `Thread-Id` 时，ccLoad 组合两个请求头建立身份，使主代理和每个子代理线程分别拥有独立的 transcript、Response ID 和 turn lock。没有 `Thread-Id` 的客户端继续使用原 `Session-Id` 契约。`prompt_cache_key`、请求体 `session_id` 及其他缓存路由提示不代表 execution session，不会触发本地串行，也不会共享本地会话状态。execution session 是单进程内存状态：新安装默认最多保留 256 个会话，进程级 transcript 有效载荷总预算为 256 MiB；已有数据库记录不迁移。空闲 TTL 继续默认 15 分钟（小内存机器可设为 10 分钟）。下游全部断开 5 分钟后，每分钟运行的清理器会关闭上游物理连接，因此实际回收时间约为 5–6 分钟，但会话 transcript 会继续保留到 TTL。稳定会话及其已提交 transcript 在 TTL 到期前绝不会因会话容量或内存预算压力被逐出。会话数达到上限时只拒绝新的会话身份，已有稳定会话仍可继续。已提交载荷超预算后，包括已有会话在内的所有新回合都会在触达上游前被拒绝。两类限制都通过 WebSocket `429/rate_limit_error/rate_limit` 事件返回；客户端应等待 TTL 回收后重试，或修改设置并重启。重启会丢失内存会话，因此客户端随后必须发送不带 `previous_response_id` 的完整会话输入。
+
+Transcript 预算是新工作准入阈值，不是严格分配上限：已经准入的回合允许完成并提交。除已配置预算外，有限的最坏超量为 `responses_ws_max_sessions × max_body_bytes`。进程重启不会恢复会话或累计会话指标。多实例部署必须使用粘性路由保证重连命中同一实例；否则客户端应发送不带 `previous_response_id` 的完整会话输入。会话数、TTL 和 transcript 预算可在系统设置中通过 `responses_ws_max_sessions`、`responses_ws_session_ttl_minutes`、`responses_ws_max_transcript_bytes` 调整。`GET /admin/runtime-metrics` 的 `transcript_bytes` 表示当前有效载荷字节数，不包含 Go 运行时、WebSocket 缓冲区和请求处理中临时对象的开销；同一响应还提供 WebSocket 拒绝、日志队列/落库失败，以及混合存储主库同步积压、失败、丢弃和最后成功时间。
+
+**Codex Alpha Search（仅原生透传）**：
+
+`POST /v1/alpha/search` 接收 Codex 原生搜索请求，`model` 字段可省略。该请求族没有本地转换路径：ccLoad 会在所有模型兼容渠道上尝试 Codex 原生端点，按 URL 缓存端点缺失结果，然后切换到下一个 URL 或渠道。
+
+```bash
+curl -X POST http://localhost:8080/v1/alpha/search \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer your-api-token" \
+  -d '{
+    "query": "golang channels"
+  }'
+```
+
+普通渠道 URL 会自动追加 `/v1/alpha/search`。精确 URL 需要设置 `exact: true`，且 `url` 已指向完整端点，例如 `{"url":"https://upstream.example.com/v1/alpha/search","exact":true,"protocols":["codex"]}`。转发前会移除 Responses 专用字段 `prompt_cache_key` 和 `prompt_cache_retention`。
+
 ### 本地 Token 计数
 
 发送请求前可用本地 Token 估算接口预估消耗，不调用上游 API：
@@ -593,26 +686,65 @@ curl -X POST http://localhost:8080/v1/messages/count_tokens \
 通过 Web 界面 `/web/channels.html` 或 API 管理渠道：
 
 ```bash
-# 添加渠道（支持多URL，逗号分隔）
+# 添加渠道，并逐 URL 声明协议能力
 curl -X POST http://localhost:8080/admin/channels \
   -H "Content-Type: application/json" \
   -d '{
     "name": "Claude-API",
     "api_key": "sk-ant-api03-xxx",
-    "url": "https://api.anthropic.com,https://api2.anthropic.com",
+    "urls": [
+      {"url": "https://api.anthropic.com", "protocols": ["anthropic"]},
+      {"url": "https://api2.anthropic.com"}
+    ],
+    "protocol_transform_mode": "auto",
     "priority": 10,
     "rpm_limit": 0,
     "max_concurrency": 0,
-    "models": ["claude-sonnet-4-6", "claude-opus-4-6"],
+    "models": [{"model": "claude-sonnet-4-6"}, {"model": "claude-opus-4-6"}],
     "enabled": true
   }'
 ```
 
-> **多URL说明**：`url` 字段支持逗号分隔的多个URL。系统会按延迟加权随机选择最优URL，故障URL自动冷却，实现同渠道内的URL级负载均衡与故障切换。
+**OpenAI 兼容上游示例**：
+
+```bash
+# 添加使用 OpenAI 线协议的渠道
+curl -X POST http://localhost:8080/admin/channels \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "OpenAI-Compatible",
+    "api_key": "sk-xxx",
+    "urls": [
+      {"url": "https://api.openai.com", "protocols": ["openai"]}
+    ],
+    "protocol_transform_mode": "auto",
+    "priority": 10,
+    "rpm_limit": 0,
+    "max_concurrency": 0,
+    "models": [{"model": "gpt-4o"}],
+    "enabled": true
+  }'
+```
+
+> 任何 OpenAI 兼容服务均可使用，只需把 `urls[].url` 改为它的 API 基础地址。不要包含 `/v1` 或具体端点路径，ccLoad 会按所选协议自动追加。`protocols: ["openai"]` 声明将该渠道作为 OpenAI 上游路由。
+
+> **协议行为说明**：每个 `urls` 条目可通过 `protocols` 声明 `anthropic`、`codex`、`openai`、`gemini` 能力，非空列表是权威配置。`upstream` 只直通客户端协议；`auto` 先尝试客户端协议，再按 OpenAI → Anthropic → Codex → Gemini 自动探测并跳过已试协议；`local` 优先显式声明的 URL 和配置顺序。`local` 下仅当全部 URL 都未声明时，才按 Anthropic → Codex → OpenAI → Gemini 尝试。
+
+> **多URL说明**：`urls` 是有序的 `{url, exact, protocols}` 对象数组。`exact: true` 表示该地址已经是完整上游请求 URL。系统按延迟加权选择 URL，并对故障 URL 独立冷却；local 模式会先把显式声明协议的 URL 稳定排到自动 URL 前面，各组内部顺序不变。
+
+> **模型条目说明**：`models` 的每个元素是 `{model, redirect_model, disabled}`。`redirect_model` 只改写发往上游的模型名，客户端仍按原名请求。`disabled: true` 表示该渠道彻底不提供这个模型——不再对外暴露、不参与精确/模糊匹配、也不再写入模型冷却，但条目本身保留。用 `replace` 模式刷新模型列表时，已有的停用标记会按原名、归一化别名和重定向目标三种方式回填到新拉取的条目上，因此刷新不会把手动停用的模型悄悄改回启用。
+
+> **独立 Key 中转回退**：当同一中转站下的不同 Key 实际对应不同服务商时，可在渠道编辑器的 **高级设置 → 其他** 中启用 **渠道故障优先换 Key**。遇到可重试的模型级或渠道级上游故障（如 5xx、连接错误、首字节超时）时，ccLoad 会先冷却当前 Key 并尝试本渠道的其他 Key，全部 Key 都不可用后才切换其他渠道。该选项默认关闭，保持原有的模型/渠道冷却行为。
 
 > **RPM限制说明**：`rpm_limit` 是渠道级请求数上限，按滚动 60 秒窗口统计；`0` 表示不限制。代理转发、手动测试、单 URL 测试和定时检测都会计入，达到上限后该渠道会被跳过；多 URL 故障重试按实际发出的上游 HTTP 请求计数。计数保存在当前进程内，服务重启会清空，多实例部署时各实例独立统计。
 
-> **并发限制说明**：`max_concurrency` 是渠道内每个 API Key 各自的同时在飞请求上限；`0` 表示不限制。槽位从发起上游请求前占用，到响应体关闭后释放，流式请求会占用到流结束。当前 Key 满载时会尝试同渠道的其他 Key，所有可用 Key 均满载时才跳过该渠道，且不触发冷却。因此多 Key 渠道的总并发最多可达到“可用 Key 数 × `max_concurrency`”。计数保存在当前进程内，多实例部署时各实例独立统计。
+> **并发限制说明**：`max_concurrency` 是渠道级同时在飞请求上限；`0` 表示不限制。槽位从发起上游请求前占用，到响应体关闭后释放，流式请求会占用到流结束；达到上限后该渠道会被跳过，不触发冷却。计数保存在当前进程内，多实例部署时各实例独立统计。
+
+#### Z.ai Coding Plan（ZCode）
+
+在渠道管理中选择 **Z.ai Coding Plan**，可完成浏览器授权，或直接导入已有的 Coding Plan API Key。提供商浏览器 OAuth 暂时不可用时，仍可通过 API Key 导入接入。
+
+ccLoad 会在创建或刷新渠道时优先读取账号的 Coding Plan 模型目录，失败后回退到 models.dev，最后才使用内置列表。渠道卡片也可刷新并展示 Coding Plan 的额度窗口。
 
 ### 自定义请求规则（高级）
 
@@ -678,9 +810,9 @@ curl -X POST -H "Authorization: Bearer your_token" \
 
 **CSV格式示例**:
 ```csv
-name,api_key,url,priority,models,enabled
-Claude-API-1,sk-ant-xxx,https://api.anthropic.com,10,"[\"claude-sonnet-4-6\"]",true
-Claude-API-2,sk-ant-yyy,https://api.anthropic.com,5,"[\"claude-opus-4-6\"]",true
+name,api_key,urls,priority,models,enabled
+Claude-API-1,sk-ant-xxx,"[{""url"":""https://api.anthropic.com"",""protocols"":[""anthropic""]}]",10,claude-sonnet-4-6,true
+Claude-API-2,sk-ant-yyy,"[{""url"":""https://api.anthropic.com""}]",5,claude-opus-4-6,true
 ```
 
 **特性**:
@@ -705,6 +837,7 @@ Claude-API-2,sk-ant-yyy,https://api.anthropic.com,5,"[\"claude-opus-4-6\"]",true
   - 对话模式支持图片上传与粘贴，直接验证多模态请求
   - 可切换思考等级、模型内置搜索与流式输出，观察协议转换后的真实响应
   - 对话记录可导出为 Markdown / HTML，方便留档和复盘
+  - 独立的图片生成标签页，可选 Images API 或 Chat Completions 生成图片，提示词在页面刷新后保留
 - ⚡ **性能指标** - 延迟、成功率，性能瓶颈无处藏
 - 💰 **Token用量统计** - 钱花哪了心里有数：
   - 自定义时间范围，想看哪段看哪段
@@ -727,11 +860,13 @@ ccLoad 使用的核心技术栈：
 
 | 组件 | 版本 | 用途 | 性能优势 |
 |------|------|------|----------|
-| **Go** | 1.25.0+ | 运行时环境 | 原生并发支持，内置 min 函数 |
+| **Go** | 1.26.0+ | 运行时环境 | 原生并发支持，现代工具链 |
 | **Gin** | v1.12.0 | Web框架 | 高性能HTTP路由 |
-| **modernc/sqlite** | v1.51.0 | 嵌入式数据库 | 纯Go实现，零CGO依赖，单文件存储（默认） |
+| **modernc/sqlite** | v1.54.0 | 嵌入式数据库 | 纯Go实现，零CGO依赖，单文件存储（默认） |
 | **MySQL** | v1.10.0 | 关系型数据库 | 可选，适合高并发生产环境 |
-| **Sonic** | v1.15.1 | JSON库 | 比标准库快2-3倍 |
+| **PostgreSQL (pgx)** | v5.10.0 | 关系型数据库 | 可选，支持 URL 和 libpq DSN |
+| **Sonic** | v1.15.2 | JSON库 | 比标准库快2-3倍 |
+| **gjson / sjson** | v1.19.0 / v1.2.5 | 协议 JSON 转换 | 定向读写字段，避免通用 map 转换 |
 | **godotenv** | v1.5.1 | 环境配置 | 简化配置管理 |
 
 ### 架构特点
@@ -754,42 +889,47 @@ ccLoad 使用的核心技术栈：
   - `admin_cooldown.go`：冷却管理API
   - `admin_csv.go`：CSV导入导出
   - `admin_types.go`：管理API类型定义
-  - `admin_auth_tokens.go`：API访问令牌CRUD（支持Token统计、费用限额、模型限制）
+  - `admin_auth_tokens.go`：API访问令牌CRUD（支持Token统计、费用限额、模型/渠道限制、并发限制）
   - `admin_settings.go`：系统设置管理
   - `admin_models.go`：模型列表管理
-  - `admin_testing.go`：渠道测试功能（支持协议转换测试）
+  - `admin_testing.go`：渠道测试功能（显式选择客户端请求协议）
   - `admin_debug_log.go`：调试日志API（敏感头脱敏+base64二进制编码）
   - `channel_check_scheduler.go`：渠道定时检测调度器
   - `detection_log.go`：检测日志构建（定时检测结果→LogEntry）
-- **协议转换系统**（2026-04新增）：
+- **协议转换系统**：
   - `protocol/types.go`：四大协议定义（Anthropic/OpenAI/Gemini/Codex）
-  - `protocol/registry.go`：请求/响应转换器注册表
-  - `protocol/builtin/`：18个内置转换实现（支持流式与非流式）
-  - 保留采样/上限/停止词/seed 参数；Gemini `thinkingConfig.thinkingLevel` 会映射为目标协议的 reasoning/thinking 配置
-  - 两种模式：`upstream`（默认，由上游原生处理）/ `local`（本地翻译）
-  - 渠道配置：`ProtocolTransformMode` + `ProtocolTransforms`
+  - `protocol/registry.go`：请求、流式响应和非流式响应的契约边界；同协议请求不进入转换
+  - `protocol/builtin/register.go`：注册全部 12 个跨协议有向组合
+  - `protocol/builtin/cliproxy_adapter.go`：ccLoad 自有的输入验证、JSON/SSE 规范化与流帧封装
+  - `protocol/cliproxy/`：仓库内维护的纯 [CLIProxyAPI](https://github.com/caidaoli/CLIProxyAPI) 四协议核心及 allowlist provider 请求/响应适配器快照边界；来源、同步规则和 provider 实际导入状态见 [`UPSTREAM.md`](internal/protocol/cliproxy/UPSTREAM.md)
+  - 上游同步入口：Codex 调 `$sync-cliproxy-core`，Claude Code 调 `/sync-cliproxy-core`；一次原子操作固定一个 commit，同时同步核心和全部已登记 provider adapter
+  - 无法表示为目标协议的请求返回 `400 Bad Request`，不会触发渠道故障切换或冷却
+  - 每个渠道默认接受 Anthropic、Codex、OpenAI、Gemini 客户端；实际上游协议能力属于结构化 URL
+  - 显式协议声明直接选路，不兼容 URL 不发请求、不冷却地跳过；自动模式先试客户端协议，再按 OpenAI → Anthropic → Codex → Gemini 回落并跳过已试协议；local 模式仅在全部 URL 未声明时按 Anthropic → Codex → OpenAI → Gemini 回落
+  - 自动检测仅在未提交响应的 HTTP 400、非模型 404/405、结构化 `convert_request_failed` + `not implemented` 500，或请求到达 API 前的 Cloudflare 403 拦截页后本地转换；未声明协议的 Exact URL 跨协议直接转换
 - **冷却管理器**（DRY原则）：
   - `cooldown/manager.go`：统一冷却决策引擎
   - 消除重复代码，冷却逻辑统一管理
   - 区分网络错误和HTTP错误的分类策略
-  - 识别结构化配额/模型冷却响应，按上游返回的重置时间精确冷却
-  - 内置单Key渠道自动升级逻辑
+  - Key/模型/渠道使用独立动作；`ActionRetryModel` 不再尝试同渠道其他 Key 或 URL
+  - 结构化 `model_cooldown`、上游 HTTP 5xx、Key 级 429 限流、模型不可用 404 和明确表示模型退役的 410 按 `(channel_id, 实际上游模型)` 持久化，同渠道其他模型仍可选
+  - 所有配置模型或所有启用 Key 均冷却时，自动升级为渠道冷却
 - **多URL选择器**（URLSelector）：
   - `url_selector.go`：单渠道多URL智能调度
   - 探索优先：未访问过的URL优先尝试，确保收集延迟数据
   - 加权随机：权重=1/EWMA延迟，延迟低的URL自动多分流
   - 独立冷却：故障URL指数退避，不影响同渠道其他URL
   - BaseURL追踪：活跃请求、日志和UI全链路携带上游URL
-- **存储层重构**（2025-12优化，消除467行重复代码）：
-  - `storage/schema/`：统一Schema定义（支持SQLite/MySQL差异）
-  - `storage/sql/`：通用SQL实现层（SQLite/MySQL共享）
+- **存储层重构**（消除467行重复代码）：
+  - `storage/schema/`：统一Schema定义（支持 SQLite/MySQL/PostgreSQL 差异）
+  - `storage/sql/`：SQLite、MySQL 和 PostgreSQL 共享的通用 SQL 实现层
   - `storage/factory.go`：工厂模式自动选择数据库
   - 复合索引优化，统计查询性能提升
-- **OpenAI service_tier 定价**（2026-03新增）：
+- **OpenAI service_tier 定价**：
   - `util.OpenAIServiceTierMultiplier()`：返回 priority/flex/default 层级对应倍率
   - `LogEntry.ServiceTier`：持久化到数据库，日志成本列显示层级标注
   - 支持 GPT-5.4、GPT-5.4-pro 等最新模型定价
-- **Responses image_generation 工具计费**（2026-05新增）：
+- **Responses image_generation 工具计费**：
   - 解析 Responses API 的 `tool_usage.image_gen` 与 `image_generation` 工具模型
   - `gpt-image-2` 按文本输入、图像输入、图像输出 token 分项计费
   - 流式/非流式代理链路与渠道测试共用同一 usage 解析器，避免费用口径漂移
@@ -802,7 +942,7 @@ ccLoad 使用的核心技术栈：
 **多级缓存系统**:
 - 渠道配置缓存（60秒TTL）- 减少数据库查询
 - 轮询指针缓存（内存）- 毫秒级选择
-- 冷却状态内联（直接存表）- 无需JOIN，速度飞起
+- 渠道/Key 冷却内联在 `channels` / `api_keys`，模型冷却独立存入 `channel_model_cooldowns`
 - 错误分类缓存（1000容量）- 重复错误秒判
 
 **异步处理架构**:
@@ -825,102 +965,145 @@ ccLoad 使用的核心技术栈：
 
 ### 环境变量
 
+环境变量只承载引导期配置——ccLoad 在数据库连接建立之前就需要的值。启动之后的策略类配置（限额、冷却时长、超时、健康度排序等）是系统设置，在管理界面修改。特别地，`SQLITE_PATH`、`SQLITE_JOURNAL_MODE`、`CCLOAD_MYSQL`、`CCLOAD_POSTGRES`、`CCLOAD_ENABLE_SQLITE_REPLICA` 和 `CCLOAD_SQLITE_LOG_DAYS` 决定的是*数据库怎么打开*，因此不可能存在那个数据库里，会一直保持为环境变量。
+
 | 变量名 | 默认值 | 说明 |
 |--------|--------|------|
 | `CCLOAD_PASS` | 无 | 管理界面密码（**必填**，未设置将退出） |
 | `CCLOAD_API_TOKENS` | 无 | 启动时预置 API 访问令牌，格式：`token1,token2` 或 `token1\|生产,token2\|开发`；已存在的 token 不会被覆盖 |
 | `API_TOKENS` | 无 | `CCLOAD_API_TOKENS` 的兼容别名；两个变量同时设置且值不一致时启动失败 |
-| `CCLOAD_MYSQL` | 无 | MySQL DSN（可选，格式: `user:pass@tcp(host:port)/db?charset=utf8mb4`）<br/>**设置后使用 MySQL，否则使用 SQLite** |
-| `CCLOAD_ENABLE_SQLITE_REPLICA` | `0` | 混合存储模式开关（`1`=启用，见下方说明） |
-| `CCLOAD_SQLITE_LOG_DAYS` | `7` | 混合模式启动时从 MySQL 恢复日志的天数（-1=全量，0=不恢复日志） |
+| `CCLOAD_MYSQL` | 无 | MySQL DSN（可选，格式: `user:pass@tcp(host:port)/db?charset=utf8mb4`）<br/>**与 `CCLOAD_POSTGRES` 互斥** |
+| `CCLOAD_POSTGRES` | 无 | PostgreSQL DSN（可选，支持 URL 或 libpq 关键字，例如 `postgres://user:pass@host:5432/db?sslmode=disable`）<br/>**与 `CCLOAD_MYSQL` 互斥** |
+| `CCLOAD_ENABLE_SQLITE_REPLICA` | `0` | 混合存储模式开关（`1`=启用，需要 MySQL 或 PostgreSQL 主库 DSN） |
+| `CCLOAD_SQLITE_LOG_DAYS` | `7` | 混合模式 SQLite 日志为空时的首次导入天数（-1=全量）；`0` 关闭所有启动日志导入，其他值在后续启动只导入 SQLite 最后时间之后的日志 |
 | `CCLOAD_ALLOW_INSECURE_TLS` | `0` | 禁用上游 TLS 证书校验（`1`=启用；⚠️仅用于临时排障/受控内网环境） |
 | `PORT` | `8080` | 服务端口 |
 | `GIN_MODE` | `release` | 运行模式（`debug`/`release`） |
 | `GIN_LOG` | `true` | Gin 访问日志开关（`false`/`0`/`no`/`off` 关闭） |
 | `TRUSTED_PROXIES` | 私有网段 + Loopback + `100.64.0.0/10` | 可信代理 CIDR 列表（逗号分隔）；`none`=不信任任何代理 |
-| `SQLITE_PATH` | `data/ccload.db` | SQLite 数据库文件路径（仅 SQLite 模式） |
+| `SQLITE_PATH` | `data/ccload.db` | SQLite 数据库文件路径（纯 SQLite 与混合模式） |
 | `SQLITE_JOURNAL_MODE` | `WAL` | SQLite Journal 模式（WAL/TRUNCATE/DELETE 等，容器环境建议 TRUNCATE） |
-| `CCLOAD_MAX_CONCURRENCY` | `1000` | 最大并发请求数（限制同时处理的代理请求数量） |
-| `CCLOAD_MAX_BODY_BYTES` | `10485760` | 请求体最大字节数（10MB，Images API自动放宽至20MB） |
-| `CCLOAD_COOLDOWN_AUTH_SEC` | `300` | 认证错误(401/402/403)初始冷却时间（秒） |
-| `CCLOAD_COOLDOWN_SERVER_SEC` | `120` | 服务器错误(5xx)初始冷却时间（秒） |
-| `CCLOAD_COOLDOWN_TIMEOUT_SEC` | `60` | 超时错误(597/598)初始冷却时间（秒） |
-| `CCLOAD_COOLDOWN_RATE_LIMIT_SEC` | `60` | 限流错误(429)初始冷却时间（秒） |
-| `CCLOAD_COOLDOWN_MAX_SEC` | `1800` | 指数退避冷却上限（秒，30分钟） |
-| `CCLOAD_COOLDOWN_MIN_SEC` | `10` | 指数退避冷却下限（秒） |
 | `CCLOAD_HOST_OVERRIDES` | 无 | DNS 覆盖：将上游域名钉到固定 IP，绕过 DNS 解析。格式：`host1=ip1,host2=ip2`，例如 `anyrouter.top=47.246.23.200`。不影响 TLS SNI/证书/Host 头 |
 
 > 如果你的服务挂在反向代理或负载均衡后面，建议显式设置 `TRUSTED_PROXIES`，避免伪造 `X-Forwarded-For` 干扰客户端 IP 识别和登录限速。
+> 可通过 `GET /admin/runtime-metrics` 查看 Responses WebSocket、日志队列/落库失败，以及混合存储主库待同步、失败、丢弃与最后成功时间。
 
-#### 混合存储模式（MySQL 主 + SQLite 缓存）
+#### 混合存储模式（SQLite 权威库 + 主库异步副本）
 
-HuggingFace Spaces 等环境重启后本地数据会丢失，但免费 MySQL 查询延迟较高（800ms+）。混合模式两全其美：
+HuggingFace Spaces 等环境重启后本地数据会丢失，远程 MySQL/PostgreSQL 又可能存在网络延迟。混合模式兼顾持久化和本地读性能：
 
-- **MySQL 主存储**：写操作先写 MySQL，确保数据持久化
-- **SQLite 本地缓存**：读操作走本地 SQLite，延迟 <1ms
-- **启动恢复**：从 MySQL 恢复数据到 SQLite，支持按天数恢复日志
-- **日志特殊处理**：先写 SQLite（快），再异步同步到 MySQL（备份）
+- **SQLite 权威库**：配置、凭据、Key、冷却、设置和日志都同步读写本地 SQLite；SQLite 成功就是请求成功
+- **主库异步副本**：进程内 worker 按实体合并最终状态；失败任务等待 10 秒后重试，主库慢或临时故障不阻塞请求；脏实体过多时折叠为一次全量状态对账，避免内存无界增长
+- **启动语义**：SQLite 文件首次创建时从主库导入配置；`CCLOAD_SQLITE_LOG_DAYS=0` 关闭启动日志导入，否则每次启动都要求主库可用，已有日志时只从主库增量导入 `time > MAX(sqlite.logs.time)` 的尾部，日志为空时才按该变量限制导入窗口；已有 SQLite 配置和日志都不会被删除覆盖
+- **日志语义**：主库日志与日志清理只做一次 best-effort 尝试，不进入 10 秒重试；较慢时新批次会替换旧批次并计入 dropped，允许主库日志缺失
+- **健康检查**：只检查权威 SQLite；主库同步状态通过 runtime metrics 观察
+- **仅本地数据**：Web Session 与原始 DebugData 只保存在当前实例的 SQLite
+- **明确边界**：这是单实例、单写者方案。进程重启会丢失尚在内存中的同步任务，不使用 outbox，也不支持多实例混合写
 
 ```bash
-# 启用混合模式
+# MySQL 主库
 export CCLOAD_MYSQL="user:pass@tcp(host:3306)/db?charset=utf8mb4"
 export CCLOAD_ENABLE_SQLITE_REPLICA=1
-export CCLOAD_SQLITE_LOG_DAYS=7  # 恢复最近 7 天日志（可选）
+export CCLOAD_SQLITE_LOG_DAYS=7  # SQLite 日志为空时先导入最近 7 天，后续启动只补尾部日志
+
+# 或 PostgreSQL 主库
+export CCLOAD_POSTGRES="postgres://user:pass@host:5432/db?sslmode=disable"
+export CCLOAD_ENABLE_SQLITE_REPLICA=1
 ```
 
-**三种存储模式**：
+**存储模式**：
 | 模式 | 配置 | 适用场景 |
 |------|------|---------|
-| 纯 SQLite | 不设置 `CCLOAD_MYSQL` | 本地开发、单机部署 |
+| 纯 SQLite | 不设置主库 DSN | 本地开发、单机部署 |
 | 纯 MySQL | 设置 `CCLOAD_MYSQL` | 标准生产环境 |
-| 混合模式 | 设置 `CCLOAD_MYSQL` + `CCLOAD_ENABLE_SQLITE_REPLICA=1` | HuggingFace Spaces |
+| 纯 PostgreSQL | 设置 `CCLOAD_POSTGRES` | PostgreSQL 生产环境 |
+| 混合模式 | 主库 DSN + `CCLOAD_ENABLE_SQLITE_REPLICA=1` | HuggingFace Spaces / 高延迟主库 |
 
-### Web 管理配置（支持热重载）
+### Web 管理配置（数据库存储，保存后自动重启）
 
-这些配置可在 Web 界面修改，保存后立即生效，无需重启：
+这些配置存在数据库中，在 Web 界面 `/web/settings.html` 修改。保存会先写库，随后约 2 秒自动重启进程——重启本身就是生效机制，因此没有热重载，进行中的请求会先跑完再退出：
 
 | 配置项 | 默认值 | 说明 |
 |--------|--------|------|
 | `log_retention_days` | `7` | 日志保留天数（-1永久保留，1-365天） |
 | `max_key_retries` | `3` | 单个渠道内最大Key重试次数 |
-| `upstream_first_byte_timeout` | `0` | 上游首个有效流内容超时（秒，0=禁用，仅流式） |
+| `max_concurrency` | `1000` | 最大并发请求数，限制同时处理的代理请求数量 |
+| `http_read_timeout_seconds` | `0` | 下游请求读取超时（秒）；`0` 使用内建 120 秒。覆盖请求头和请求体的完整读取，超时返回 408，与请求体大小限制独立。 |
+| `max_body_bytes` | `10485760` | 请求体最大字节数，默认 10MB |
+| `max_image_body_bytes` | `20971520` | Images API 请求体最大字节数，默认 20MB |
+| `cooldown_auth_seconds` | `300` | 认证错误（401/402/403）初始冷却时间（秒） |
+| `cooldown_server_seconds` | `120` | 服务器错误（5xx）初始冷却时间（秒） |
+| `cooldown_timeout_seconds` | `60` | 超时错误（597/598）初始冷却时间（秒） |
+| `cooldown_rate_limit_seconds` | `60` | 限流错误（429）初始冷却时间（秒） |
+| `codex_map_429_to_503` | `false` | 将返回给官方 Codex 客户端的最终上游 429 映射为 503，使其按 5xx 重试；不影响其他 Responses 客户端和 ccLoad 自身限额 |
+| `cooldown_min_seconds` | `10` | 指数退避冷却下限（秒） |
+| `cooldown_max_seconds` | `1800` | 指数退避冷却上限（秒；下限大于上限时整对回退默认值） |
+| `cooldown_fallback_enabled` | `true` | 所有渠道都在冷却时，兜底选取「最早恢复」的渠道继续服务（Key 同样选最早恢复的）；设为 `false` 则直接拒绝请求 |
+| `global_cooldown_detection_rules` | `{}` | 全局冷却探测规则，渠道未配置自身 `cooldown_detection_rules` 时继承 |
+| `upstream_connection_reuse_limit_seconds` | `0` | 上游连接最长复用时间（秒，`0`=不限制）；统一约束 HTTP/1.1、HTTP/2 和 WebSocket，达到时限后不再接收新请求，在途请求跑完再关闭，下次按需重连 |
+| `upstream_first_byte_timeout` | `0` | 流式请求首个有效内容超时（秒，0=禁用） |
+| `stream_timeout` | `0` | 流式请求总超时（秒，0=禁用） |
 | `non_stream_timeout` | `120` | 非流式请求超时（秒，0=禁用） |
-| `anthropic_first_byte_timeout` | `0` | Anthropic 上游首个有效流内容超时（秒，0=使用全局 `upstream_first_byte_timeout`） |
+| `anthropic_first_byte_timeout` | `0` | Anthropic 流式请求首个有效内容超时（秒，0=使用全局 `upstream_first_byte_timeout`） |
 | `anthropic_non_stream_timeout` | `0` | Anthropic 非流式请求超时（秒，0=使用全局 `non_stream_timeout`） |
-| `codex_first_byte_timeout` | `0` | Codex 上游首个有效流内容超时（秒，0=使用全局 `upstream_first_byte_timeout`） |
+| `codex_first_byte_timeout` | `0` | Codex 流式请求首个有效内容超时（秒，0=使用全局 `upstream_first_byte_timeout`） |
 | `codex_non_stream_timeout` | `0` | Codex 非流式请求超时（秒，0=使用全局 `non_stream_timeout`） |
-| `openai_first_byte_timeout` | `0` | OpenAI 上游首个有效流内容超时（秒，0=使用全局 `upstream_first_byte_timeout`） |
+| `openai_first_byte_timeout` | `0` | OpenAI 流式请求首个有效内容超时（秒，0=使用全局 `upstream_first_byte_timeout`） |
 | `openai_non_stream_timeout` | `0` | OpenAI 非流式请求超时（秒，0=使用全局 `non_stream_timeout`） |
-| `gemini_first_byte_timeout` | `0` | Gemini 上游首个有效流内容超时（秒，0=使用全局 `upstream_first_byte_timeout`） |
+| `gemini_first_byte_timeout` | `0` | Gemini 流式请求首个有效内容超时（秒，0=使用全局 `upstream_first_byte_timeout`） |
 | `gemini_non_stream_timeout` | `0` | Gemini 非流式请求超时（秒，0=使用全局 `non_stream_timeout`） |
 | `enable_health_score` | `false` | 启用基于健康度的渠道动态排序 |
 | `success_rate_penalty_weight` | `100` | 成功率惩罚权重（见下方说明） |
 | `health_score_window_minutes` | `30` | 成功率统计时间窗口（分钟） |
 | `health_score_update_interval` | `30` | 成功率缓存更新间隔（秒） |
 | `health_min_confident_sample` | `20` | 置信样本量阈值（样本量达到此值时惩罚全额生效） |
-| `channel_check_interval_hours` | `0` | 渠道定时检测间隔（小时，0=禁用） |
-| `auto_update_interval_hours` | `12` | 自动更新检测间隔（小时，0=禁用，启用时最低 1 小时） |
+| `enable_ttfb_score` | `false` | 启用渠道首字相对延迟惩罚，需同时开启 `enable_health_score` |
+| `ttfb_penalty_weight` | `20` | 首字惩罚权重（平均首字为候选中位数 2 倍且满置信度时的惩罚值） |
+| `ttfb_max_slow_ratio` | `2` | 首字相对慢速比上限（`平均首字 / 候选中位首字 - 1`） |
+| `ttfb_min_confident_sample` | `10` | 首字置信样本量阈值 |
+| `channel_check_interval_hours` | `5` | 渠道定时检测间隔（小时，支持小数，0=禁用） |
+| `model_catalog_sync_interval_hours` | `6` | 每 6 小时从 models.dev 同步模型目录；`0` 禁用网络同步。启动时使用最近一次成功的缓存，失败时回退内嵌目录；渠道 `cost_multiplier` 仍然适用。 |
+| `auto_update_interval_hours` | `12` | 非容器部署的版本检查间隔（小时，0=禁用，启用时最低 1 小时）；容器中不可用 |
+| `auto_update_channel` | `stable` | 非容器部署的发布渠道：`stable` 只接收稳定版；`preview` 同时接收稳定版和测试版，并选择语义版本最高者；容器中不可用 |
+| `model_fuzzy_match` | `false` | 模型名精确匹配未命中时，回退到子串匹配 + 版本排序 |
+| `responses_ws_max_connections` | `128` | 下游 Responses WebSocket 全局最大并发连接数；`0` 使用内建默认值 |
+| `responses_ws_max_connections_per_token` | `64` | 单个认证 Token 的下游 Responses WebSocket 最大并发连接数；`0` 使用内建默认值 |
+| `responses_ws_max_sessions` | `256` | 整个进程保留的 Responses WebSocket 执行会话数上限；`0` 使用内建默认值 |
+| `responses_ws_session_ttl_minutes` | `15` | 空闲执行会话保留时长（分钟）；`0` 使用内建默认值 |
+| `responses_ws_max_transcript_bytes` | `268435456` | 整个进程保留的 transcript 有效载荷总预算（256 MiB）；`0` 使用内建默认值 |
+| `debug_log_enabled` | `false` | 记录上游请求/响应调试日志 |
+| `debug_log_retention_minutes` | `2` | 调试日志保留时长（分钟） |
 
 分协议超时按“实际转发到的上游协议”生效：协议转换后转发到 OpenAI，就读取 `openai_*_timeout`；对应值为 `0` 时回退全局超时。
 
 #### 自动更新
 
-ccLoad 支持程序内自动更新，默认每 12 小时检查一次 GitHub Releases。发现新版本后会下载并校验对应平台的二进制文件，等待服务空闲后重启生效。可以在 Web 管理后台的设置页修改 `auto_update_interval_hours`；设置为 `0` 可关闭自动更新检测。
+非容器部署由单一更新管理器负责版本检查、前端版本提示和可选的进程内自动更新。默认启动时检查一次，此后每 12 小时检查一次。`auto_update_channel=stable` 只接收稳定版；`preview` 同时考虑稳定版和测试版，按 SemVer 选择最高有效版本，不会把当前版本或待重启版本降级。两个设置都可以在 Web 管理后台修改；将 `auto_update_interval_hours` 设为 `0` 可关闭全部版本检查。
 
-#### 健康度排序说明
+稳定版元数据通过配置的发布源解析。测试版发现读取 GitHub Releases Atom feed，其中包含稳定版和测试版，无需使用受速率限制的 REST API。解析出精确 Tag 后，ccLoad 会从配置的下载源获取该 Tag 的二进制及校验文件；默认顺序是 `gh.monlor.com`、`fastgit.cc`、`ghfast.top` 和 GitHub，SHA256 匹配后才替换。
 
-启用健康度排序后，低成功率渠道会自动降低有效优先级：
+官方容器不运行版本检查或进程内更新循环。每个稳定版和 Beta 镜像都直接包含对应 GitHub Release 生成的同版本二进制。稳定版发布精确版本 Tag 和 `latest`，Beta 发布精确测试版 Tag 和滚动 `beta` 别名。修改 Compose 中的镜像标签后，重新拉取并启动容器即可切换版本。
 
-启用 `enable_health_score` 后，系统会根据渠道的历史成功率动态调整优先级，成功率低的渠道优先级自动降低：
+如需使用私有发布镜像，可将 `CCLOAD_RELEASE_BASE_URL` 设置为完整的 latest-download 地址，例如 `https://mirror.example/caidaoli/ccLoad/releases/latest/download`。显式设置后，稳定版元数据和全部发布文件下载都不会追加内置回退源；测试版元数据仍从 GitHub Releases Atom feed 获取。该变量不会设置 `HTTP_PROXY` 或 `HTTPS_PROXY`，因此不会让业务渠道请求经过下载代理。
+
+#### 渠道动态排序说明
+
+启用 `enable_health_score` 后，ccLoad 会根据近期渠道健康数据计算有效优先级。成功率惩罚始终参与计算；只有同时设置 `enable_ttfb_score=true` 时，才叠加首字相对延迟惩罚：
 
 ```
-置信度 = min(1.0, 样本量 / health_min_confident_sample)
-有效优先级 = 基础优先级 - (失败率 × success_rate_penalty_weight × 置信度)
+失败置信度 = min(1.0, 样本量 / health_min_confident_sample)
+失败惩罚 = 失败率 × success_rate_penalty_weight × 失败置信度
+
+相对慢速比 = clamp(平均首字 / 当前候选渠道首字中位数 - 1, 0, ttfb_max_slow_ratio)
+首字置信度 = min(1.0, 首字样本量 / ttfb_min_confident_sample)
+首字惩罚 = 相对慢速比 × ttfb_penalty_weight × 首字置信度
+
+有效优先级 = 基础优先级 - 失败惩罚 - 首字惩罚
 ```
 
-**置信度因子**：解决新渠道或低流量渠道因样本量小导致的过度惩罚问题。样本量越小，置信度越低，惩罚打折越多。
+**置信度因子**用于避免新渠道或低流量渠道因少量样本被全额惩罚。首字排序只统计成功请求，并与当前候选渠道的首字中位数比较；达到或快于中位数的渠道不受首字惩罚，少于两个候选渠道有有效首字数据时不启用该项惩罚。
 
-**示例**（`success_rate_penalty_weight = 100`，`health_min_confident_sample = 20`）：
+**仅成功率惩罚示例**（`enable_ttfb_score=false`，`success_rate_penalty_weight = 100`，`health_min_confident_sample = 20`）：
 
 | 渠道 | 基础优先级 | 成功率 | 样本量 | 置信度 | 惩罚值 | 有效优先级 |
 |------|-----------|--------|--------|--------|--------|-----------|
@@ -960,9 +1143,11 @@ ccLoad 支持程序内自动更新，默认每 12 小时检查一次 GitHub Rele
 - 预置完成后如不再需要自动恢复，可从部署配置中移除 `CCLOAD_API_TOKENS`
 - 限制容器 inspect、编排平台控制台和部署配置的访问权限
 
-**令牌高级功能**（2026-01新增）：
-- **费用限额**：为每个令牌设置费用上限（美元），超限后拒绝请求返回 429
+**令牌高级功能**：
+- **费用限额**：通过 `cost_limit_usd`、`cost_daily_limit_usd`、`cost_monthly_limit_usd` 分别设置总、日、月费用上限（美元）；`0` 表示不限制。任一已启用限额达到上限即返回 429；设置费用限额时还必须将 `max_concurrency` 设为正数。
 - **模型限制**：限制令牌可访问的模型列表，增强访问控制
+- **渠道限制**：`allowed_channel_ids` 配合 `channel_restriction_mode`——`allow` 为白名单，`deny` 为黑名单；两种模式下空列表均表示不限制
+- **并发限制**：`max_concurrency` 限制单令牌同时在飞的请求数（`0`=不限制）
 - **首字节时间**：记录流式请求的 TTFB（毫秒），便于诊断上游延迟
 
 #### 行为摘要
@@ -981,9 +1166,11 @@ ccLoad 支持程序内自动更新，默认每 12 小时检查一次 GitHub Rele
 - **镜像仓库**：`ghcr.io/caidaoli/ccload`
 - **可用标签**：
   - `latest` - 最新稳定版本
-  - `v2.44.1` - 具体发布版本，和 GitHub Release Tag 保持一致
+  - `beta` - 最新 Beta 版本
+  - `v2.44.1` - 精确稳定版本，和 GitHub Release Tag 保持一致
+  - `vX.Y.Z-beta.N` - 精确 Beta 版本，和 GitHub Prerelease Tag 保持一致
 
-官方 GHCR 镜像基于 Alpine。容器启动时会从 GitHub Releases 下载最新 Linux 二进制；程序启动后的更新检测由 ccLoad 自身的自动更新机制处理。默认检测间隔为 12 小时，可在 Web 管理后台通过 `auto_update_interval_hours` 修改。
+官方 GHCR 镜像基于 Alpine，并保持不可变：每次发布都将已经通过测试的 `ccload-linux-amd64` 和 `ccload-linux-arm64` GitHub Release 二进制直接打进同版本多架构镜像。精确版本 Tag 是不可变发布引用；`latest` 和 `beta` 分别滚动指向最新稳定版和 Beta。容器不检查发布版本，也不在进程内替换二进制；拉取精确版本 Tag 或所需滚动别名后重建容器即可更新。
 
 ### 镜像标签说明
 
@@ -993,6 +1180,13 @@ docker pull ghcr.io/caidaoli/ccload:latest
 
 # 拉取指定版本
 docker pull ghcr.io/caidaoli/ccload:v2.44.1
+
+# 拉取最新 Beta；要锁定版本时将 beta 替换为已发布的 vX.Y.Z-beta.N Tag
+docker pull ghcr.io/caidaoli/ccload:beta
+
+# 使用 Compose 时，将 image 改为 :latest 或 :beta 后应用变更
+docker compose pull
+docker compose up -d
 
 # 指定架构（Docker 通常自动选择）
 docker pull --platform linux/amd64 ghcr.io/caidaoli/ccload:latest
@@ -1008,10 +1202,10 @@ docker pull --platform linux/arm64 ghcr.io/caidaoli/ccload:latest
 storage/
 ├── store.go         # Store 接口（统一契约）
 ├── factory.go       # NewStore() 自动选择数据库
-├── schema/          # 统一 Schema 定义层（2025-12 新增）
+├── schema/          # 统一 Schema 定义层
 │   ├── tables.go    # 表结构定义（DefineXxxTable 函数）
-│   └── builder.go   # Schema 构建器（支持 SQLite/MySQL 差异）
-├── sql/             # 通用 SQL 实现层（2025-12 重构，消除 467 行重复代码）
+│   └── builder.go   # Schema 构建器（支持 SQLite/MySQL/PostgreSQL 差异）
+├── sql/             # 通用 SQL 实现层（消除 467 行重复代码）
 │   ├── store_impl.go      # SQLStore 核心实现
 │   ├── config.go          # 渠道配置 CRUD
 │   ├── apikey.go          # API 密钥 CRUD
@@ -1023,31 +1217,34 @@ storage/
 │   ├── metrics_finalize.go    # 终结化处理
 │   ├── auth_tokens.go         # API 访问令牌
 │   ├── auth_token_stats.go    # 令牌统计
-│   ├── admin_sessions.go  # 管理会话
+│   ├── web_sessions.go    # 带角色与 Token 作用域的 Web 会话
 │   ├── system_settings.go # 系统设置
 │   └── helpers.go         # 辅助函数
 └── sqlite/          # SQLite 特定（仅测试文件）
 ```
 
 **数据库选择逻辑**:
-- 设置 `CCLOAD_MYSQL` 环境变量 → 使用 MySQL
-- 未设置 → 使用 SQLite（默认）
+- 设置 `CCLOAD_MYSQL` → 使用 MySQL 主库（与 `CCLOAD_POSTGRES` 同时设置时启动失败）
+- 设置 `CCLOAD_POSTGRES` → 使用 PostgreSQL 主库
+- 两者都未设置 → 使用 SQLite（默认）
+- 主库 DSN + `CCLOAD_ENABLE_SQLITE_REPLICA=1` → 混合模式
 
-**核心表结构**（SQLite 和 MySQL 共用）:
-- `channels` - 渠道配置（冷却数据内联，UNIQUE 约束 name，含协议转换配置、定时检测配置、RPM/单 Key 并发限制配置）
+**核心表结构**（SQLite / MySQL / PostgreSQL 共用）:
+- `channels` - 渠道配置（渠道级冷却内联，UNIQUE 约束 name，含上游协议、定时检测配置、RPM/并发限制配置）
 - `api_keys` - API 密钥（Key 级冷却内联，支持多 Key 策略）
+- `channel_model_cooldowns` - 模型级运行时冷却，主键为渠道和实际上游模型
 - `logs` - 请求日志（含base_url上游URL追踪）
 - `debug_logs` - 调试日志（上游请求/响应原始数据，独立清理策略）
 - `key_rr` - 轮询指针（channel_id → idx）
-- `auth_tokens` - 认证令牌（支持费用限额、模型限制、首字节时间记录）
-- `admin_sessions` - 管理会话
-- `system_settings` - 系统配置（支持热重载）
+- `auth_tokens` - 认证令牌（支持费用限额、模型/渠道限制、并发限制、首字节时间记录）
+- `web_sessions` - 可绑定 API Token 的角色化 Web 会话
+- `system_settings` - 系统配置（数据库存储，保存后自动重启生效）
 
-**架构特性** (✅ 2025-12月 ~ 2026-04月持续优化):
-- ✅ **统一SQL层**（重构）：SQLite/MySQL共享`storage/sql/`实现，消除467行重复代码
+**架构特性**:
+- ✅ **统一SQL层**（重构）：SQLite、MySQL 和 PostgreSQL 共享 `storage/sql/` 实现
 - ✅ **统一Schema定义**（新增）：`storage/schema/`定义表结构，支持数据库差异
 - ✅ 工厂模式统一接口（OCP 原则，易扩展新存储）
-- ✅ 冷却数据内联（废弃独立 cooldowns 表，减少 JOIN 开销）
+- ✅ 渠道/Key 冷却数据内联；模型冷却独立存储，避免单模型不可用时冷却整个渠道
 - ✅ 性能索引优化（渠道选择延迟↓30-50%，Key 查找延迟↓40-60%）
 - ✅ 复合索引优化（统计查询性能提升）
 - ✅ 外键约束（级联删除，保证数据一致性）
@@ -1058,11 +1255,11 @@ storage/
 - ✅ **Responses 图像工具成本计量**：`image_generation` 工具调用费用并入日志、统计和限额口径
 - ✅ **分层定价引擎**：GPT-5.4/Qwen-Plus/Gemini 长上下文阶梯计价
 - ✅ **日志体验优化**：成本格式化精度提升（3位小数/空值空串），IP列悬停显示完整地址
-- ✅ **协议转换系统**：Anthropic/OpenAI/Gemini/Codex四协议互转，upstream/local两种模式
+- ✅ **协议转换系统**：Anthropic/OpenAI/Gemini/Codex 四协议互转，支持 auto/upstream/local 三种模式
 - ✅ **调试日志**：上游请求/响应原始数据捕获，敏感头脱敏，独立清理策略
 - ✅ **渠道定时检测**：后台定时探测渠道可用性，支持指定检测模型
 - ✅ **渠道RPM限制**：每渠道滚动60秒请求数上限，`0` 表示无限制，超限自动跳过该渠道
-- ✅ **单 Key 并发限制**：渠道内每个 Key 独立限制同时在飞请求数，`0` 表示无限制，满载时自动尝试其他 Key
+- ✅ **渠道并发限制**：每渠道同时在飞请求数上限，`0` 表示无限制，超限自动跳过该渠道
 
 **向后兼容迁移**:
 - 自动检测并修复重复渠道名称
@@ -1077,7 +1274,7 @@ storage/
 - 生产环境**务必**设置强密码 `CCLOAD_PASS`，别用123456
 - 在Web界面 `/web/tokens.html` 配好API令牌，保护你的接口
 - API Key只在内存用，日志里不记录，放心
-- Token存在浏览器localStorage，24小时过期，安全又方便
+- 浏览器 localStorage 只保存随机 Web 会话令牌，24 小时过期，不保存 API Token 明文
 - 建议部署 HTTPS 反向代理（nginx/Caddy），不要让管理界面裸露在公网明文访问
 - Docker 镜像使用非 root 用户运行，降低容器逃逸后的影响面
 
@@ -1086,23 +1283,22 @@ storage/
 Token 认证系统：
 
 **认证方式**：
-- **管理界面**：登录后获取24小时有效期的Token，存储在 `localStorage`
+- **Web界面**：可用管理员密码或 API Token 登录，获取 24 小时有效的 Web 会话令牌
 - **API端点**：支持 `Authorization: Bearer <token>` 头认证
 
 **核心特性**：
-- ✅ **无状态认证**：Token 不依赖服务端 Session，便于水平扩展
-- ✅ **统一认证体系**：API和Web用同一套Token，简单
-- ✅ **简洁架构**：纯Token认证，代码又少又稳（KISS原则）
-- ✅ **跨域支持**：Token存localStorage，跨域访问完全OK
+- ✅ **作用域会话**：API Token 会话只读，服务端强制限制为当前 Token 的数据
+- ✅ **即时失效**：API Token 被禁用、删除或过期后，其 Web 会话立即失效
+- ✅ **凭据隔离**：浏览器存储中不会保存 API Token 明文
+- ✅ **服务端授权**：渠道、令牌、设置和调试数据始终只允许管理员访问
 
 **使用示例**：
 
-使用示例：
 ```bash
 # 1. 登录获取Token
 curl -X POST http://localhost:8080/login \
   -H "Content-Type: application/json" \
-  -d '{"password":"your_admin_password"}' | jq
+  -d '{"mode":"admin","password":"your_admin_password"}' | jq
 
 # 响应示例：
 # {
@@ -1145,6 +1341,7 @@ GitHub Actions 负责自动构建和发布：
 Go 命令必须带 `sonic`。提交改动前，按影响范围跑对应验证：
 
 ```bash
+bash .agents/skills/sync-cliproxy-core/scripts/verify.sh --tests  # 快照审计 + 协议定向测试
 go test -tags sonic ./internal/...
 make race-fast      # 高价值 race 子集
 make race           # 全量 race
@@ -1152,7 +1349,7 @@ make verify-web     # 前端 node:test 验证
 golangci-lint run ./...
 ```
 
-`make race-fast` 用于本地快速迭代常见并发敏感包；大改动或并发相关改动再跑 `make race`。机器并行度不合适时再覆盖 `RACE_P` 或 `RACE_PARALLEL`。
+协议转换有改动时，先跑快照审计，再跑全量内部测试。`make race-fast` 用于本地快速迭代常见并发敏感包；大改动或并发相关改动再跑 `make race`。机器并行度不合适时再覆盖 `RACE_P` 或 `RACE_PARALLEL`。
 
 ### 故障排除
 
@@ -1190,4 +1387,4 @@ env | grep CCLOAD
 
 ## 📄 许可证
 
-MIT License
+MIT License。`internal/protocol/cliproxy` 下的同步转换核心保留其上游 [MIT 许可证](internal/protocol/cliproxy/LICENSE)与[来源记录](internal/protocol/cliproxy/UPSTREAM.md)。

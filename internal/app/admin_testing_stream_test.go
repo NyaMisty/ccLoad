@@ -10,8 +10,10 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -21,6 +23,7 @@ import (
 
 	"github.com/bytedance/sonic"
 	"github.com/gin-gonic/gin"
+	"github.com/tidwall/gjson"
 )
 
 type asyncResponseRecorder struct {
@@ -277,9 +280,8 @@ func TestHandleChannelChatWritesOnlyUpstreamEvents(t *testing.T) {
 
 	created, err := srv.store.CreateConfig(ctx, &model.Config{
 		Name:         "chat-handler-stream-upstream-only",
-		URL:          upstream.URL,
+		URLs:         model.ChannelURLs{{URL: upstream.URL}},
 		Priority:     1,
-		ChannelType:  "openai",
 		ModelEntries: []model.ModelEntry{{Model: "gpt-4o-mini"}},
 		Enabled:      true,
 	})
@@ -292,9 +294,10 @@ func TestHandleChannelChatWritesOnlyUpstreamEvents(t *testing.T) {
 
 	channelID := fmt.Sprintf("%d", created.ID)
 	req := newJSONRequest(t, http.MethodPost, "/admin/channels/"+channelID+"/chat", map[string]any{
-		"model":          "gpt-4o-mini",
-		"stream":         true,
-		"builtin_search": true,
+		"model":           "gpt-4o-mini",
+		"client_protocol": "openai",
+		"stream":          true,
+		"builtin_search":  true,
 		"messages": []map[string]string{
 			{"role": "user", "content": "hi"},
 		},
@@ -375,9 +378,8 @@ func TestHandleChannelChatPersistsDetectionLogWithStreamStatusAndDebugData(t *te
 	ctx := context.Background()
 	created, err := srv.store.CreateConfig(ctx, &model.Config{
 		Name:         "chat-log-stream-debug",
-		URL:          upstream.URL,
+		URLs:         model.ChannelURLs{{URL: upstream.URL}},
 		Priority:     1,
-		ChannelType:  "openai",
 		ModelEntries: []model.ModelEntry{{Model: "gpt-4o-mini"}},
 		Enabled:      true,
 	})
@@ -391,8 +393,9 @@ func TestHandleChannelChatPersistsDetectionLogWithStreamStatusAndDebugData(t *te
 	started := time.Now()
 	channelID := fmt.Sprintf("%d", created.ID)
 	req := newJSONRequest(t, http.MethodPost, "/admin/channels/"+channelID+"/chat", map[string]any{
-		"model":  "gpt-4o-mini",
-		"stream": true,
+		"model":           "gpt-4o-mini",
+		"client_protocol": "openai",
+		"stream":          true,
 		"messages": []map[string]string{
 			{"role": "user", "content": "hi"},
 		},
@@ -470,10 +473,9 @@ func TestHandleChannelChatLogsThinkingEffortFromUpstreamRequestBody(t *testing.T
 	ctx := context.Background()
 
 	created, err := srv.store.CreateConfig(ctx, &model.Config{
-		Name:        "chat-thinking-from-upstream-request",
-		URL:         upstream.URL,
-		Priority:    1,
-		ChannelType: "openai",
+		Name:     "chat-thinking-from-upstream-request",
+		URLs:     model.ChannelURLs{{URL: upstream.URL}},
+		Priority: 1,
 		ModelEntries: []model.ModelEntry{
 			{Model: "gpt-4o-mini"},
 		},
@@ -494,8 +496,9 @@ func TestHandleChannelChatLogsThinkingEffortFromUpstreamRequestBody(t *testing.T
 	started := time.Now()
 	channelID := fmt.Sprintf("%d", created.ID)
 	req := newJSONRequest(t, http.MethodPost, "/admin/channels/"+channelID+"/chat", map[string]any{
-		"model":  "gpt-4o-mini",
-		"stream": true,
+		"model":           "gpt-4o-mini",
+		"client_protocol": "openai",
+		"stream":          true,
 		"messages": []map[string]string{
 			{"role": "user", "content": "hi"},
 		},
@@ -558,9 +561,8 @@ func TestHandleChannelChatStreamsUpstreamDeltaThroughZstdMiddleware(t *testing.T
 
 	created, err := srv.store.CreateConfig(ctx, &model.Config{
 		Name:         "chat-handler-zstd-stream",
-		URL:          upstream.URL,
+		URLs:         model.ChannelURLs{{URL: upstream.URL}},
 		Priority:     1,
-		ChannelType:  "openai",
 		ModelEntries: []model.ModelEntry{{Model: "gpt-4o-mini"}},
 		Enabled:      true,
 	})
@@ -578,8 +580,9 @@ func TestHandleChannelChatStreamsUpstreamDeltaThroughZstdMiddleware(t *testing.T
 	defer app.Close()
 
 	payload, err := sonic.Marshal(map[string]any{
-		"model":  "gpt-4o-mini",
-		"stream": true,
+		"model":           "gpt-4o-mini",
+		"client_protocol": "openai",
+		"stream":          true,
 		"messages": []map[string]string{
 			{"role": "user", "content": "hi"},
 		},
@@ -639,20 +642,21 @@ func TestHandleChannelChatStreamsUpstreamDeltaThroughZstdMiddleware(t *testing.T
 	}
 }
 
-func TestStreamChatWithURLHandlesNonStreamOpenAIResponseAsFrontendSSE(t *testing.T) {
+func TestStreamChatWithURLHandlesJSONResponseAsFrontendSSE(t *testing.T) {
 	var upstreamBody string
 	upstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/v1/chat/completions" {
 			http.NotFound(w, r)
 			return
 		}
-		if got := r.Header.Get("Accept"); got != "" {
-			t.Errorf("non-stream chat request must not ask for SSE, Accept=%q", got)
-		}
 		body, _ := io.ReadAll(r.Body)
 		upstreamBody = string(body)
+		if got := r.Header.Get("Accept"); strings.Contains(upstreamBody, `"stream":true`) && got != "text/event-stream" {
+			t.Errorf("stream chat request Accept=%q, want text/event-stream", got)
+		} else if strings.Contains(upstreamBody, `"stream":false`) && got != "" {
+			t.Errorf("non-stream chat request must not ask for SSE, Accept=%q", got)
+		}
 
-		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
 		_, _ = io.WriteString(w, `{"choices":[{"message":{"role":"assistant","content":"plain answer"}}],"usage":{"prompt_tokens":3,"completion_tokens":2,"total_tokens":5}}`)
 	}))
@@ -663,43 +667,40 @@ func TestStreamChatWithURLHandlesNonStreamOpenAIResponseAsFrontendSSE(t *testing
 	cfg := &model.Config{
 		ID:           1,
 		Name:         "openai-non-stream",
-		URL:          upstream.URL,
+		URLs:         model.ChannelURLs{{URL: upstream.URL}},
 		Priority:     1,
 		ModelEntries: []model.ModelEntry{{Model: "gpt-4o-mini"}},
-		ChannelType:  "openai",
 		Enabled:      true,
 	}
-	testReq := &testutil.TestChannelRequest{
-		Model:       "gpt-4o-mini",
-		Stream:      false,
-		ChannelType: "openai",
-		Messages: []testutil.ChatMessage{
-			{Role: "user", Content: "hi"},
-		},
-	}
+	for _, stream := range []bool{false, true} {
+		t.Run(fmt.Sprintf("stream=%t", stream), func(t *testing.T) {
+			testReq := &testutil.TestChannelRequest{
+				Model:          "gpt-4o-mini",
+				ClientProtocol: "openai",
+				Stream:         stream,
+				Messages: []testutil.ChatMessage{
+					{Role: "user", Content: "hi"},
+				},
+			}
 
-	c, w := newTestContext(t, httptest.NewRequest(http.MethodPost, "/admin/channels/1/chat", nil))
-	attempt := srv.streamChatWithURL(c, cfg, "sk-test", testReq, "openai", upstream.URL, testReq.Model)
-	if !attempt.handled {
-		t.Fatal("expected non-stream chat response to be handled without URL fallback")
-	}
+			c, w := newTestContext(t, httptest.NewRequest(http.MethodPost, "/admin/channels/1/chat", nil))
+			attempt := srv.streamChatWithURLForProtocol(c, cfg, "sk-test", testReq, "openai", "openai", upstream.URL, testReq.Model)
+			if !attempt.handled {
+				t.Fatal("expected JSON chat response to be handled without URL fallback")
+			}
 
-	if !strings.Contains(upstreamBody, `"stream":false`) {
-		t.Fatalf("expected upstream request stream=false, got:\n%s", upstreamBody)
-	}
-	if strings.Contains(upstreamBody, `"stream":true`) {
-		t.Fatalf("upstream request must not force stream=true, got:\n%s", upstreamBody)
-	}
-
-	body := w.Body.String()
-	if !strings.Contains(body, `"delta":"plain answer"`) {
-		t.Fatalf("expected frontend delta event, got:\n%s", body)
-	}
-	if !strings.Contains(body, "data: [DONE]") {
-		t.Fatalf("expected frontend DONE event, got:\n%s", body)
-	}
-	if strings.Contains(body, `"error"`) {
-		t.Fatalf("non-stream success must not be emitted as error, got:\n%s", body)
+			wantStreamField := fmt.Sprintf(`"stream":%t`, stream)
+			if !strings.Contains(upstreamBody, wantStreamField) {
+				t.Fatalf("expected upstream request %s, got:\n%s", wantStreamField, upstreamBody)
+			}
+			body := w.Body.String()
+			if !strings.Contains(body, `"delta":"plain answer"`) || !strings.Contains(body, "data: [DONE]") {
+				t.Fatalf("expected frontend delta and DONE events, got:\n%s", body)
+			}
+			if strings.Contains(body, `"error"`) {
+				t.Fatalf("JSON success must not be emitted as error, got:\n%s", body)
+			}
+		})
 	}
 }
 
@@ -709,9 +710,8 @@ func TestHandleChannelChatWritesErrorWhenAllURLsFailBeforeResponse(t *testing.T)
 
 	created, err := srv.store.CreateConfig(ctx, &model.Config{
 		Name:         "chat-network-error",
-		URL:          "http://missing-chat-upstream.invalid",
+		URLs:         model.ChannelURLs{{URL: "http://missing-chat-upstream.invalid"}},
 		Priority:     1,
-		ChannelType:  "openai",
 		ModelEntries: []model.ModelEntry{{Model: "gpt-4o-mini"}},
 		Enabled:      true,
 	})
@@ -724,8 +724,9 @@ func TestHandleChannelChatWritesErrorWhenAllURLsFailBeforeResponse(t *testing.T)
 
 	channelID := fmt.Sprintf("%d", created.ID)
 	req := newJSONRequest(t, http.MethodPost, "/admin/channels/"+channelID+"/chat", map[string]any{
-		"model":  "gpt-4o-mini",
-		"stream": true,
+		"model":           "gpt-4o-mini",
+		"client_protocol": "openai",
+		"stream":          true,
 		"messages": []map[string]string{
 			{"role": "user", "content": "hi"},
 		},
@@ -758,9 +759,8 @@ func TestHandleChannelChatPersistsLogOnHTTPError(t *testing.T) {
 
 	created, err := srv.store.CreateConfig(ctx, &model.Config{
 		Name:         "chat-http-error-log",
-		URL:          upstream.URL,
+		URLs:         model.ChannelURLs{{URL: upstream.URL}},
 		Priority:     1,
-		ChannelType:  "openai",
 		ModelEntries: []model.ModelEntry{{Model: "gpt-4o-mini"}},
 		Enabled:      true,
 	})
@@ -774,8 +774,9 @@ func TestHandleChannelChatPersistsLogOnHTTPError(t *testing.T) {
 	started := time.Now()
 	channelID := fmt.Sprintf("%d", created.ID)
 	req := newJSONRequest(t, http.MethodPost, "/admin/channels/"+channelID+"/chat", map[string]any{
-		"model":  "gpt-4o-mini",
-		"stream": true,
+		"model":           "gpt-4o-mini",
+		"client_protocol": "openai",
+		"stream":          true,
 		"messages": []map[string]string{
 			{"role": "user", "content": "hi"},
 		},
@@ -808,7 +809,7 @@ func TestHandleChannelChatPersistsLogOnHTTPError(t *testing.T) {
 	}
 }
 
-func TestHandleChannelChatFallsBackAfterRetryableHTTPError(t *testing.T) {
+func TestHandleChannelChatDoesNotFallbackAfterModelScopedHTTPError(t *testing.T) {
 	failCalls := 0
 	failUpstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		failCalls++
@@ -836,9 +837,8 @@ func TestHandleChannelChatFallsBackAfterRetryableHTTPError(t *testing.T) {
 
 	created, err := srv.store.CreateConfig(ctx, &model.Config{
 		Name:         "chat-http-fallback",
-		URL:          failUpstream.URL + "\n" + okUpstream.URL,
+		URLs:         channelURLsForTest(failUpstream.URL, okUpstream.URL),
 		Priority:     1,
-		ChannelType:  "openai",
 		ModelEntries: []model.ModelEntry{{Model: "gpt-4o-mini"}},
 		Enabled:      true,
 	})
@@ -854,8 +854,9 @@ func TestHandleChannelChatFallsBackAfterRetryableHTTPError(t *testing.T) {
 
 	channelID := fmt.Sprintf("%d", created.ID)
 	req := newJSONRequest(t, http.MethodPost, "/admin/channels/"+channelID+"/chat", map[string]any{
-		"model":  "gpt-4o-mini",
-		"stream": true,
+		"model":           "gpt-4o-mini",
+		"client_protocol": "openai",
+		"stream":          true,
 		"messages": []map[string]string{
 			{"role": "user", "content": "hi"},
 		},
@@ -865,15 +866,61 @@ func TestHandleChannelChatFallsBackAfterRetryableHTTPError(t *testing.T) {
 
 	srv.HandleChannelChat(c)
 
-	if failCalls != 1 || okCalls != 1 {
-		t.Fatalf("expected one failed call and one fallback call, failCalls=%d okCalls=%d", failCalls, okCalls)
+	if failCalls != 1 || okCalls != 0 {
+		t.Fatalf("expected only the model-scoped failure call, failCalls=%d okCalls=%d", failCalls, okCalls)
 	}
 	body := w.Body.String()
-	if !strings.Contains(body, `"delta":"fallback answer"`) {
-		t.Fatalf("expected fallback answer, got:\n%s", body)
+	if strings.Contains(body, `"delta":"fallback answer"`) {
+		t.Fatalf("model-scoped failure must not retry another URL, got:\n%s", body)
 	}
-	if strings.Contains(body, `"error"`) {
-		t.Fatalf("retryable HTTP error must not be emitted before fallback succeeds, got:\n%s", body)
+	if !strings.Contains(body, `"error"`) {
+		t.Fatalf("expected SSE error event, got:\n%s", body)
+	}
+}
+
+func TestHandleChannelChatAutoFallsBackToChannelProtocolOnMissingEndpoint(t *testing.T) {
+	var paths []string
+	upstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		paths = append(paths, r.URL.Path)
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Path != "/v1/responses" {
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = io.WriteString(w, `{"error":{"message":"endpoint not found"}}`)
+			return
+		}
+		_, _ = io.WriteString(w, `{"id":"resp_1","object":"response","status":"completed","model":"test-model","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"fallback answer"}]}],"usage":{"input_tokens":1,"output_tokens":2}}`)
+	}))
+	defer upstream.Close()
+
+	srv := newInMemoryServer(t)
+	ctx := context.Background()
+	created, err := srv.store.CreateConfig(ctx, &model.Config{
+		Name: "chat-auto", URLs: model.ChannelURLs{{URL: upstream.URL}}, ProtocolTransformMode: model.ProtocolTransformModeAuto,
+		ModelEntries: []model.ModelEntry{{Model: "test-model"}},
+		Enabled:      true,
+	})
+	if err != nil {
+		t.Fatalf("CreateConfig: %v", err)
+	}
+	if err := srv.store.CreateAPIKeysBatch(ctx, []*model.APIKey{{ChannelID: created.ID, KeyIndex: 0, APIKey: "sk-test"}}); err != nil {
+		t.Fatalf("CreateAPIKeysBatch: %v", err)
+	}
+
+	channelID := fmt.Sprintf("%d", created.ID)
+	req := newJSONRequest(t, http.MethodPost, "/admin/channels/"+channelID+"/chat", map[string]any{
+		"model": "test-model", "client_protocol": "anthropic", "stream": false,
+		"messages": []map[string]string{{"role": "user", "content": "hi"}},
+	})
+	c, w := newTestContext(t, req)
+	c.Params = gin.Params{{Key: "id", Value: channelID}}
+
+	srv.HandleChannelChat(c)
+
+	if !slices.Equal(paths, []string{"/v1/messages", "/v1/chat/completions", "/v1/responses"}) {
+		t.Fatalf("paths=%v, want Anthropic, OpenAI, then Codex", paths)
+	}
+	if !strings.Contains(w.Body.String(), `"delta":"fallback answer"`) || !strings.Contains(w.Body.String(), "data: [DONE]") {
+		t.Fatalf("unexpected frontend SSE: %s", w.Body.String())
 	}
 }
 
@@ -895,12 +942,12 @@ func TestHandleChannelChatDisablesServerWriteTimeoutForDelayedStreamBody(t *test
 	ctx := context.Background()
 
 	created, err := srv.store.CreateConfig(ctx, &model.Config{
-		Name:         "chat-write-timeout",
-		URL:          upstream.URL,
-		Priority:     1,
-		ChannelType:  "openai",
-		ModelEntries: []model.ModelEntry{{Model: "gpt-4o-mini"}},
-		Enabled:      true,
+		Name:                  "chat-write-timeout",
+		URLs:                  model.ChannelURLs{{URL: upstream.URL}},
+		Priority:              1,
+		ProtocolTransformMode: model.ProtocolTransformModeUpstream,
+		ModelEntries:          []model.ModelEntry{{Model: "gpt-4o-mini"}},
+		Enabled:               true,
 	})
 	if err != nil {
 		t.Fatalf("CreateConfig failed: %v", err)
@@ -917,8 +964,9 @@ func TestHandleChannelChatDisablesServerWriteTimeoutForDelayedStreamBody(t *test
 	defer app.Close()
 
 	payload, err := sonic.Marshal(map[string]any{
-		"model":  "gpt-4o-mini",
-		"stream": true,
+		"model":           "gpt-4o-mini",
+		"client_protocol": "openai",
+		"stream":          true,
 		"messages": []map[string]string{
 			{"role": "user", "content": "hi"},
 		},
@@ -973,16 +1021,15 @@ func TestStreamChatWithURLKeepsFirstContentTimeoutUntilValidSSEEvent(t *testing.
 	cfg := &model.Config{
 		ID:           77,
 		Name:         "chat-first-content-timeout",
-		URL:          upstream.URL,
+		URLs:         model.ChannelURLs{{URL: upstream.URL}},
 		Priority:     1,
-		ChannelType:  "openai",
 		ModelEntries: []model.ModelEntry{{Model: "gpt-4o-mini"}},
 		Enabled:      true,
 	}
 	testReq := &testutil.TestChannelRequest{
-		Model:       "gpt-4o-mini",
-		Stream:      true,
-		ChannelType: "openai",
+		Model:          "gpt-4o-mini",
+		ClientProtocol: "openai",
+		Stream:         true,
 		Messages: []testutil.ChatMessage{
 			{Role: "user", Content: "hi"},
 		},
@@ -994,7 +1041,7 @@ func TestStreamChatWithURLKeepsFirstContentTimeoutUntilValidSSEEvent(t *testing.
 
 	done := make(chan chatURLAttemptResult, 1)
 	go func() {
-		done <- srv.streamChatWithURL(c, cfg, "sk-test", testReq, "openai", upstream.URL, testReq.Model)
+		done <- srv.streamChatWithURLForProtocol(c, cfg, "sk-test", testReq, "openai", "openai", upstream.URL, testReq.Model)
 	}()
 
 	select {
@@ -1007,7 +1054,7 @@ func TestStreamChatWithURLKeepsFirstContentTimeoutUntilValidSSEEvent(t *testing.
 	}
 
 	body := w.Body.String()
-	if !strings.Contains(body, `"error"`) || !strings.Contains(body, "首个有效流内容超时") {
+	if !strings.Contains(body, `"error"`) {
 		t.Fatalf("expected first content timeout error event, got:\n%s", body)
 	}
 }
@@ -1028,23 +1075,22 @@ func TestStreamChatWithURLDoesNotTreatDoneEventAsFirstContent(t *testing.T) {
 	cfg := &model.Config{
 		ID:           78,
 		Name:         "chat-done-is-not-content",
-		URL:          upstream.URL,
+		URLs:         model.ChannelURLs{{URL: upstream.URL}},
 		Priority:     1,
-		ChannelType:  "openai",
 		ModelEntries: []model.ModelEntry{{Model: "gpt-4o-mini"}},
 		Enabled:      true,
 	}
 	testReq := &testutil.TestChannelRequest{
-		Model:       "gpt-4o-mini",
-		Stream:      true,
-		ChannelType: "openai",
+		Model:          "gpt-4o-mini",
+		ClientProtocol: "openai",
+		Stream:         true,
 		Messages: []testutil.ChatMessage{
 			{Role: "user", Content: "hi"},
 		},
 	}
 
 	c, w := newTestContext(t, httptest.NewRequest(http.MethodPost, "/admin/channels/78/chat", nil))
-	attempt := srv.streamChatWithURL(c, cfg, "sk-test", testReq, "openai", upstream.URL, testReq.Model)
+	attempt := srv.streamChatWithURLForProtocol(c, cfg, "sk-test", testReq, "openai", "openai", upstream.URL, testReq.Model)
 	if !attempt.handled {
 		t.Fatal("expected stream attempt to be handled")
 	}
@@ -1078,12 +1124,12 @@ func TestHandleChannelChatDoesNotWriteSyntheticOneMillisecondURLLatency(t *testi
 	ctx := context.Background()
 
 	created, err := srv.store.CreateConfig(ctx, &model.Config{
-		Name:         "chat-selector-latency",
-		URL:          upstream.URL + "\n" + unusedUpstream.URL,
-		Priority:     1,
-		ChannelType:  "openai",
-		ModelEntries: []model.ModelEntry{{Model: "gpt-4o-mini"}},
-		Enabled:      true,
+		Name:                  "chat-selector-latency",
+		URLs:                  channelURLsForTest(upstream.URL, unusedUpstream.URL),
+		Priority:              1,
+		ProtocolTransformMode: model.ProtocolTransformModeUpstream,
+		ModelEntries:          []model.ModelEntry{{Model: "gpt-4o-mini"}},
+		Enabled:               true,
 	})
 	if err != nil {
 		t.Fatalf("CreateConfig failed: %v", err)
@@ -1097,8 +1143,9 @@ func TestHandleChannelChatDoesNotWriteSyntheticOneMillisecondURLLatency(t *testi
 
 	channelID := fmt.Sprintf("%d", created.ID)
 	req := newJSONRequest(t, http.MethodPost, "/admin/channels/"+channelID+"/chat", map[string]any{
-		"model":  "gpt-4o-mini",
-		"stream": true,
+		"model":           "gpt-4o-mini",
+		"client_protocol": "openai",
+		"stream":          true,
 		"messages": []map[string]string{
 			{"role": "user", "content": "hi"},
 		},
@@ -1147,9 +1194,9 @@ func TestChatRequestErrorResultClassifiesLimitAndNetworkFailures(t *testing.T) {
 		},
 		{
 			name:        "concurrency",
-			err:         &keyConcurrencyExceededError{active: 1, limit: 1},
+			err:         &channelConcurrencyExceededError{active: 1, limit: 1},
 			wantStatus:  http.StatusTooManyRequests,
-			wantMessage: "当前 Key 已达到并发限制",
+			wantMessage: "渠道已达到并发限制",
 			wantKey:     "concurrency_limited",
 		},
 	}
@@ -1180,6 +1227,13 @@ func TestChatRequestErrorResultClassifiesLimitAndNetworkFailures(t *testing.T) {
 	if statusCode, _ := getResultInt(result["status_code"]); statusCode != util.StatusFirstByteTimeout {
 		t.Fatalf("status_code=%d, want %d, result=%+v", statusCode, util.StatusFirstByteTimeout, result)
 	}
+
+	timeout.firstStreamContentTimedOut.Store(false)
+	timeout.streamTimedOut.Store(true)
+	result = chatRequestErrorResult(start, req, timeout, context.Canceled)
+	if statusCode, _ := getResultInt(result["status_code"]); statusCode != util.StatusStreamIncomplete {
+		t.Fatalf("status_code=%d, want %d, result=%+v", statusCode, util.StatusStreamIncomplete, result)
+	}
 }
 
 func TestHandleChannelChatRespectsNonStreamFlag(t *testing.T) {
@@ -1198,12 +1252,12 @@ func TestHandleChannelChatRespectsNonStreamFlag(t *testing.T) {
 	ctx := context.Background()
 
 	created, err := srv.store.CreateConfig(ctx, &model.Config{
-		Name:         "chat-handler-non-stream",
-		URL:          upstream.URL,
-		Priority:     1,
-		ChannelType:  "openai",
-		ModelEntries: []model.ModelEntry{{Model: "gpt-4o-mini"}},
-		Enabled:      true,
+		Name:                  "chat-handler-non-stream",
+		URLs:                  model.ChannelURLs{{URL: upstream.URL}},
+		Priority:              1,
+		ProtocolTransformMode: model.ProtocolTransformModeUpstream,
+		ModelEntries:          []model.ModelEntry{{Model: "gpt-4o-mini"}},
+		Enabled:               true,
 	})
 	if err != nil {
 		t.Fatalf("CreateConfig failed: %v", err)
@@ -1214,8 +1268,9 @@ func TestHandleChannelChatRespectsNonStreamFlag(t *testing.T) {
 
 	channelID := fmt.Sprintf("%d", created.ID)
 	req := newJSONRequest(t, http.MethodPost, "/admin/channels/"+channelID+"/chat", map[string]any{
-		"model":  "gpt-4o-mini",
-		"stream": false,
+		"model":           "gpt-4o-mini",
+		"client_protocol": "openai",
+		"stream":          false,
 		"messages": []map[string]string{
 			{"role": "user", "content": "hi"},
 		},
@@ -1260,9 +1315,8 @@ data: {"type":"response.completed"}
 
 	created, err := srv.store.CreateConfig(ctx, &model.Config{
 		Name:         "chat-handler-codex",
-		URL:          upstream.URL,
+		URLs:         model.ChannelURLs{{URL: upstream.URL}},
 		Priority:     1,
-		ChannelType:  "codex",
 		ModelEntries: []model.ModelEntry{{Model: "gpt-5.5"}},
 		Enabled:      true,
 	})
@@ -1275,8 +1329,9 @@ data: {"type":"response.completed"}
 
 	channelID := fmt.Sprintf("%d", created.ID)
 	req := newJSONRequest(t, http.MethodPost, "/admin/channels/"+channelID+"/chat", map[string]any{
-		"model":  "gpt-5.5",
-		"stream": true,
+		"model":           "gpt-5.5",
+		"client_protocol": "codex",
+		"stream":          true,
 		"messages": []map[string]string{
 			{"role": "user", "content": "macbook m5有几款"},
 			{"role": "assistant", "content": "Test received. How can I help?"},
@@ -1315,6 +1370,447 @@ data: {"type":"response.completed"}
 	}
 }
 
+func TestHandleChannelChat_CodexOAuthWithoutAPIKeyOrSSEContentType(t *testing.T) {
+	upstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("Authorization"); got != "Bearer at-admin-test" {
+			t.Errorf("Authorization = %q", got)
+		}
+		if got := r.Header.Get("ChatGPT-Account-ID"); got != "account-admin-test" {
+			t.Errorf("ChatGPT-Account-ID = %q", got)
+		}
+		if r.Header.Get("X-Api-Key") != "" || r.Header.Get("Originator") != "codex-tui" ||
+			(r.Header.Get("Session_id") == "" && r.Header.Get("Session-Id") == "") {
+			t.Errorf("incomplete Codex OAuth stream headers: %v", r.Header)
+		}
+		_, _ = io.WriteString(w, "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"status\":\"in_progress\"}}\n\n")
+		_, _ = io.WriteString(w, "event: response.in_progress\ndata: {\"type\":\"response.in_progress\",\"response\":{\"status\":\"in_progress\"}}\n\n")
+		_, _ = io.WriteString(w, "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"oauth answer\"}\n\n")
+		_, _ = io.WriteString(w, "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n")
+	}))
+
+	srv := newInMemoryServer(t)
+	srv.client = upstream.Client()
+	created := createCodexOAuthChannelForAdminTest(t, srv, upstream.URL+"/backend-api/codex/responses")
+	channelID := fmt.Sprintf("%d", created.ID)
+	req := newJSONRequest(t, http.MethodPost, "/admin/channels/"+channelID+"/chat", map[string]any{
+		"model":           "gpt-5.6-sol",
+		"client_protocol": "codex",
+		"stream":          true,
+	})
+	c, w := newTestContext(t, req)
+	c.Params = gin.Params{{Key: "id", Value: channelID}}
+
+	srv.HandleChannelChat(c)
+
+	if got := w.Body.String(); !strings.Contains(got, `"delta":"oauth answer"`) || !strings.Contains(got, "data: [DONE]") || strings.Contains(got, `"error"`) {
+		t.Fatalf("Codex OAuth chat failed: %s", got)
+	}
+}
+
+func TestHandleChannelChat_AntigravityCapacityUsesProviderFallbackPolicy(t *testing.T) {
+	var mu sync.Mutex
+	var baseURLs []string
+	var requestTimes []time.Time
+	client := &http.Client{Transport: roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+		baseURL := req.URL.Scheme + "://" + req.URL.Host
+		mu.Lock()
+		baseURLs = append(baseURLs, baseURL)
+		requestTimes = append(requestTimes, time.Now())
+		mu.Unlock()
+
+		status := http.StatusOK
+		contentType := "text/event-stream"
+		body := `data: {"response":{"responseId":"gravity-chat","candidates":[{"content":{"role":"model","parts":[{"text":"fallback chat answer"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":2,"candidatesTokenCount":3,"totalTokenCount":5},"modelVersion":"gemini-3-flash"}}` + "\n\n"
+		switch baseURL {
+		case antigravityDailyBaseURL:
+			status = http.StatusServiceUnavailable
+			contentType = "application/json"
+			body = antigravityCapacityBodyForAdminTest
+		case antigravityProdBaseURL:
+			t.Fatalf("production Antigravity URL was called: %s", baseURL)
+		case antigravitySandboxDailyBaseURL:
+		default:
+			t.Fatalf("unexpected Antigravity fallback URL: %s", baseURL)
+		}
+		return &http.Response{
+			StatusCode: status,
+			Header:     http.Header{"Content-Type": []string{contentType}},
+			Body:       io.NopCloser(strings.NewReader(body)),
+			Request:    req,
+		}, nil
+	})}
+
+	srv := newInMemoryServer(t)
+	srv.antigravityClient = client
+	created := createAntigravityOAuthChannelForAdminTest(t, srv, antigravityDailyBaseURL)
+	started := time.Now()
+	channelID := fmt.Sprintf("%d", created.ID)
+	req := newJSONRequest(t, http.MethodPost, "/admin/channels/"+channelID+"/chat", map[string]any{
+		"model": "gemini-3-flash", "client_protocol": "gemini", "stream": true,
+		"messages": []map[string]string{{"role": "user", "content": "hello"}},
+	})
+	c, w := newTestContext(t, req)
+	c.Params = gin.Params{{Key: "id", Value: channelID}}
+	srv.HandleChannelChat(c)
+
+	body := w.Body.String()
+	if !strings.Contains(body, `"delta":"fallback chat answer"`) || strings.Contains(body, `"error"`) {
+		t.Fatalf("unexpected chat SSE: %s", body)
+	}
+	mu.Lock()
+	gotURLs := append([]string(nil), baseURLs...)
+	gotTimes := append([]time.Time(nil), requestTimes...)
+	mu.Unlock()
+	wantURLs := []string{antigravityDailyBaseURL, antigravitySandboxDailyBaseURL}
+	if !slices.Equal(gotURLs, wantURLs) {
+		t.Fatalf("Antigravity chat URLs=%v, want %v", gotURLs, wantURLs)
+	}
+	for i := 1; i < len(gotTimes); i++ {
+		if delay := gotTimes[i].Sub(gotTimes[i-1]); delay < antigravityBaseURLFallbackDelay {
+			t.Fatalf("fallback delay[%d]=%v, want >= %v", i, delay, antigravityBaseURLFallbackDelay)
+		}
+	}
+
+	logs, err := srv.store.ListLogsRange(
+		context.Background(), started.Add(-time.Second), time.Now().Add(time.Second), 10, 0,
+		&model.LogFilter{LogSource: model.LogSourceDetection},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(logs) != 1 || logs[0].LogSource != model.LogSourceManualChat || logs[0].StatusCode != http.StatusOK {
+		t.Fatalf("manual chat logs=%+v", logs)
+	}
+	cooldowns, err := srv.store.GetAllModelCooldowns(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if until := cooldowns[created.ID]["gemini-3-flash"]; until.After(time.Now()) {
+		t.Fatalf("successful fallback must clear model cooldown, until=%v", until)
+	}
+}
+
+func TestHandleChannelChat_AntigravityCapacityCancellationKeepsModelCooldown(t *testing.T) {
+	var calls atomic.Int32
+	reqCtx, cancel := context.WithCancel(context.Background())
+	client := &http.Client{Transport: roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+		if calls.Add(1) != 1 {
+			t.Fatalf("unexpected request after cancellation: %s", req.URL)
+		}
+		time.AfterFunc(20*time.Millisecond, cancel)
+		return &http.Response{
+			StatusCode: http.StatusServiceUnavailable,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body:       io.NopCloser(strings.NewReader(antigravityCapacityBodyForAdminTest)),
+			Request:    req,
+		}, nil
+	})}
+
+	srv := newInMemoryServer(t)
+	srv.antigravityClient = client
+	created := createAntigravityOAuthChannelForAdminTest(t, srv, antigravityDailyBaseURL)
+	channelID := fmt.Sprintf("%d", created.ID)
+	req := newJSONRequest(t, http.MethodPost, "/admin/channels/"+channelID+"/chat", map[string]any{
+		"model": "gemini-3-flash", "client_protocol": "gemini", "stream": true, "content": "hello",
+	}).WithContext(reqCtx)
+	c, _ := newTestContext(t, req)
+	c.Params = gin.Params{{Key: "id", Value: channelID}}
+	srv.HandleChannelChat(c)
+
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("calls=%d, want 1", got)
+	}
+	cooldowns, err := srv.store.GetAllModelCooldowns(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	remaining := time.Until(cooldowns[created.ID]["gemini-3-flash"])
+	if remaining < util.ServerErrorInitialCooldown-10*time.Second || remaining > util.ServerErrorInitialCooldown+2*time.Second {
+		t.Fatalf("capacity cooldown remaining=%v, want about %v", remaining, util.ServerErrorInitialCooldown)
+	}
+}
+
+func TestHandleChannelChat_AntigravityFallbackBusinessFailureKeepsModelCooldown(t *testing.T) {
+	var mu sync.Mutex
+	var baseURLs []string
+	client := &http.Client{Transport: roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+		baseURL := req.URL.Scheme + "://" + req.URL.Host
+		mu.Lock()
+		baseURLs = append(baseURLs, baseURL)
+		mu.Unlock()
+
+		status := http.StatusServiceUnavailable
+		body := antigravityCapacityBodyForAdminTest
+		switch baseURL {
+		case antigravityDailyBaseURL:
+		case antigravitySandboxDailyBaseURL:
+			status = http.StatusOK
+			body = `{"error":{"message":"upstream overloaded"}}`
+		case antigravityProdBaseURL:
+			t.Fatalf("production Antigravity URL was called: %s", baseURL)
+		default:
+			t.Fatalf("unexpected Antigravity fallback URL: %s", baseURL)
+		}
+		return &http.Response{
+			StatusCode: status,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body:       io.NopCloser(strings.NewReader(body)),
+			Request:    req,
+		}, nil
+	})}
+
+	srv := newInMemoryServer(t)
+	srv.antigravityClient = client
+	created := createAntigravityOAuthChannelForAdminTest(t, srv, antigravityDailyBaseURL)
+	channelID := fmt.Sprintf("%d", created.ID)
+	req := newJSONRequest(t, http.MethodPost, "/admin/channels/"+channelID+"/chat", map[string]any{
+		"model": "gemini-3-flash", "client_protocol": "gemini", "stream": false, "content": "hello",
+	})
+	c, w := newTestContext(t, req)
+	c.Params = gin.Params{{Key: "id", Value: channelID}}
+	srv.HandleChannelChat(c)
+
+	if body := w.Body.String(); !strings.Contains(body, `"error"`) || strings.Contains(body, `"delta"`) {
+		t.Fatalf("business failure must remain a chat error: %s", body)
+	}
+	mu.Lock()
+	gotURLs := append([]string(nil), baseURLs...)
+	mu.Unlock()
+	wantURLs := []string{antigravityDailyBaseURL, antigravitySandboxDailyBaseURL}
+	if !slices.Equal(gotURLs, wantURLs) {
+		t.Fatalf("Antigravity chat URLs=%v, want %v", gotURLs, wantURLs)
+	}
+	cooldowns, err := srv.store.GetAllModelCooldowns(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	remaining := time.Until(cooldowns[created.ID]["gemini-3-flash"])
+	if remaining < util.ServerErrorInitialCooldown-10*time.Second || remaining > util.ServerErrorInitialCooldown+2*time.Second {
+		t.Fatalf("capacity cooldown remaining=%v, want about %v", remaining, util.ServerErrorInitialCooldown)
+	}
+}
+
+func TestHandleChannelChat_XAIOAuthWithoutAPIKeyUsesProviderWire(t *testing.T) {
+	upstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/responses" {
+			t.Errorf("upstream path = %q, want /v1/responses", r.URL.Path)
+		}
+		if got := r.Header.Get("Authorization"); got != "Bearer at-xai-admin" {
+			t.Errorf("Authorization = %q", got)
+		}
+		if got := r.Header.Get("X-XAI-Token-Auth"); got != "xai-grok-cli" {
+			t.Errorf("X-XAI-Token-Auth = %q", got)
+		}
+		_, _ = io.WriteString(w, "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"status\":\"in_progress\"}}\n\n")
+		_, _ = io.WriteString(w, "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"xai chat answer\"}\n\n")
+		_, _ = io.WriteString(w, "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n")
+	}))
+
+	srv := newInMemoryServer(t)
+	srv.client = upstream.Client()
+	created := createXAIOAuthChannelForAdminTest(t, srv, upstream.URL+"/v1")
+	channelID := fmt.Sprintf("%d", created.ID)
+	req := newJSONRequest(t, http.MethodPost, "/admin/channels/"+channelID+"/chat", map[string]any{
+		"model": "grok-4.5", "client_protocol": "codex", "stream": true, "content": "hello",
+	})
+	c, w := newTestContext(t, req)
+	c.Params = gin.Params{{Key: "id", Value: channelID}}
+
+	srv.HandleChannelChat(c)
+
+	if got := w.Body.String(); !strings.Contains(got, `"delta":"xai chat answer"`) ||
+		!strings.Contains(got, "data: [DONE]") || strings.Contains(got, `"error"`) {
+		t.Fatalf("xAI OAuth chat failed: %s", got)
+	}
+}
+
+func TestHandleChannelChat_CodexOAuthTransformsOpenAIClientProtocol(t *testing.T) {
+	var upstreamBody []byte
+	upstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/backend-api/codex/responses" {
+			t.Errorf("upstream path = %q", r.URL.Path)
+		}
+		if got := r.Header.Get("Authorization"); got != "Bearer at-admin-test" {
+			t.Errorf("Authorization = %q", got)
+		}
+		if got := r.Header.Get("ChatGPT-Account-ID"); got != "account-admin-test" {
+			t.Errorf("ChatGPT-Account-ID = %q", got)
+		}
+		upstreamBody, _ = io.ReadAll(r.Body)
+		_, _ = io.WriteString(w, "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"status\":\"in_progress\"}}\n\n")
+		_, _ = io.WriteString(w, "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"openai to codex answer\"}\n\n")
+		_, _ = io.WriteString(w, "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n")
+	}))
+
+	srv := newInMemoryServer(t)
+	srv.client = upstream.Client()
+	created := createCodexOAuthChannelForAdminTest(t, srv, upstream.URL+"/backend-api/codex/responses")
+	updated := created.Clone()
+	updated.ProtocolTransformMode = model.ProtocolTransformModeLocal
+	created, err := srv.store.UpdateConfig(context.Background(), created.ID, updated)
+	if err != nil {
+		t.Fatalf("enable local protocol transform: %v", err)
+	}
+	channelID := fmt.Sprintf("%d", created.ID)
+	req := newJSONRequest(t, http.MethodPost, "/admin/channels/"+channelID+"/chat", map[string]any{
+		"model":           "gpt-5.6-sol",
+		"client_protocol": "openai",
+		"stream":          true,
+		"thinking_effort": "none",
+		"builtin_search":  true,
+		"messages": []map[string]string{
+			{"role": "user", "content": "which header carries the API key?"},
+		},
+	})
+	c, response := newTestContext(t, req)
+	c.Params = gin.Params{{Key: "id", Value: channelID}}
+
+	srv.HandleChannelChat(c)
+
+	if len(upstreamBody) == 0 {
+		t.Fatalf("OpenAI client request did not reach Codex upstream: %s", response.Body.String())
+	}
+	var payload map[string]any
+	if err := sonic.Unmarshal(upstreamBody, &payload); err != nil {
+		t.Fatalf("decode Codex upstream body: %v; body=%s", err, upstreamBody)
+	}
+	if _, exists := payload["messages"]; exists {
+		t.Fatalf("OpenAI messages leaked to Codex upstream: %s", upstreamBody)
+	}
+	if input, ok := payload["input"].([]any); !ok || len(input) != 1 {
+		t.Fatalf("Codex input = %#v; body=%s", payload["input"], upstreamBody)
+	}
+	if stream, ok := payload["stream"].(bool); !ok || !stream {
+		t.Fatalf("Codex stream = %#v; body=%s", payload["stream"], upstreamBody)
+	}
+	if store, ok := payload["store"].(bool); !ok || store {
+		t.Fatalf("Codex store = %#v; body=%s", payload["store"], upstreamBody)
+	}
+	if reasoning, exists := payload["reasoning"]; exists {
+		t.Fatalf("Codex reasoning = %#v; want request thinking_effort=none to remove template reasoning; body=%s", reasoning, upstreamBody)
+	}
+	textConfig, _ := payload["text"].(map[string]any)
+	if got, _ := textConfig["verbosity"].(string); got != "low" {
+		t.Fatalf("Codex text.verbosity = %q, want low; body=%s", got, upstreamBody)
+	}
+	if got, _ := payload["prompt_cache_key"].(string); got == "" {
+		t.Fatalf("Codex prompt_cache_key is missing; body=%s", upstreamBody)
+	}
+	if got, _ := payload["tool_choice"].(string); got != "auto" {
+		t.Fatalf("Codex tool_choice = %q, want auto; body=%s", got, upstreamBody)
+	}
+	clientMetadata, _ := payload["client_metadata"].(map[string]any)
+	if got, _ := clientMetadata["x-codex-installation-id"].(string); got == "" {
+		t.Fatalf("Codex installation id is missing; body=%s", upstreamBody)
+	}
+	tools, _ := payload["tools"].([]any)
+	if len(tools) != 1 {
+		t.Fatalf("Codex tools = %#v; want web_search; body=%s", tools, upstreamBody)
+	}
+	tool, _ := tools[0].(map[string]any)
+	if tool["type"] != "web_search" {
+		t.Fatalf("Codex tool = %#v; want web_search; body=%s", tool, upstreamBody)
+	}
+	got := response.Body.String()
+	if !strings.Contains(got, `"delta":"openai to codex answer"`) || !strings.Contains(got, "data: [DONE]") || strings.Contains(got, `"error"`) {
+		t.Fatalf("OpenAI to Codex chat response failed: %s", got)
+	}
+}
+
+func TestHandleChannelChat_CodexOAuthKeepsConversationCacheIdentity(t *testing.T) {
+	type capturedRequest struct {
+		body      []byte
+		sessionID string
+	}
+	var captured []capturedRequest
+	upstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("read upstream body: %v", err)
+		}
+		captured = append(captured, capturedRequest{
+			body:      body,
+			sessionID: r.Header.Get("Session-Id"),
+		})
+		_, _ = io.WriteString(w, "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"status\":\"in_progress\"}}\n\n")
+		_, _ = io.WriteString(w, "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"answer\"}\n\n")
+		_, _ = io.WriteString(w, "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n")
+	}))
+
+	srv := newInMemoryServer(t)
+	srv.client = upstream.Client()
+	created := createCodexOAuthChannelForAdminTest(t, srv, upstream.URL+"/backend-api/codex/responses")
+	updated := created.Clone()
+	updated.ProtocolTransformMode = model.ProtocolTransformModeLocal
+	created, err := srv.store.UpdateConfig(context.Background(), created.ID, updated)
+	if err != nil {
+		t.Fatalf("enable local protocol transform: %v", err)
+	}
+	channelID := fmt.Sprintf("%d", created.ID)
+
+	send := func(sessionID string, messages []map[string]string) {
+		t.Helper()
+		req := newJSONRequest(t, http.MethodPost, "/admin/channels/"+channelID+"/chat", map[string]any{
+			"model":           "gpt-5.6-sol",
+			"client_protocol": "openai",
+			"stream":          true,
+			"session_id":      sessionID,
+			"messages":        messages,
+		})
+		c, response := newTestContext(t, req)
+		c.Params = gin.Params{{Key: "id", Value: channelID}}
+		srv.HandleChannelChat(c)
+		if got := response.Body.String(); !strings.Contains(got, `"delta":"answer"`) || strings.Contains(got, `"error"`) {
+			t.Fatalf("chat response failed: %s", got)
+		}
+	}
+
+	send("browser-conversation", []map[string]string{
+		{"role": "user", "content": "first question"},
+	})
+	send("browser-conversation", []map[string]string{
+		{"role": "user", "content": "first question"},
+		{"role": "assistant", "content": "first answer"},
+		{"role": "user", "content": "second question"},
+	})
+	send("different-conversation", []map[string]string{
+		{"role": "user", "content": "first question"},
+	})
+
+	if len(captured) != 3 {
+		t.Fatalf("captured requests = %d, want 3", len(captured))
+	}
+	firstKey := gjson.GetBytes(captured[0].body, "prompt_cache_key").String()
+	secondKey := gjson.GetBytes(captured[1].body, "prompt_cache_key").String()
+	thirdKey := gjson.GetBytes(captured[2].body, "prompt_cache_key").String()
+	if firstKey == "" || firstKey != secondKey {
+		t.Fatalf("same conversation prompt_cache_key = %q, %q", firstKey, secondKey)
+	}
+	if thirdKey == "" || thirdKey == firstKey {
+		t.Fatalf("different conversation prompt_cache_key = %q, want different from %q", thirdKey, firstKey)
+	}
+	if captured[0].sessionID == "" || captured[0].sessionID != captured[1].sessionID {
+		t.Fatalf("same conversation headers changed: first=%+v second=%+v", captured[0], captured[1])
+	}
+	if captured[2].sessionID == captured[0].sessionID {
+		t.Fatalf("different conversation reused headers: first=%+v third=%+v", captured[0], captured[2])
+	}
+	firstInstallationID := gjson.GetBytes(captured[0].body, "client_metadata.x-codex-installation-id").String()
+	secondInstallationID := gjson.GetBytes(captured[1].body, "client_metadata.x-codex-installation-id").String()
+	thirdInstallationID := gjson.GetBytes(captured[2].body, "client_metadata.x-codex-installation-id").String()
+	if firstInstallationID == "" || firstInstallationID != secondInstallationID {
+		t.Fatalf("same conversation installation id = %q, %q", firstInstallationID, secondInstallationID)
+	}
+	if thirdInstallationID == "" || thirdInstallationID == firstInstallationID {
+		t.Fatalf("different conversation installation id = %q, want different from %q", thirdInstallationID, firstInstallationID)
+	}
+	firstInput := gjson.GetBytes(captured[0].body, "input.0").Raw
+	secondInput := gjson.GetBytes(captured[1].body, "input.0").Raw
+	if firstInput == "" || firstInput != secondInput {
+		t.Fatalf("existing message JSON prefix changed:\nfirst:  %s\nsecond: %s", firstInput, secondInput)
+	}
+}
+
 func TestTestChannelAPI_StreamIncludesUsageAndCost(t *testing.T) {
 	upstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/v1/messages" {
@@ -1348,18 +1844,17 @@ func TestTestChannelAPI_StreamIncludesUsageAndCost(t *testing.T) {
 	cfg := &model.Config{
 		ID:           1,
 		Name:         "test-channel",
-		URL:          upstream.URL,
+		URLs:         model.ChannelURLs{{URL: upstream.URL}},
 		Priority:     1,
 		ModelEntries: []model.ModelEntry{{Model: "claude-3-haiku", RedirectModel: ""}},
-		ChannelType:  "anthropic",
 		Enabled:      true,
 	}
 
 	req := &testutil.TestChannelRequest{
-		Model:       "claude-3-haiku",
-		Stream:      true,
-		Content:     "hi",
-		ChannelType: "anthropic",
+		Model:          "claude-3-haiku",
+		ClientProtocol: "anthropic",
+		Stream:         true,
+		Content:        "hi",
 	}
 
 	result := srv.testChannelAPI(context.Background(), cfg, "sk-test", req)
@@ -1432,18 +1927,17 @@ func TestTestChannelAPI_GeminiStreamIncludesTTFBAndText(t *testing.T) {
 	cfg := &model.Config{
 		ID:           1,
 		Name:         "gemini-channel",
-		URL:          upstream.URL,
+		URLs:         model.ChannelURLs{{URL: upstream.URL}},
 		Priority:     1,
 		ModelEntries: []model.ModelEntry{{Model: "gemini-2.5-flash-lite"}},
-		ChannelType:  "gemini",
 		Enabled:      true,
 	}
 
 	req := &testutil.TestChannelRequest{
-		Model:       "gemini-2.5-flash-lite",
-		Stream:      true,
-		Content:     "hi",
-		ChannelType: "gemini",
+		Model:          "gemini-2.5-flash-lite",
+		ClientProtocol: "gemini",
+		Stream:         true,
+		Content:        "hi",
 	}
 
 	result := srv.testChannelAPI(context.Background(), cfg, "test-key", req)

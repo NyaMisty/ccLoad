@@ -1,21 +1,36 @@
 package app
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"ccLoad/internal/model"
+	"ccLoad/internal/storage"
 
 	"github.com/gin-gonic/gin"
 )
 
+type failingAuthReloadStore struct {
+	storage.Store
+	calls atomic.Int32
+}
+
+func (s *failingAuthReloadStore) ListActiveAuthTokens(context.Context) ([]*model.AuthToken, error) {
+	s.calls.Add(1)
+	return nil, errors.New("primary unavailable")
+}
+
 // ============================================================================
 // 认证中间件测试
-// 覆盖 RequireAPIAuth 和 RequireTokenAuth 的各种认证场景
+// 覆盖 RequireAPIAuth 和 RequireAdminAuth 的各种认证场景
 // ============================================================================
 
 // ============================================================================
@@ -88,6 +103,76 @@ func TestRequireAPIAuth_InvalidToken(t *testing.T) {
 	w := runMiddleware(t, svc.RequireAPIAuth(), req)
 	if w.Code != http.StatusUnauthorized {
 		t.Fatalf("expected 401, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestRequireAPIAuth_RefreshesStaleTokenCache(t *testing.T) {
+	store, err := storage.CreateSQLiteStore(filepath.Join(t.TempDir(), "auth_refresh.db"))
+	if err != nil {
+		t.Fatalf("CreateSQLiteStore: %v", err)
+	}
+	defer func() { _ = store.Close() }()
+
+	plainToken := "remote-revocation-token"
+	stored := &model.AuthToken{
+		Token: model.HashToken(plainToken), Description: "remote revocation", IsActive: true,
+	}
+	if err := store.CreateAuthToken(context.Background(), stored); err != nil {
+		t.Fatalf("CreateAuthToken: %v", err)
+	}
+	svc := NewAuthService("test-password", nil, store)
+	defer svc.Close()
+
+	request := func() *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodGet, "/test", nil)
+		req.Header.Set("Authorization", "Bearer "+plainToken)
+		return runMiddleware(t, svc.RequireAPIAuth(), req)
+	}
+	if w := request(); w.Code != http.StatusOK {
+		t.Fatalf("initial status=%d, want 200: %s", w.Code, w.Body.String())
+	}
+	if err := store.DeleteAuthToken(context.Background(), stored.ID); err != nil {
+		t.Fatalf("DeleteAuthToken: %v", err)
+	}
+	svc.authTokensReloadAt.Store(time.Now().Add(-authTokenReloadInterval).Add(-time.Second).UnixMilli())
+	if w := request(); w.Code != http.StatusUnauthorized {
+		t.Fatalf("status after remote revocation=%d, want 401: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestRequireWebAuth_RefreshFailureDoesNotRevokeSession(t *testing.T) {
+	svc := newTestAuthService(t)
+	failingStore := &failingAuthReloadStore{}
+	svc.store = failingStore
+	apiTokenID := int64(42)
+	injectAPIToken(svc, "api-token", 0, apiTokenID)
+	sessionToken := "web-session"
+	sessionHash := model.HashToken(sessionToken)
+	svc.tokensMux.Lock()
+	svc.validTokens[sessionHash] = model.WebSession{
+		TokenHash: sessionHash, Role: model.WebRoleAPIToken, AuthTokenID: apiTokenID, ExpiresAt: time.Now().Add(time.Hour),
+	}
+	svc.tokensMux.Unlock()
+
+	req := httptest.NewRequest(http.MethodGet, "/test", nil)
+	req.Header.Set("Authorization", "Bearer "+sessionToken)
+	w := runMiddleware(t, svc.RequireWebAuth(), req)
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status=%d, want 503: %s", w.Code, w.Body.String())
+	}
+	svc.tokensMux.RLock()
+	_, exists := svc.validTokens[sessionHash]
+	svc.tokensMux.RUnlock()
+	if !exists {
+		t.Fatal("temporary reload failure revoked the persistent Web session")
+	}
+
+	w = runMiddleware(t, svc.RequireWebAuth(), req.Clone(context.Background()))
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("second status=%d, want 503: %s", w.Code, w.Body.String())
+	}
+	if calls := failingStore.calls.Load(); calls != 1 {
+		t.Fatalf("reload calls=%d, want one coalesced failure during retry backoff", calls)
 	}
 }
 
@@ -290,10 +375,10 @@ func TestRequireAPIAuth_TokenConcurrencyLimit_AppliesImmediatelyAfterUpdate(t *t
 }
 
 // ============================================================================
-// RequireTokenAuth 测试
+// RequireAdminAuth 测试
 // ============================================================================
 
-func TestRequireTokenAuth_ValidBearer(t *testing.T) {
+func TestRequireAdminAuth_ValidBearer(t *testing.T) {
 	t.Parallel()
 	svc := newTestAuthService(t)
 	injectAdminToken(svc, "admin-token-valid", time.Now().Add(time.Hour))
@@ -301,13 +386,13 @@ func TestRequireTokenAuth_ValidBearer(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "/test", nil)
 	req.Header.Set("Authorization", "Bearer admin-token-valid")
 
-	w := runMiddleware(t, svc.RequireTokenAuth(), req)
+	w := runMiddleware(t, svc.RequireAdminAuth(), req)
 	if w.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
 	}
 }
 
-func TestRequireTokenAuth_InvalidBearer(t *testing.T) {
+func TestRequireAdminAuth_InvalidBearer(t *testing.T) {
 	t.Parallel()
 	svc := newTestAuthService(t)
 	injectAdminToken(svc, "admin-token", time.Now().Add(time.Hour))
@@ -315,26 +400,26 @@ func TestRequireTokenAuth_InvalidBearer(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "/test", nil)
 	req.Header.Set("Authorization", "Bearer wrong-admin-token")
 
-	w := runMiddleware(t, svc.RequireTokenAuth(), req)
+	w := runMiddleware(t, svc.RequireAdminAuth(), req)
 	if w.Code != http.StatusUnauthorized {
 		t.Fatalf("expected 401, got %d: %s", w.Code, w.Body.String())
 	}
 }
 
-func TestRequireTokenAuth_MissingHeader(t *testing.T) {
+func TestRequireAdminAuth_MissingHeader(t *testing.T) {
 	t.Parallel()
 	svc := newTestAuthService(t)
 	injectAdminToken(svc, "admin-token", time.Now().Add(time.Hour))
 
 	req := httptest.NewRequest(http.MethodGet, "/test", nil)
 
-	w := runMiddleware(t, svc.RequireTokenAuth(), req)
+	w := runMiddleware(t, svc.RequireAdminAuth(), req)
 	if w.Code != http.StatusUnauthorized {
 		t.Fatalf("expected 401, got %d: %s", w.Code, w.Body.String())
 	}
 }
 
-func TestRequireTokenAuth_ExpiredToken(t *testing.T) {
+func TestRequireAdminAuth_ExpiredToken(t *testing.T) {
 	t.Parallel()
 	svc := newTestAuthService(t)
 	injectAdminToken(svc, "admin-expired", time.Now().Add(-time.Second))
@@ -342,7 +427,7 @@ func TestRequireTokenAuth_ExpiredToken(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "/test", nil)
 	req.Header.Set("Authorization", "Bearer admin-expired")
 
-	w := runMiddleware(t, svc.RequireTokenAuth(), req)
+	w := runMiddleware(t, svc.RequireAdminAuth(), req)
 	if w.Code != http.StatusUnauthorized {
 		t.Fatalf("expected 401, got %d: %s", w.Code, w.Body.String())
 	}
@@ -357,7 +442,7 @@ func TestRequireTokenAuth_ExpiredToken(t *testing.T) {
 	}
 }
 
-func TestRequireTokenAuth_NoBearerPrefix(t *testing.T) {
+func TestRequireAdminAuth_NoBearerPrefix(t *testing.T) {
 	t.Parallel()
 	svc := newTestAuthService(t)
 	injectAdminToken(svc, "admin-token", time.Now().Add(time.Hour))
@@ -365,7 +450,7 @@ func TestRequireTokenAuth_NoBearerPrefix(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "/test", nil)
 	req.Header.Set("Authorization", "admin-token") // 没有 Bearer 前缀
 
-	w := runMiddleware(t, svc.RequireTokenAuth(), req)
+	w := runMiddleware(t, svc.RequireAdminAuth(), req)
 	if w.Code != http.StatusUnauthorized {
 		t.Fatalf("expected 401, got %d: %s", w.Code, w.Body.String())
 	}

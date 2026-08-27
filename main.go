@@ -84,9 +84,6 @@ func main() {
 	// 打印启动 Banner
 	version.PrintBanner()
 
-	// 启动后台版本检测（每4小时检查GitHub releases）
-	version.StartChecker()
-
 	// 优先读取.env文件
 	if err := godotenv.Load(); err != nil {
 		log.Printf("未找到 .env 文件: %v", err)
@@ -109,10 +106,19 @@ func main() {
 	// 渠道仅从数据库管理与读取；不再从本地文件初始化。
 
 	srv := app.NewServer(store)
+	antigravityVersionCtx, cancelAntigravityVersion := context.WithTimeout(context.Background(), 10*time.Second)
+	antigravityUserAgent, antigravityVersionErr := srv.RefreshAntigravityUserAgent(antigravityVersionCtx)
+	cancelAntigravityVersion()
+	if antigravityVersionErr != nil {
+		log.Printf("[WARN] 获取 Antigravity Hub 版本失败，使用回退 User-Agent %q: %v", antigravityUserAgent, antigravityVersionErr)
+	} else {
+		log.Printf("[INFO] Antigravity User-Agent: %s", antigravityUserAgent)
+	}
+	srv.StartModelCatalogSync()
 
 	// 注入重启函数（避免循环依赖）
 	// 语义：标记“需要重启”，并发送 SIGTERM 触发优雅关闭；main 在退出前检测标记并 execSelf。
-	app.RestartFunc = func() {
+	srv.SetRestartFunc(func() {
 		RequestRestart()
 
 		p, err := os.FindProcess(os.Getpid())
@@ -123,9 +129,9 @@ func main() {
 		if err := p.Signal(syscall.SIGTERM); err != nil {
 			log.Printf("[ERROR] 发送 SIGTERM 失败: %v", err)
 		}
-	}
+	})
 
-	srv.StartAutoUpdateLoop()
+	srv.StartUpdateManager()
 
 	// 创建Gin引擎
 	r := gin.New()
@@ -168,20 +174,21 @@ func main() {
 	}
 
 	// 使用http.Server支持优雅关闭
-	// WriteTimeout 动态计算：确保 >= nonStreamTimeout，避免传输层截断业务层超时
+	// WriteTimeout 动态计算：确保不早于流式/非流式业务总超时
 	writeTimeout := srv.GetWriteTimeout()
+	readTimeout := srv.GetReadTimeout()
 	httpServer := &http.Server{
 		Addr:    addr,
 		Handler: r,
 
 		// ✅ 深度防御：传输层超时保护（抵御slowloris等慢速攻击）
 		// 即使绕过应用层并发控制，也会在HTTP层被杀死
-		ReadHeaderTimeout: 5 * time.Second,   // 防止慢速发送header（slowloris攻击）
-		ReadTimeout:       120 * time.Second, // 防止慢速发送body（兼容长请求）
-		WriteTimeout:      writeTimeout,      // 动态值，>= nonStreamTimeout
-		IdleTimeout:       60 * time.Second,  // 防止keep-alive连接占用fd
+		ReadHeaderTimeout: 5 * time.Second,  // 防止慢速发送header（slowloris攻击）
+		ReadTimeout:       readTimeout,      // 系统设置 http_read_timeout_seconds（0=默认120秒）
+		WriteTimeout:      writeTimeout,     // 动态值，>= 业务层请求总超时
+		IdleTimeout:       60 * time.Second, // 防止keep-alive连接占用fd
 	}
-	log.Printf("[CONFIG] HTTP WriteTimeout: %v", writeTimeout)
+	log.Printf("[CONFIG] HTTP ReadTimeout: %v, WriteTimeout: %v", readTimeout, writeTimeout)
 
 	// 启动HTTP服务器（在goroutine中）
 	go func() {

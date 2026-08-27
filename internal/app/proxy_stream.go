@@ -9,7 +9,22 @@ import (
 	"net/http"
 )
 
-var errAbortStreamBeforeWrite = errors.New("abort stream before first client write")
+var (
+	errAbortStreamBeforeWrite = errors.New("abort stream before first client write")
+	errStopStreamAfterWrite   = errors.New("stop stream after current client write")
+)
+
+type stopStreamAfterWriteError struct {
+	writeBytes int
+}
+
+func (e *stopStreamAfterWriteError) Error() string {
+	return errStopStreamAfterWrite.Error()
+}
+
+func (e *stopStreamAfterWriteError) Unwrap() error {
+	return errStopStreamAfterWrite
+}
 
 // ============================================================================
 // 流式传输数据结构
@@ -70,6 +85,8 @@ func streamCopyWithBufferSize(ctx context.Context, src io.Reader, dst http.Respo
 
 		n, err := src.Read(buf)
 		if n > 0 {
+			stopAfterWrite := false
+			writeBytes := n
 			// [FIX] 2026-01: 先 Feed 数据到 parser，再写入客户端
 			// 原因：即使写入失败（客户端断开），也需要检测流结束标志（如 response.completed）
 			// 这样当上游完整返回但客户端取消时，可以正确识别为"流完整"而非 499
@@ -78,29 +95,42 @@ func streamCopyWithBufferSize(ctx context.Context, src io.Reader, dst http.Respo
 					if errors.Is(hookErr, errAbortStreamBeforeWrite) {
 						return hookErr
 					}
+					if errors.Is(hookErr, errStopStreamAfterWrite) {
+						stopAfterWrite = true
+						var stopErr *stopStreamAfterWriteError
+						if errors.As(hookErr, &stopErr) && stopErr.writeBytes >= 0 && stopErr.writeBytes <= n {
+							writeBytes = stopErr.writeBytes
+						}
+					}
 					_ = hookErr // 钩子错误不中断流传输（容错设计）
 				}
 			}
-			if _, writeErr := dst.Write(buf[:n]); writeErr != nil {
+			if _, writeErr := dst.Write(buf[:writeBytes]); writeErr != nil {
 				return writeErr
 			}
 			if flusher, ok := dst.(http.Flusher); ok {
 				flusher.Flush()
 			}
-		}
-		if err != nil {
-			if err == io.EOF {
+			if stopAfterWrite {
 				return nil
 			}
-			// [FIX] 检查 context 是否在 Read 期间被取消
-			// 场景：客户端取消请求 → HTTP/2 流关闭 → Read 返回 "http2: response body closed"
-			// 此时应返回 context.Canceled，让上层正确识别为客户端断开（499）而非上游错误（502）
-			if ctx.Err() != nil {
-				return ctx.Err()
-			}
-			return err
+		}
+		if err != nil {
+			return normalizeStreamReadError(ctx, err)
 		}
 	}
+}
+
+// normalizeStreamReadError 保留 Read 的真实终止原因。
+// context 取消会主动 Close 源，底层可能因此返回 EOF；此时取消/超时必须优先。
+func normalizeStreamReadError(ctx context.Context, err error) error {
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return ctxErr
+	}
+	if err == io.EOF {
+		return nil
+	}
+	return err
 }
 
 func closeReaderOnContextCancel(ctx context.Context, src io.Reader) func() {
@@ -209,6 +239,17 @@ func streamTransformSSEEvents(
 	onRawEvent func([]byte) error,
 	transform func([]byte) ([][]byte, error),
 ) error {
+	return streamTransformSSEEventsUntil(ctx, src, dst, onRawEvent, transform, nil)
+}
+
+func streamTransformSSEEventsUntil(
+	ctx context.Context,
+	src io.Reader,
+	dst http.ResponseWriter,
+	onRawEvent func([]byte) error,
+	transform func([]byte) ([][]byte, error),
+	stopAfterEvent func() bool,
+) error {
 	stopCloseOnCancel := closeReaderOnContextCancel(ctx, src)
 	defer stopCloseOnCancel()
 
@@ -253,19 +294,16 @@ func streamTransformSSEEvents(
 							}
 						}
 					}
+					if stopAfterEvent != nil && stopAfterEvent() {
+						return nil
+					}
 				}
 				eventBuf.Reset()
 			}
 		}
 
 		if err != nil {
-			if err == io.EOF {
-				return nil
-			}
-			if ctx.Err() != nil {
-				return ctx.Err()
-			}
-			return err
+			return normalizeStreamReadError(ctx, err)
 		}
 	}
 }

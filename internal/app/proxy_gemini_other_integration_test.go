@@ -7,9 +7,37 @@ import (
 	"net/http"
 	"strings"
 	"testing"
-
-	"ccLoad/internal/model"
 )
+
+func assertGeminiFunctionCallStream(t *testing.T, body, name, query string) {
+	t.Helper()
+	for _, block := range strings.Split(body, "\n\n") {
+		_, data := parseSSEEventChunk([]byte(block))
+		payload, ok := decodeSSEPayload(data)
+		if !ok {
+			continue
+		}
+		candidates, _ := payload["candidates"].([]any)
+		if len(candidates) == 0 {
+			continue
+		}
+		candidate, _ := candidates[0].(map[string]any)
+		content, _ := candidate["content"].(map[string]any)
+		parts, _ := content["parts"].([]any)
+		for _, rawPart := range parts {
+			part, _ := rawPart.(map[string]any)
+			functionCall, _ := part["functionCall"].(map[string]any)
+			if functionCall == nil {
+				continue
+			}
+			args, _ := functionCall["args"].(map[string]any)
+			if functionCall["name"] == name && args["query"] == query {
+				return
+			}
+		}
+	}
+	t.Fatalf("expected Gemini functionCall name=%q query=%q, got %s", name, query, body)
+}
 
 func TestProxy_Success_Streaming_GeminiToAnthropicTransform(t *testing.T) {
 	t.Parallel()
@@ -18,11 +46,11 @@ func TestProxy_Success_Streaming_GeminiToAnthropicTransform(t *testing.T) {
 	var gotBody []byte
 
 	env := setupProxyTestEnv(t, []testChannel{
-		{name: "anthropic-ch", channelType: "anthropic", models: "claude-3-5-sonnet", apiKey: "sk-ant"},
+		{name: "anthropic-ch", upstreamProtocol: "anthropic", models: "claude-3-5-sonnet", apiKey: "sk-ant"},
 	}, map[int]string{0: "https://anthropic-upstream.example.com"})
 
 	env.server.client = &http.Client{
-		Transport: roundTripperFunc(func(r *http.Request) (*http.Response, error) {
+		Transport: automaticFallbackToPath("/v1/messages", roundTripperFunc(func(r *http.Request) (*http.Response, error) {
 			gotPath = r.URL.Path
 			gotBody, _ = io.ReadAll(r.Body)
 			body := bytes.NewBufferString(
@@ -38,7 +66,7 @@ func TestProxy_Success_Streaming_GeminiToAnthropicTransform(t *testing.T) {
 				Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
 				Body:       io.NopCloser(body),
 			}, nil
-		}),
+		})),
 	}
 
 	configs, err := env.store.ListConfigs(context.Background())
@@ -46,14 +74,12 @@ func TestProxy_Success_Streaming_GeminiToAnthropicTransform(t *testing.T) {
 		t.Fatalf("ListConfigs failed: %v", err)
 	}
 	cfg := configs[0]
-	cfg.ProtocolTransforms = []string{"gemini"}
-	cfg.ProtocolTransformMode = model.ProtocolTransformModeLocal
 	if _, err := env.store.UpdateConfig(context.Background(), cfg.ID, cfg); err != nil {
 		t.Fatalf("UpdateConfig failed: %v", err)
 	}
 	env.server.InvalidateChannelListCache()
 
-	w := doProxyRequest(t, env.engine, http.MethodPost, "/v1beta/models/claude-3-5-sonnet:streamGenerateContent", map[string]any{
+	w := doProxyRequest(t, env.engine, "/v1beta/models/claude-3-5-sonnet:streamGenerateContent", map[string]any{
 		"contents": []map[string]any{{
 			"role":  "user",
 			"parts": []map[string]any{{"text": "hi"}},
@@ -70,9 +96,7 @@ func TestProxy_Success_Streaming_GeminiToAnthropicTransform(t *testing.T) {
 		t.Fatalf("expected anthropic request body, got %s", gotBody)
 	}
 	body := w.Body.String()
-	if !strings.Contains(body, `"functionCall":{"name":"lookup","args":{"query":"go"}}`) {
-		t.Fatalf("expected translated Gemini functionCall, got %s", body)
-	}
+	assertGeminiFunctionCallStream(t, body, "lookup", "go")
 	if !strings.Contains(body, `"finishReason":"STOP"`) || !strings.Contains(body, `"promptTokenCount":3`) || !strings.Contains(body, `"candidatesTokenCount":5`) {
 		t.Fatalf("expected Gemini usage metadata, got %s", body)
 	}
@@ -85,11 +109,11 @@ func TestProxy_Success_Streaming_GeminiToCodexTransform(t *testing.T) {
 	var gotBody []byte
 
 	env := setupProxyTestEnv(t, []testChannel{
-		{name: "codex-ch", channelType: "codex", models: "gpt-5-codex", apiKey: "sk-cdx"},
+		{name: "codex-ch", upstreamProtocol: "codex", models: "gpt-5-codex", apiKey: "sk-cdx"},
 	}, map[int]string{0: "https://codex-upstream.example.com"})
 
 	env.server.client = &http.Client{
-		Transport: roundTripperFunc(func(r *http.Request) (*http.Response, error) {
+		Transport: automaticFallbackToPath("/v1/responses", roundTripperFunc(func(r *http.Request) (*http.Response, error) {
 			gotPath = r.URL.Path
 			gotBody, _ = io.ReadAll(r.Body)
 			body := bytes.NewBufferString(
@@ -101,7 +125,7 @@ func TestProxy_Success_Streaming_GeminiToCodexTransform(t *testing.T) {
 				Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
 				Body:       io.NopCloser(body),
 			}, nil
-		}),
+		})),
 	}
 
 	configs, err := env.store.ListConfigs(context.Background())
@@ -109,14 +133,12 @@ func TestProxy_Success_Streaming_GeminiToCodexTransform(t *testing.T) {
 		t.Fatalf("ListConfigs failed: %v", err)
 	}
 	cfg := configs[0]
-	cfg.ProtocolTransforms = []string{"gemini"}
-	cfg.ProtocolTransformMode = model.ProtocolTransformModeLocal
 	if _, err := env.store.UpdateConfig(context.Background(), cfg.ID, cfg); err != nil {
 		t.Fatalf("UpdateConfig failed: %v", err)
 	}
 	env.server.InvalidateChannelListCache()
 
-	w := doProxyRequest(t, env.engine, http.MethodPost, "/v1beta/models/gpt-5-codex:streamGenerateContent", map[string]any{
+	w := doProxyRequest(t, env.engine, "/v1beta/models/gpt-5-codex:streamGenerateContent", map[string]any{
 		"contents": []map[string]any{{
 			"role":  "user",
 			"parts": []map[string]any{{"text": "hi"}},
@@ -133,9 +155,7 @@ func TestProxy_Success_Streaming_GeminiToCodexTransform(t *testing.T) {
 		t.Fatalf("expected codex request body, got %s", gotBody)
 	}
 	body := w.Body.String()
-	if !strings.Contains(body, `"functionCall":{"name":"lookup","args":{"query":"go"}}`) {
-		t.Fatalf("expected translated Gemini functionCall, got %s", body)
-	}
+	assertGeminiFunctionCallStream(t, body, "lookup", "go")
 	if !strings.Contains(body, `"finishReason":"STOP"`) || !strings.Contains(body, `"promptTokenCount":3`) || !strings.Contains(body, `"candidatesTokenCount":5`) {
 		t.Fatalf("expected Gemini completion payload, got %s", body)
 	}

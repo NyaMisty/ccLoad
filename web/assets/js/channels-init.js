@@ -32,8 +32,8 @@ const CHANNELS_FILTER_KEY = 'channels.filters';
 function saveChannelsFilters() {
   try {
     localStorage.setItem(CHANNELS_FILTER_KEY, JSON.stringify({
-      channelType: filters.channelType,
       status: filters.status,
+      authType: filters.authType,
       model: filters.model,
       modelExact: filters.modelExact,
       search: filters.search,
@@ -49,21 +49,6 @@ function loadChannelsFilters() {
     if (saved) return JSON.parse(saved);
   } catch (_) {}
   return null;
-}
-
-function resetChannelSearchFilter() {
-  filters.search = '';
-  filters.searchExact = false;
-  channelsCurrentPage = 1;
-  if (typeof channelNameCombobox !== 'undefined' && channelNameCombobox) {
-    channelNameCombobox.setValue('', getChannelNameAllLabel());
-  } else {
-    const searchInputEl = document.getElementById('searchInput');
-    if (searchInputEl) {
-      const allLabel = (window.t && window.t('channels.channelNameAll')) || '所有渠道';
-      searchInputEl.value = allLabel;
-    }
-  }
 }
 
 function updateChannelsPagination() {
@@ -89,28 +74,28 @@ function firstChannelsPage() {
   if (channelsCurrentPage <= 1) return;
   channelsCurrentPage = 1;
   saveChannelsFilters();
-  loadChannels(filters.channelType);
+  loadChannels();
 }
 
 function prevChannelsPage() {
   if (channelsCurrentPage <= 1) return;
   channelsCurrentPage--;
   saveChannelsFilters();
-  loadChannels(filters.channelType);
+  loadChannels();
 }
 
 function nextChannelsPage() {
   if (channelsCurrentPage >= channelsTotalPages) return;
   channelsCurrentPage++;
   saveChannelsFilters();
-  loadChannels(filters.channelType);
+  loadChannels();
 }
 
 function lastChannelsPage() {
   if (channelsCurrentPage >= channelsTotalPages) return;
   channelsCurrentPage = channelsTotalPages;
   saveChannelsFilters();
-  loadChannels(filters.channelType);
+  loadChannels();
 }
 
 function jumpChannelsPage() {
@@ -124,7 +109,7 @@ function jumpChannelsPage() {
   if (page !== channelsCurrentPage) {
     channelsCurrentPage = page;
     saveChannelsFilters();
-    loadChannels(filters.channelType);
+    loadChannels();
   }
   input.value = '';
 }
@@ -132,6 +117,9 @@ function jumpChannelsPage() {
 function initChannelsPageActions() {
   if (typeof initChannelEditorActions === 'function') {
     initChannelEditorActions();
+  }
+  if (typeof setupOAuthActions === 'function') {
+    setupOAuthActions();
   }
 
   if (typeof window.initDelegatedActions === 'function') {
@@ -146,8 +134,17 @@ function initChannelsPageActions() {
         'batch-enable-channels': () => batchEnableSelectedChannels(),
         'batch-disable-channels': () => batchDisableSelectedChannels(),
         'batch-delete-channels': () => batchDeleteSelectedChannels(),
+        'batch-export-channels': () => exportSelectedChannelsCSV(),
+        'batch-refresh-oauth-usage': () => batchRefreshSelectedOAuthUsage(),
         'batch-refresh-channels-merge': () => batchRefreshSelectedChannelsMerge(),
         'batch-refresh-channels-replace': () => batchRefreshSelectedChannelsReplace(),
+        'batch-set-protocol-mode': () => batchSetSelectedChannelsProtocolMode(),
+        'batch-set-priority': () => batchSetSelectedChannelsPriority(),
+        'batch-set-cost-multiplier': () => batchSetSelectedChannelsCostMultiplier(),
+        'batch-set-rpm-limit': () => batchSetSelectedChannelsRPMLimit(),
+        'batch-set-max-concurrency': () => batchSetSelectedChannelsMaxConcurrency(),
+        'batch-set-daily-cost-limit': () => batchSetSelectedChannelsDailyCostLimit(),
+        'batch-clear-cooldowns': () => batchClearSelectedChannelCooldowns(),
         'clear-selected-channels': () => clearSelectedChannels(),
         'close-test-modal': () => closeTestModal(),
         'run-channel-test': () => runChannelTest(),
@@ -162,9 +159,6 @@ function initChannelsPageActions() {
             window.toggleResponse(responseTarget);
           }
         }
-      },
-      change: {
-        'update-test-url': () => updateTestURL()
       }
     });
   }
@@ -179,27 +173,48 @@ function initChannelsPageActions() {
     jumpPageInput.dataset.bound = '1';
   }
 
-  // 每页显示数量选择器
-  const pageSizeSelect = document.getElementById('channels_page_size');
-  if (pageSizeSelect && !pageSizeSelect.dataset.bound) {
-    pageSizeSelect.value = String(channelsPageSize);
-    pageSizeSelect.addEventListener('change', (event) => {
-      const newSize = parseInt(event.target.value, 10);
-      if (newSize > 0) {
-        channelsPageSize = newSize;
-        localStorage.setItem('channels.pageSize', String(newSize));
-        channelsCurrentPage = 1;
-        saveChannelsFilters();
-        loadChannels(filters.channelType);
+  // 每页显示数量输入框
+  const pageSizeInput = document.getElementById('channels_page_size');
+  if (pageSizeInput && !pageSizeInput.dataset.bound) {
+    const applyPageSize = () => {
+      const newSize = normalizeChannelsPageSize(pageSizeInput.value);
+      pageSizeInput.value = String(newSize);
+      localStorage.setItem('channels.pageSize', String(newSize));
+      if (newSize === channelsPageSize) return;
+
+      channelsPageSize = newSize;
+      channelsCurrentPage = 1;
+      saveChannelsFilters();
+      loadChannels();
+    };
+
+    pageSizeInput.value = String(channelsPageSize);
+    pageSizeInput.addEventListener('change', applyPageSize);
+    pageSizeInput.addEventListener('keydown', (event) => {
+      if (event.key === 'Enter') {
+        event.preventDefault();
+        applyPageSize();
       }
     });
-    pageSizeSelect.dataset.bound = '1';
+    pageSizeInput.dataset.bound = '1';
   }
+}
+
+function applyChannelsAccessMode() {
+  const readOnly = isTokenChannelsReadOnly();
+  document.body.classList.toggle('channels-readonly', readOnly);
+  for (const id of ['addChannelBtn', 'oauthLoginBtn', 'oauthCredentialImportBtn', 'oauthCredentialCleanupOpenBtn', 'importCsvBtn', 'batchFloatingMenu']) {
+    const el = document.getElementById(id);
+    if (el) el.hidden = readOnly;
+  }
+  if (readOnly) channelStatsRange = 'today';
+  return readOnly;
 }
 
 window.initPageBootstrap({
   topbarKey: 'channels',
   run: async () => {
+    const readOnly = applyChannelsAccessMode();
     initChannelsPageActions();
     setupFilterListeners();
     setupImportExport();
@@ -212,28 +227,30 @@ window.initPageBootstrap({
       updateBatchChannelSelectionUI();
     }
 
-    // 并行化第一批：渠道类型渲染、目标渠道查询、不依赖 initialType 的设置请求同时发起
+    // 并行化第一批：协议下拉初始化、目标渠道查询与管理员设置请求同时发起
     const savedFilters = loadChannelsFilters();
     channelsCurrentPage = Math.max(1, parseInt(savedFilters?.page, 10) || 1);
     const [, targetChannel] = await Promise.all([
-      window.ChannelTypeManager.renderChannelTypeRadios('channelTypeRadios'),
-      getTargetChannel(),
-      loadDefaultTestContent(),
-      loadChannelStatsRange()
+      ensureProtocolTransformModeCombobox('auto'),
+      readOnly ? null : getTargetChannel(),
+      ...(readOnly ? [] : [loadDefaultTestContent(), loadChannelStatsRange()])
     ]);
-    const targetChannelType = targetChannel?.channel_type || null;
-    const initialType = targetChannelType || (savedFilters?.channelType) || 'all';
-
-    filters.channelType = initialType;
     const urlChannelId = new URLSearchParams(location.search).get('id');
     if (urlChannelId) {
       filters.status = 'all';
+      filters.authType = 'all';
       filters.model = 'all';
       filters.modelExact = false;
       filters.search = targetChannel?.name || '';
       filters.searchExact = Boolean(filters.search);
       channelsCurrentPage = 1;
       document.getElementById('statusFilter').value = 'all';
+      if (typeof channelAuthTypeFilterCombobox !== 'undefined' && channelAuthTypeFilterCombobox) {
+        channelAuthTypeFilterCombobox.setValue('all', channelAuthTypeFilterLabel('all'));
+      } else {
+        const authTypeFilterEl = document.getElementById('channelAuthTypeFilter');
+        if (authTypeFilterEl) authTypeFilterEl.value = channelAuthTypeFilterLabel('all');
+      }
       if (typeof modelFilterCombobox !== 'undefined' && modelFilterCombobox) {
         modelFilterCombobox.setValue('all', modelFilterInputValueFromFilterValue('all'));
       } else {
@@ -247,11 +264,18 @@ window.initPageBootstrap({
       }
     } else if (savedFilters) {
       filters.status = savedFilters.status || 'all';
+      filters.authType = ['api_key', 'codex_oauth', 'antigravity_oauth', 'xai_oauth', 'anthropic_oauth', 'zai_oauth'].includes(savedFilters.authType) ? savedFilters.authType : 'all';
       filters.model = savedFilters.model || 'all';
       filters.modelExact = filters.model !== 'all' && savedFilters.modelExact !== false;
       filters.search = savedFilters.search || '';
       filters.searchExact = savedFilters.searchExact === true;
       document.getElementById('statusFilter').value = filters.status;
+      if (typeof channelAuthTypeFilterCombobox !== 'undefined' && channelAuthTypeFilterCombobox) {
+        channelAuthTypeFilterCombobox.setValue(filters.authType, channelAuthTypeFilterLabel(filters.authType));
+      } else {
+        const authTypeFilterEl = document.getElementById('channelAuthTypeFilter');
+        if (authTypeFilterEl) authTypeFilterEl.value = channelAuthTypeFilterLabel(filters.authType);
+      }
       if (typeof modelFilterCombobox !== 'undefined' && modelFilterCombobox) {
         modelFilterCombobox.setValue(filters.model, modelFilterInputValueFromFilterValue(filters.model));
       } else {
@@ -273,30 +297,10 @@ window.initPageBootstrap({
       saveChannelsFilters();
     }
 
-    // 并行化第二批：依赖 initialType 的请求 + stats（channelStatsRange 已在第一批设置）
+    // 并行化第二批：筛选选项、渠道列表与统计互不依赖
     await Promise.all([
-      window.initChannelTypeFilter('channelTypeFilter', initialType, (type) => {
-        filters.channelType = type;
-        filters.model = 'all';
-        filters.modelExact = false;
-        filters.search = '';
-        filters.searchExact = false;
-        channelsCurrentPage = 1;
-        if (typeof modelFilterCombobox !== 'undefined' && modelFilterCombobox) {
-          modelFilterCombobox.setValue('all', modelFilterInputValueFromFilterValue('all'));
-        } else {
-          const modelFilterEl = document.getElementById('modelFilter');
-          if (modelFilterEl) modelFilterEl.value = modelFilterInputValueFromFilterValue('all');
-        }
-        if (typeof channelNameCombobox !== 'undefined' && channelNameCombobox) {
-          channelNameCombobox.setValue('', getChannelNameAllLabel());
-        }
-        saveChannelsFilters();
-        loadChannelsFilterOptions(type, filters.status);
-        loadChannels(type);
-      }),
-      loadChannelsFilterOptions(initialType, filters.status),
-      loadChannels(initialType),
+      loadChannelsFilterOptions(),
+      loadChannels(),
       loadChannelStats()
     ]);
     highlightFromHash();
@@ -304,6 +308,7 @@ window.initPageBootstrap({
 
     window.i18n.onLocaleChange(() => {
       renderChannels();
+      updateChannelAuthTypeOptions();
       updateModelOptions();
       updateChannelsPagination();
     });
@@ -313,12 +318,26 @@ window.initPageBootstrap({
     if (typeof window.createAutoRefresh === 'function') {
       window.createAutoRefresh({
         load: () => Promise.all([
-          loadChannels(filters.channelType || 'all'),
+          loadChannels(),
           loadChannelStats()
         ])
       }).init();
     }
   }
+});
+
+// 批量「高级」面板：Esc 与点击面板外区域关闭（原生 details 只能靠再次点击 summary 收起）
+function closeBatchAdvancedOptions(restoreFocus) {
+  const advancedOptions = document.getElementById('batchAdvancedOptions');
+  if (!advancedOptions || !advancedOptions.open) return false;
+  advancedOptions.open = false;
+  if (restoreFocus) advancedOptions.querySelector('summary')?.focus();
+  return true;
+}
+
+document.addEventListener('pointerdown', (e) => {
+  if (e.target?.closest?.('#batchAdvancedOptions')) return;
+  closeBatchAdvancedOptions(false);
 });
 
 document.addEventListener('keydown', (e) => {
@@ -348,6 +367,9 @@ document.addEventListener('keydown', (e) => {
       closeTestModal();
     } else if (channelModal && channelModal.classList.contains('show')) {
       closeModal();
+    } else {
+      // 无模态框打开时 Esc 才收起高级面板，避免抢走模态框的关闭语义
+      closeBatchAdvancedOptions(true);
     }
   }
 });
@@ -356,7 +378,8 @@ window.addEventListener('pageshow', async (event) => {
   const urlChannelId = new URLSearchParams(location.search).get('id');
   if (!event.persisted || urlChannelId) return;
 
-  resetChannelSearchFilter();
-  if (typeof saveChannelsFilters === 'function') saveChannelsFilters();
-  await loadChannels(filters.channelType || 'all');
+  await Promise.all([
+    loadChannelsFilterOptions(),
+    loadChannels()
+  ]);
 });

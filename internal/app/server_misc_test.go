@@ -3,9 +3,10 @@ package app
 import (
 	"bytes"
 	"context"
-	"net"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -160,15 +161,20 @@ func TestServer_GetWriteTimeout(t *testing.T) {
 	if got := s.GetWriteTimeout(); got != 300*time.Second {
 		t.Fatalf("GetWriteTimeout()=%v, want 300s", got)
 	}
+
+	s.streamTimeout = 600 * time.Second
+	if got := s.GetWriteTimeout(); got != 600*time.Second {
+		t.Fatalf("GetWriteTimeout()=%v, want 600s", got)
+	}
 }
 
-func TestServer_GetWriteTimeout_IncludesChannelTypeNonStreamTimeout(t *testing.T) {
+func TestServer_GetWriteTimeout_IncludesProtocolNonStreamTimeout(t *testing.T) {
 	t.Parallel()
 
 	s := &Server{
 		nonStreamTimeout: 10 * time.Second,
-		channelTypeTimeouts: map[string]channelTypeTimeoutConfig{
-			util.ChannelTypeOpenAI: {NonStreamTimeout: 300 * time.Second},
+		protocolTimeouts: map[string]protocolTimeoutConfig{
+			util.ProtocolOpenAI: {NonStreamTimeout: 300 * time.Second},
 		},
 	}
 
@@ -183,61 +189,50 @@ func TestServer_ResolveProtocolTimeouts(t *testing.T) {
 	s := &Server{
 		firstByteTimeout: 90 * time.Second,
 		nonStreamTimeout: 120 * time.Second,
-		channelTypeTimeouts: map[string]channelTypeTimeoutConfig{
-			util.ChannelTypeAnthropic: {
+		protocolTimeouts: map[string]protocolTimeoutConfig{
+			util.ProtocolAnthropic: {
 				FirstByteTimeout: 11 * time.Second,
 				NonStreamTimeout: 12 * time.Second,
 			},
-			util.ChannelTypeOpenAI: {
+			util.ProtocolOpenAI: {
 				FirstByteTimeout: 21 * time.Second,
 				NonStreamTimeout: 22 * time.Second,
 			},
 		},
 	}
 
-	localCfg := &model.Config{
-		ChannelType:           util.ChannelTypeAnthropic,
-		ProtocolTransformMode: model.ProtocolTransformModeLocal,
-		ProtocolTransforms:    []string{util.ChannelTypeOpenAI},
-	}
 	localPlan := protocol.TransformPlan{
 		ClientProtocol:   protocol.OpenAI,
 		UpstreamProtocol: protocol.Anthropic,
 	}
-	localTimeouts := s.resolveProtocolTimeouts(localCfg, localPlan)
+	localTimeouts := s.resolveProtocolTimeouts(localPlan)
 	if localTimeouts.FirstByteTimeout != 11*time.Second || localTimeouts.NonStreamTimeout != 12*time.Second {
 		t.Fatalf("local timeouts=%+v, want anthropic bucket", localTimeouts)
 	}
 
-	upstreamCfg := &model.Config{
-		ChannelType:           util.ChannelTypeAnthropic,
-		ProtocolTransformMode: model.ProtocolTransformModeUpstream,
-		ProtocolTransforms:    []string{util.ChannelTypeOpenAI},
-	}
 	upstreamPlan := protocol.TransformPlan{
 		ClientProtocol:   protocol.OpenAI,
 		UpstreamProtocol: protocol.OpenAI,
 	}
-	upstreamTimeouts := s.resolveProtocolTimeouts(upstreamCfg, upstreamPlan)
+	upstreamTimeouts := s.resolveProtocolTimeouts(upstreamPlan)
 	if upstreamTimeouts.FirstByteTimeout != 21*time.Second || upstreamTimeouts.NonStreamTimeout != 22*time.Second {
 		t.Fatalf("upstream timeouts=%+v, want openai bucket", upstreamTimeouts)
 	}
 }
 
-func TestServer_ResolveProtocolTimeouts_ZeroChannelTypeFallsBackToGlobal(t *testing.T) {
+func TestServer_ResolveProtocolTimeouts_ZeroProtocolOverrideFallsBackToGlobal(t *testing.T) {
 	t.Parallel()
 
 	s := &Server{
 		firstByteTimeout: 90 * time.Second,
 		nonStreamTimeout: 120 * time.Second,
-		channelTypeTimeouts: map[string]channelTypeTimeoutConfig{
-			util.ChannelTypeCodex: {},
+		protocolTimeouts: map[string]protocolTimeoutConfig{
+			util.ProtocolCodex: {},
 		},
 	}
-	cfg := &model.Config{ChannelType: util.ChannelTypeCodex}
 	plan := protocol.TransformPlan{UpstreamProtocol: protocol.Codex}
 
-	timeouts := s.resolveProtocolTimeouts(cfg, plan)
+	timeouts := s.resolveProtocolTimeouts(plan)
 	if timeouts.FirstByteTimeout != 90*time.Second || timeouts.NonStreamTimeout != 120*time.Second {
 		t.Fatalf("timeouts=%+v, want global fallback", timeouts)
 	}
@@ -272,7 +267,7 @@ func TestNewServer_ZeroNonStreamTimeoutDisablesTimeout(t *testing.T) {
 	}
 }
 
-func TestNewServer_LoadsChannelTypeTimeoutOverrides(t *testing.T) {
+func TestNewServer_LoadsProtocolTimeoutOverrides(t *testing.T) {
 	t.Parallel()
 
 	store, err := storage.CreateSQLiteStore(":memory:")
@@ -300,7 +295,7 @@ func TestNewServer_LoadsChannelTypeTimeoutOverrides(t *testing.T) {
 		}
 	})
 
-	got := srv.channelTypeTimeouts[util.ChannelTypeOpenAI]
+	got := srv.protocolTimeouts[util.ProtocolOpenAI]
 	if got.FirstByteTimeout != 9*time.Second || got.NonStreamTimeout != 33*time.Second {
 		t.Fatalf("openai timeouts=%+v, want 9s/33s", got)
 	}
@@ -312,7 +307,7 @@ func TestServer_GetConfig_FallbackToStore(t *testing.T) {
 
 	cfg, err := store.CreateConfig(context.Background(), &model.Config{
 		Name:         "ch",
-		URL:          "https://api.example.com",
+		URLs:         model.ChannelURLs{{URL: "https://api.example.com"}},
 		Priority:     1,
 		ModelEntries: []model.ModelEntry{{Model: "m1"}},
 		Enabled:      true,
@@ -331,66 +326,6 @@ func TestServer_GetConfig_FallbackToStore(t *testing.T) {
 	}
 }
 
-func TestServer_GetModelsByChannelType(t *testing.T) {
-	server, store, cleanup := setupAdminTestServer(t)
-	defer cleanup()
-
-	ctx := context.Background()
-
-	_, err := store.CreateConfig(ctx, &model.Config{
-		Name:         "a1",
-		ChannelType:  "openai",
-		URL:          "https://api.example.com",
-		Priority:     1,
-		ModelEntries: []model.ModelEntry{{Model: "m1"}, {Model: "m2"}},
-		Enabled:      true,
-	})
-	if err != nil {
-		t.Fatalf("CreateConfig #1 failed: %v", err)
-	}
-	_, err = store.CreateConfig(ctx, &model.Config{
-		Name:         "a2",
-		ChannelType:  "openai",
-		URL:          "https://api.example.com",
-		Priority:     1,
-		ModelEntries: []model.ModelEntry{{Model: "m2"}, {Model: "m3"}},
-		Enabled:      true,
-	})
-	if err != nil {
-		t.Fatalf("CreateConfig #2 failed: %v", err)
-	}
-	_, err = store.CreateConfig(ctx, &model.Config{
-		Name:         "b1",
-		ChannelType:  "gemini",
-		URL:          "https://api.example.com",
-		Priority:     1,
-		ModelEntries: []model.ModelEntry{{Model: "x1"}},
-		Enabled:      true,
-	})
-	if err != nil {
-		t.Fatalf("CreateConfig #3 failed: %v", err)
-	}
-
-	server.store = store
-
-	models, err := server.getModelsByChannelType(ctx, "openai")
-	if err != nil {
-		t.Fatalf("getModelsByChannelType failed: %v", err)
-	}
-	set := make(map[string]bool)
-	for _, m := range models {
-		set[m] = true
-	}
-	for _, must := range []string{"m1", "m2", "m3"} {
-		if !set[must] {
-			t.Fatalf("models missing %q: %v", must, models)
-		}
-	}
-	if set["x1"] {
-		t.Fatalf("unexpected model from other channel type: %v", models)
-	}
-}
-
 func TestServer_HandleChannelKeys(t *testing.T) {
 	server, store, cleanup := setupAdminTestServer(t)
 	defer cleanup()
@@ -398,7 +333,7 @@ func TestServer_HandleChannelKeys(t *testing.T) {
 
 	cfg, err := store.CreateConfig(context.Background(), &model.Config{
 		Name:         "ch",
-		URL:          "https://api.example.com",
+		URLs:         model.ChannelURLs{{URL: "https://api.example.com"}},
 		Priority:     1,
 		ModelEntries: []model.ModelEntry{{Model: "m1"}},
 		Enabled:      true,
@@ -441,57 +376,83 @@ func TestServer_HandleChannelKeys(t *testing.T) {
 	})
 }
 
-func TestServer_ShutdownCancelsInFlightURLProbe(t *testing.T) {
-	srv := newInMemoryServer(t)
+func TestServer_HandleChannelKeysProjectsOAuthAccessTokens(t *testing.T) {
+	server, store, cleanup := setupAdminTestServer(t)
+	defer cleanup()
 
-	srv.urlSelector.probeTimeout = 5 * time.Second
-
-	started := make(chan struct{}, 2)
-	srv.urlSelector.probeDial = func(ctx context.Context, _, _ string) (net.Conn, error) {
-		started <- struct{}{}
-		<-ctx.Done()
-		return nil, ctx.Err()
+	tests := []struct {
+		name       string
+		authType   string
+		credential string
+		wantToken  string
+		wantNote   string
+	}{
+		{
+			name:       "codex",
+			authType:   model.AuthTypeCodexOAuth,
+			credential: `{"type":"codex","access_token":"codex-access","refresh_token":"codex-refresh","expired":"2030-01-01T00:00:00Z"}`,
+			wantToken:  "codex-access",
+			wantNote:   "Codex OAuth AT",
+		},
+		{
+			name:       "antigravity",
+			authType:   model.AuthTypeAntigravityOAuth,
+			credential: `{"type":"antigravity","access_token":"gravity-access","refresh_token":"gravity-refresh","expired":"2030-01-01T00:00:00Z"}`,
+			wantToken:  "gravity-access",
+			wantNote:   "Antigravity OAuth AT",
+		},
+		{
+			name:       "xai",
+			authType:   model.AuthTypeXAIOAuth,
+			credential: `{"type":"xai","auth_kind":"oauth","access_token":"xai-access","refresh_token":"xai-refresh","expired":"2030-01-01T00:00:00Z"}`,
+			wantToken:  "xai-access",
+			wantNote:   "xAI OAuth AT",
+		},
+		{
+			name:       "anthropic",
+			authType:   model.AuthTypeAnthropicOAuth,
+			credential: `{"type":"anthropic","access_token":"anthropic-access","refresh_token":"anthropic-refresh","expired":"2030-01-01T00:00:00Z","account_uuid":"account-1"}`,
+			wantToken:  "anthropic-access",
+			wantNote:   "Anthropic OAuth AT",
+		},
 	}
 
-	channelID := int64(1)
-	urls := []string{"https://a.example", "https://b.example"}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg, err := store.CreateConfig(context.Background(), &model.Config{
+				Name:            tt.name,
+				AuthType:        tt.authType,
+				OAuthCredential: tt.credential,
+				URLs:            model.ChannelURLs{{URL: "https://api.example.com"}},
+				Enabled:         true,
+			})
+			if err != nil {
+				t.Fatalf("CreateConfig failed: %v", err)
+			}
 
-	probeDone := make(chan struct{})
-	go func() {
-		srv.urlSelector.ProbeURLs(srv.baseCtx, channelID, urls)
-		close(probeDone)
-	}()
+			id := strconv.FormatInt(cfg.ID, 10)
+			c, w := newTestContext(t, newRequest(http.MethodGet, "/admin/channels/"+id+"/keys", nil))
+			c.Params = gin.Params{{Key: "id", Value: id}}
+			server.HandleChannelKeys(c)
 
-	for range len(urls) {
-		select {
-		case <-started:
-		case <-time.After(500 * time.Millisecond):
-			t.Fatal("probe dials did not start in time")
-		}
-	}
-
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-	if err := srv.Shutdown(shutdownCtx); err != nil {
-		t.Fatalf("Shutdown failed: %v", err)
-	}
-
-	select {
-	case <-probeDone:
-	case <-time.After(500 * time.Millisecond):
-		t.Fatal("ProbeURLs did not exit promptly after shutdown")
-	}
-
-	for _, u := range urls {
-		if srv.urlSelector.IsCooledDown(channelID, u) {
-			t.Fatalf("expected canceled probe not to cooldown url: %s", u)
-		}
-	}
-
-	srv.urlSelector.mu.RLock()
-	probingLeft := len(srv.urlSelector.probing)
-	srv.urlSelector.mu.RUnlock()
-	if probingLeft != 0 {
-		t.Fatalf("expected probing markers cleared after shutdown cancellation, got %d", probingLeft)
+			if w.Code != http.StatusOK {
+				t.Fatalf("status=%d, want %d body=%s", w.Code, http.StatusOK, w.Body.String())
+			}
+			resp := mustParseAPIResponse[[]*model.APIKey](t, w.Body.Bytes())
+			if !resp.Success || len(resp.Data) != 1 {
+				t.Fatalf("response=%+v, want one OAuth key", resp)
+			}
+			key := resp.Data[0]
+			if key.KeyIndex != 0 || key.APIKey != util.MaskAPIKey(tt.wantToken) || key.Note != tt.wantNote || key.Disabled {
+				t.Fatalf("key=%+v, want token=%q note=%q", key, tt.wantToken, tt.wantNote)
+			}
+			if strings.Contains(w.Body.String(), tt.wantToken) {
+				t.Fatalf("OAuth access token leaked in channel keys response: %s", w.Body.String())
+			}
+			stored, err := store.GetAPIKeys(context.Background(), cfg.ID)
+			if err != nil || len(stored) != 0 {
+				t.Fatalf("projected OAuth key must not be persisted: keys=%+v err=%v", stored, err)
+			}
+		})
 	}
 }

@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"ccLoad/internal/config"
@@ -31,26 +32,35 @@ import (
 type AuthService struct {
 	// Token 认证（管理界面使用的动态 Token）
 	// [INFO] 安全修复：存储SHA256哈希而非明文(2025-12)
-	passwordHash []byte               // 管理员密码bcrypt哈希
-	validTokens  map[string]time.Time // TokenHash → 过期时间
-	tokensMux    sync.RWMutex         // 并发保护
+	passwordHash []byte                      // 管理员密码bcrypt哈希
+	validTokens  map[string]model.WebSession // WebSessionTokenHash → 会话身份
+	tokensMux    sync.RWMutex                // 并发保护
+
+	sessionRevokeHooksMux sync.RWMutex
+	sessionRevokeHooks    []func(string)
 
 	// API 认证（代理 API 使用的数据库令牌）
 	// [FIX] 2025-12: 存储过期时间而非bool，支持懒惰过期校验
-	authTokens          map[string]int64          // Token哈希 → 过期时间(Unix毫秒，0=永不过期)
-	authTokenIDs        map[string]int64          // Token哈希 → Token ID 映射（用于日志记录，2025-12新增）
-	authTokenModels     map[string][]string       // Token哈希 → 允许的模型列表（2026-01新增）
-	authTokenChannels   map[string][]int64        // Token哈希 → 允许的渠道ID列表（2026-04新增）
-	authTokenCostLimits map[string]tokenCostLimit // Token哈希 → 费用限额状态（仅限额>0的令牌）
-	authTokenMaxConns   map[string]int            // Token哈希 → 最大并发请求数（0=无限制）
-	authTokenActiveReqs map[string]int            // Token哈希 → 当前进行中请求数
-	authTokensMux       sync.RWMutex              // 并发保护（支持热更新）
+	authTokens          map[string]int64                    // Token哈希 → 过期时间(Unix毫秒，0=永不过期)
+	authTokenIDs        map[string]int64                    // Token哈希 → Token ID 映射（用于日志记录，2025-12新增）
+	authTokenHashes     map[int64]string                    // Token ID → Token哈希（Web会话绑定代理身份）
+	authTokenModels     map[string][]string                 // Token哈希 → 允许的模型列表（2026-01新增）
+	authTokenChannels   map[string]model.ChannelRestriction // Token哈希 → 已校验的渠道限制策略
+	authTokenCostLimits map[string]tokenCostLimit           // Token哈希 → 费用限额状态（仅限额>0的令牌）
+	authTokenMaxConns   map[string]int                      // Token哈希 → 最大并发请求数（0=无限制）
+	authTokenActiveReqs map[string]int                      // Token哈希 → 当前进行中请求数
+	authTokensMux       sync.RWMutex                        // 并发保护（支持热更新）
+	authTokensRefreshMu sync.Mutex
+	authTokensReloadAt  atomic.Int64
+	authTokensNextRetry time.Time
+	authTokensReloadErr error
 
 	// 数据库依赖（用于热更新令牌）
 	store storage.Store
 
 	// 速率限制（防暴力破解）
-	loginRateLimiter *util.LoginRateLimiter
+	loginRateLimiter       *util.LoginRateLimiter
+	apiTokenSessionLimiter *apiTokenSessionLimiter
 
 	// 异步更新 last_used_at（受控 worker，避免 goroutine 泄漏）
 	lastUsedCh chan string    // tokenHash 更新队列
@@ -61,14 +71,83 @@ type AuthService struct {
 }
 
 type tokenCostLimit struct {
-	usedMicroUSD  int64
-	limitMicroUSD int64
+	usedMicroUSD         int64
+	limitMicroUSD        int64
+	dailyUsedMicroUSD    int64
+	dailyLimitMicroUSD   int64
+	dailyPeriodStart     int64
+	monthlyUsedMicroUSD  int64
+	monthlyLimitMicroUSD int64
+	monthlyPeriodStart   int64
+}
+
+func (v tokenCostLimit) applyPeriod(now time.Time) tokenCostLimit {
+	dayStart, monthStart := model.AuthTokenCostPeriodStarts(now)
+	if v.dailyPeriodStart != dayStart {
+		v.dailyUsedMicroUSD = 0
+		v.dailyPeriodStart = dayStart
+	}
+	if v.monthlyPeriodStart != monthStart {
+		v.monthlyUsedMicroUSD = 0
+		v.monthlyPeriodStart = monthStart
+	}
+	return v
+}
+
+func (v tokenCostLimit) addCost(deltaMicroUSD int64, completedAt time.Time) tokenCostLimit {
+	v.usedMicroUSD += deltaMicroUSD
+	dayStart, monthStart := model.AuthTokenCostPeriodStarts(completedAt)
+	if v.dailyPeriodStart <= dayStart {
+		if v.dailyPeriodStart < dayStart {
+			v.dailyUsedMicroUSD = 0
+			v.dailyPeriodStart = dayStart
+		}
+		v.dailyUsedMicroUSD += deltaMicroUSD
+	}
+	if v.monthlyPeriodStart <= monthStart {
+		if v.monthlyPeriodStart < monthStart {
+			v.monthlyUsedMicroUSD = 0
+			v.monthlyPeriodStart = monthStart
+		}
+		v.monthlyUsedMicroUSD += deltaMicroUSD
+	}
+	return v
+}
+
+func (v tokenCostLimit) exceededWindow() (usedMicroUSD, limitMicroUSD int64, window string, exceeded bool) {
+	type costWindow struct {
+		used, limit int64
+		name        string
+	}
+	windows := []costWindow{
+		{v.dailyUsedMicroUSD, v.dailyLimitMicroUSD, "daily"},
+		{v.monthlyUsedMicroUSD, v.monthlyLimitMicroUSD, "monthly"},
+		{v.usedMicroUSD, v.limitMicroUSD, "total"},
+	}
+	var first costWindow
+	for _, w := range windows {
+		if w.limit <= 0 {
+			continue
+		}
+		if first.name == "" {
+			first = w
+		}
+		if w.used >= w.limit {
+			return w.used, w.limit, w.name, true
+		}
+	}
+	if first.name == "" {
+		return 0, 0, "", false
+	}
+	return first.used, first.limit, first.name, false
 }
 
 var authPasswordHashCost = bcrypt.DefaultCost
 
+const authTokenReloadInterval = 30 * time.Second
+
 // NewAuthService 创建认证服务实例
-// 初始化时自动从数据库加载API访问令牌和管理员会话
+// 初始化时自动从数据库加载 API 访问令牌和 Web 会话。
 func NewAuthService(
 	password string,
 	loginRateLimiter *util.LoginRateLimiter,
@@ -81,19 +160,21 @@ func NewAuthService(
 	}
 
 	s := &AuthService{
-		passwordHash:        passwordHash,
-		validTokens:         make(map[string]time.Time),
-		authTokens:          make(map[string]int64),
-		authTokenIDs:        make(map[string]int64),
-		authTokenModels:     make(map[string][]string),
-		authTokenChannels:   make(map[string][]int64),
-		authTokenCostLimits: make(map[string]tokenCostLimit),
-		authTokenMaxConns:   make(map[string]int),
-		authTokenActiveReqs: make(map[string]int),
-		loginRateLimiter:    loginRateLimiter,
-		store:               store,
-		lastUsedCh:          make(chan string, 256), // 带缓冲，避免阻塞请求
-		done:                make(chan struct{}),
+		passwordHash:           passwordHash,
+		validTokens:            make(map[string]model.WebSession),
+		authTokens:             make(map[string]int64),
+		authTokenIDs:           make(map[string]int64),
+		authTokenHashes:        make(map[int64]string),
+		authTokenModels:        make(map[string][]string),
+		authTokenChannels:      make(map[string]model.ChannelRestriction),
+		authTokenCostLimits:    make(map[string]tokenCostLimit),
+		authTokenMaxConns:      make(map[string]int),
+		authTokenActiveReqs:    make(map[string]int),
+		loginRateLimiter:       loginRateLimiter,
+		apiTokenSessionLimiter: newAPITokenSessionLimiter(nil),
+		store:                  store,
+		lastUsedCh:             make(chan string, 256), // 带缓冲，避免阻塞请求
+		done:                   make(chan struct{}),
 	}
 
 	// 启动 last_used_at 更新 worker
@@ -105,7 +186,7 @@ func NewAuthService(
 		log.Printf("[WARN]  初始化时加载API令牌失败: %v", err)
 	}
 
-	// 从数据库加载管理员会话（支持重启后保持登录）
+	// 从数据库加载 Web 会话（支持重启后保持登录）
 	if err := s.loadSessionsFromDB(); err != nil {
 		log.Printf("[WARN]  初始化时加载管理员会话失败: %v", err)
 	}
@@ -113,25 +194,24 @@ func NewAuthService(
 	return s
 }
 
-// loadSessionsFromDB 从数据库加载管理员会话
-// [INFO] 安全修复：加载tokenHash→expiry映射(2025-12)
+// loadSessionsFromDB 从数据库加载角色化 Web 会话。
 func (s *AuthService) loadSessionsFromDB() error {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	sessions, err := s.store.LoadAllSessions(ctx)
+	sessions, err := s.store.LoadWebSessions(ctx)
 	if err != nil {
 		return err
 	}
 
 	s.tokensMux.Lock()
-	for tokenHash, expiry := range sessions {
-		s.validTokens[tokenHash] = expiry
+	for tokenHash, session := range sessions {
+		s.validTokens[tokenHash] = session
 	}
 	s.tokensMux.Unlock()
 
 	if len(sessions) > 0 {
-		log.Printf("[INFO] 已恢复 %d 个管理员会话（重启后保持登录）", len(sessions))
+		log.Printf("[INFO] 已恢复 %d 个 Web 会话（重启后保持登录）", len(sessions))
 	}
 	return nil
 }
@@ -163,6 +243,47 @@ func (s *AuthService) Close() {
 	})
 }
 
+// RegisterWebSessionRevokeHook registers a callback for deleted Web sessions.
+// Callbacks receive only the irreversible session hash and run without service locks held.
+func (s *AuthService) RegisterWebSessionRevokeHook(hook func(sessionHash string)) {
+	if s == nil || hook == nil {
+		return
+	}
+	s.sessionRevokeHooksMux.Lock()
+	s.sessionRevokeHooks = append(s.sessionRevokeHooks, hook)
+	s.sessionRevokeHooksMux.Unlock()
+}
+
+func (s *AuthService) notifyWebSessionRevoked(sessionHashes []string) {
+	if len(sessionHashes) == 0 {
+		return
+	}
+	s.sessionRevokeHooksMux.RLock()
+	hooks := append([]func(string){}, s.sessionRevokeHooks...)
+	s.sessionRevokeHooksMux.RUnlock()
+	for _, sessionHash := range sessionHashes {
+		if strings.TrimSpace(sessionHash) == "" {
+			continue
+		}
+		for _, hook := range hooks {
+			hook(sessionHash)
+		}
+	}
+}
+
+func (s *AuthService) deleteWebSession(tokenHash string) bool {
+	s.tokensMux.Lock()
+	_, exists := s.validTokens[tokenHash]
+	if exists {
+		delete(s.validTokens, tokenHash)
+	}
+	s.tokensMux.Unlock()
+	if exists {
+		s.notifyWebSessionRevoked([]string{tokenHash})
+	}
+	return exists
+}
+
 // ============================================================================
 // Token 生成和验证（内部方法）
 // ============================================================================
@@ -179,39 +300,77 @@ func (s *AuthService) generateToken() (string, error) {
 // isValidToken 验证Token有效性（检查过期时间）
 // [INFO] 安全修复：通过tokenHash查询(2025-12)
 func (s *AuthService) isValidToken(token string) bool {
+	_, ok, _ := s.webSession(token)
+	return ok
+}
+
+func (s *AuthService) webSession(token string) (model.WebSession, bool, error) {
 	tokenHash := model.HashToken(token)
 
 	s.tokensMux.RLock()
-	expiry, exists := s.validTokens[tokenHash]
+	session, exists := s.validTokens[tokenHash]
 	s.tokensMux.RUnlock()
 
 	if !exists {
-		return false
+		return model.WebSession{}, false, nil
 	}
 
-	// 检查是否过期
-	if time.Now().After(expiry) {
+	if time.Now().After(session.ExpiresAt) {
 		// 同步删除过期Token（避免goroutine泄漏）
 		// 原因：map删除操作非常快（O(1)），无需异步，异步反而导致goroutine泄漏
-		s.tokensMux.Lock()
-		delete(s.validTokens, tokenHash)
-		s.tokensMux.Unlock()
-		return false
+		s.deleteWebSession(tokenHash)
+		return model.WebSession{}, false, nil
 	}
 
-	return true
+	validIdentity := session.Role == model.WebRoleAdmin && session.AuthTokenID == 0
+	if session.Role == model.WebRoleAPIToken {
+		var err error
+		validIdentity, err = s.isActiveAuthTokenID(session.AuthTokenID)
+		if err != nil {
+			return model.WebSession{}, false, err
+		}
+	}
+	if !validIdentity {
+		if session.AuthTokenID > 0 && s.store != nil {
+			_ = s.revokeWebSessions([]int64{session.AuthTokenID})
+		} else {
+			s.deleteWebSession(tokenHash)
+		}
+		return model.WebSession{}, false, nil
+	}
+
+	return session, true, nil
+}
+
+func (s *AuthService) isActiveAuthTokenID(tokenID int64) (bool, error) {
+	if tokenID <= 0 {
+		return false, nil
+	}
+	if err := s.refreshAuthTokensIfStale(); err != nil {
+		return false, err
+	}
+	s.authTokensMux.RLock()
+	tokenHash, ok := s.authTokenHashes[tokenID]
+	if !ok {
+		s.authTokensMux.RUnlock()
+		return false, nil
+	}
+	expiresAt, ok := s.authTokens[tokenHash]
+	s.authTokensMux.RUnlock()
+	return ok && (expiresAt <= 0 || time.Now().UnixMilli() <= expiresAt), nil
 }
 
 // CleanExpiredTokens 清理过期Token（定期任务）
 // 公开方法，供 Server 的后台协程调用
 func (s *AuthService) CleanExpiredTokens() {
 	now := time.Now()
+	s.apiTokenSessionLimiter.cleanup()
 
 	// 使用快照模式避免长时间持锁
 	s.tokensMux.RLock()
 	toDelete := make([]string, 0, len(s.validTokens)/10)
-	for tokenHash, expiry := range s.validTokens {
-		if now.After(expiry) {
+	for tokenHash, session := range s.validTokens {
+		if now.After(session.ExpiresAt) {
 			toDelete = append(toDelete, tokenHash)
 		}
 	}
@@ -219,19 +378,22 @@ func (s *AuthService) CleanExpiredTokens() {
 
 	// 批量删除内存中的过期Token
 	if len(toDelete) > 0 {
+		deleted := make([]string, 0, len(toDelete))
 		s.tokensMux.Lock()
 		for _, tokenHash := range toDelete {
-			if expiry, exists := s.validTokens[tokenHash]; exists && now.After(expiry) {
+			if session, exists := s.validTokens[tokenHash]; exists && now.After(session.ExpiresAt) {
 				delete(s.validTokens, tokenHash)
+				deleted = append(deleted, tokenHash)
 			}
 		}
 		s.tokensMux.Unlock()
+		s.notifyWebSessionRevoked(deleted)
 	}
 
 	// 同时清理数据库中的过期会话
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	if err := s.store.CleanExpiredSessions(ctx); err != nil {
+	if err := s.store.CleanExpiredWebSessions(ctx); err != nil {
 		log.Printf("[WARN]  清理数据库过期会话失败: %v", err)
 	}
 }
@@ -240,8 +402,8 @@ func (s *AuthService) CleanExpiredTokens() {
 // 认证中间件
 // ============================================================================
 
-// RequireTokenAuth Token 认证中间件（管理界面使用）
-func (s *AuthService) RequireTokenAuth() gin.HandlerFunc {
+// RequireWebAuth accepts administrator and API-token web sessions.
+func (s *AuthService) RequireWebAuth() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		// 从 Authorization 头获取Token
 		authHeader := c.GetHeader("Authorization")
@@ -250,8 +412,14 @@ func (s *AuthService) RequireTokenAuth() gin.HandlerFunc {
 			if strings.HasPrefix(authHeader, prefix) {
 				token := strings.TrimPrefix(authHeader, prefix)
 
-				// 检查动态Token（登录生成的24小时Token）
-				if s.isValidToken(token) {
+				session, ok, err := s.webSession(token)
+				if err != nil {
+					RespondErrorMsg(c, http.StatusServiceUnavailable, "authorization backend unavailable")
+					c.Abort()
+					return
+				}
+				if ok {
+					c.Set(webIdentityContextKey, WebIdentity{Role: session.Role, AuthTokenID: session.AuthTokenID, SessionHash: session.TokenHash})
 					c.Next()
 					return
 				}
@@ -264,10 +432,140 @@ func (s *AuthService) RequireTokenAuth() gin.HandlerFunc {
 	}
 }
 
+// RequireAdminAuth accepts only administrator web sessions.
+func (s *AuthService) RequireAdminAuth() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		authHeader := c.GetHeader("Authorization")
+		token, ok := strings.CutPrefix(authHeader, "Bearer ")
+		if !ok {
+			RespondErrorMsg(c, http.StatusUnauthorized, "未授权访问，请先登录")
+			c.Abort()
+			return
+		}
+		session, ok, err := s.webSession(token)
+		if err != nil {
+			RespondErrorMsg(c, http.StatusServiceUnavailable, "authorization backend unavailable")
+			c.Abort()
+			return
+		}
+		if !ok {
+			RespondErrorMsg(c, http.StatusUnauthorized, "未授权访问，请先登录")
+			c.Abort()
+			return
+		}
+		if session.Role != model.WebRoleAdmin {
+			RespondErrorMsg(c, http.StatusForbidden, "管理员权限不足")
+			c.Abort()
+			return
+		}
+		c.Set(webIdentityContextKey, WebIdentity{Role: session.Role, SessionHash: session.TokenHash})
+		c.Next()
+	}
+}
+
+// RequireWebAPITokenProxyAuth attaches the backing API-token identity to a
+// token-scoped web request before it enters the normal proxy handler.
+func (s *AuthService) RequireWebAPITokenProxyAuth() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		identity, ok := WebIdentityFromContext(c)
+		if !ok || identity.Role != model.WebRoleAPIToken || identity.AuthTokenID <= 0 {
+			RespondErrorMsg(c, http.StatusForbidden, "API Token 会话权限不足")
+			c.Abort()
+			return
+		}
+		if err := s.refreshAuthTokensIfStale(); err != nil {
+			RespondErrorMsg(c, http.StatusServiceUnavailable, "authorization backend unavailable")
+			c.Abort()
+			return
+		}
+
+		s.authTokensMux.RLock()
+		tokenHash, exists := s.authTokenHashes[identity.AuthTokenID]
+		expiresAt := s.authTokens[tokenHash]
+		s.authTokensMux.RUnlock()
+		if !exists || (expiresAt > 0 && time.Now().UnixMilli() > expiresAt) {
+			RespondErrorMsg(c, http.StatusUnauthorized, "API Token 已失效")
+			c.Abort()
+			return
+		}
+
+		releaseTokenSlot, activeConns, maxConns, acquired := s.prepareAPIIdentity(c, tokenHash, identity.AuthTokenID)
+		if !acquired {
+			RespondErrorWithData(c, http.StatusTooManyRequests, "Token concurrency limit exceeded", gin.H{
+				"message": fmt.Sprintf("Token concurrency limit exceeded: %d active of %d limit", activeConns, maxConns),
+				"type":    "rate_limit_error",
+				"code":    "token_concurrency_exceeded",
+			})
+			c.Abort()
+			return
+		}
+		defer releaseTokenSlot()
+
+		c.Next()
+	}
+}
+
+func (s *AuthService) prepareAPIIdentity(c *gin.Context, tokenHash string, tokenID int64) (func(), int, int, bool) {
+	release, activeConns, maxConns, ok := s.acquireTokenConcurrencySlot(tokenHash)
+	if !ok {
+		return nil, activeConns, maxConns, false
+	}
+	s.attachAPIIdentity(c, tokenHash, tokenID)
+	return release, activeConns, maxConns, true
+}
+
+func (s *AuthService) attachAPIIdentity(c *gin.Context, tokenHash string, tokenID int64) {
+	c.Set("token_hash", tokenHash)
+	if tokenID > 0 {
+		c.Set("token_id", tokenID)
+	}
+	select {
+	case s.lastUsedCh <- tokenHash:
+	default:
+	}
+}
+
+func (s *AuthService) resolveAuthToken(token string) (tokenHash string, expiresAt, tokenID int64, exists bool) {
+	s.authTokensMux.RLock()
+	defer s.authTokensMux.RUnlock()
+
+	tokenHash = token
+	expiresAt, exists = s.authTokens[tokenHash]
+	if !exists {
+		tokenHash = model.HashToken(token)
+		expiresAt, exists = s.authTokens[tokenHash]
+	}
+	if exists {
+		tokenID = s.authTokenIDs[tokenHash]
+	}
+	return tokenHash, expiresAt, tokenID, exists
+}
+
+// IsTokenActive revalidates the identity attached to a long-lived connection.
+// Missing tokens fail closed: the absence of restriction maps must never turn a
+// revoked token into an unrestricted token.
+func (s *AuthService) IsTokenActive(tokenHash string) bool {
+	if s == nil || strings.TrimSpace(tokenHash) == "" {
+		return false
+	}
+	if err := s.refreshAuthTokensIfStale(); err != nil {
+		return false
+	}
+	s.authTokensMux.RLock()
+	expiresAt, exists := s.authTokens[tokenHash]
+	s.authTokensMux.RUnlock()
+	return exists && (expiresAt <= 0 || time.Now().UnixMilli() <= expiresAt)
+}
+
 // RequireAPIAuth API 认证中间件（代理 API 使用）
 // [FIX] 2025-12: 添加过期时间校验，支持懒惰剔除过期令牌
 func (s *AuthService) RequireAPIAuth() gin.HandlerFunc {
 	return func(c *gin.Context) {
+		if err := s.refreshAuthTokensIfStale(); err != nil {
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "authorization backend unavailable"})
+			c.Abort()
+			return
+		}
 		// 未配置认证令牌时，默认全部返回 401（不允许公开访问）
 		s.authTokensMux.RLock()
 		tokenCount := len(s.authTokens)
@@ -326,17 +624,7 @@ func (s *AuthService) RequireAPIAuth() gin.HandlerFunc {
 		}
 
 		// 双路径验证：先尝试直接匹配（客户端发送的是hash值），再尝试SHA256匹配（客户端发送的是明文）
-		s.authTokensMux.RLock()
-		var tokenHash string
-		expiresAt, exists := s.authTokens[token]
-		if exists {
-			tokenHash = token
-		} else {
-			tokenHash = model.HashToken(token)
-			expiresAt, exists = s.authTokens[tokenHash]
-		}
-		tokenID, hasTokenID := s.authTokenIDs[tokenHash]
-		s.authTokensMux.RUnlock()
+		tokenHash, expiresAt, tokenID, exists := s.resolveAuthToken(token)
 
 		if !exists {
 			c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid or missing authorization"})
@@ -350,18 +638,30 @@ func (s *AuthService) RequireAPIAuth() gin.HandlerFunc {
 			s.authTokensMux.Lock()
 			delete(s.authTokens, tokenHash)
 			delete(s.authTokenIDs, tokenHash)
+			delete(s.authTokenHashes, tokenID)
 			delete(s.authTokenModels, tokenHash)
 			delete(s.authTokenChannels, tokenHash)
 			delete(s.authTokenCostLimits, tokenHash)
 			delete(s.authTokenMaxConns, tokenHash)
 			s.authTokensMux.Unlock()
+			if tokenID > 0 {
+				if err := s.revokeWebSessions([]int64{tokenID}); err != nil {
+					log.Printf("[WARN] 撤销过期 API Token 的 Web 会话失败: %v", err)
+				}
+			}
 
 			c.JSON(http.StatusUnauthorized, gin.H{"error": "token expired"})
 			c.Abort()
 			return
 		}
 
-		releaseTokenSlot, activeConns, maxConns, acquired := s.acquireTokenConcurrencySlot(tokenHash)
+		if isResponsesWebsocketUpgradeRequest(c.Request) {
+			s.attachAPIIdentity(c, tokenHash, tokenID)
+			c.Next()
+			return
+		}
+
+		releaseTokenSlot, activeConns, maxConns, acquired := s.prepareAPIIdentity(c, tokenHash, tokenID)
 		if !acquired {
 			c.JSON(http.StatusTooManyRequests, gin.H{
 				"error": gin.H{
@@ -374,19 +674,6 @@ func (s *AuthService) RequireAPIAuth() gin.HandlerFunc {
 			return
 		}
 		defer releaseTokenSlot()
-
-		// 将tokenHash和tokenID存储到context，供后续统计使用（2025-11新增tokenHash, 2025-12新增tokenID）
-		c.Set("token_hash", tokenHash)
-		if hasTokenID {
-			c.Set("token_id", tokenID)
-		}
-
-		// 异步更新last_used_at（发送到受控worker，不阻塞请求）
-		select {
-		case s.lastUsedCh <- tokenHash:
-		default:
-			// channel满时丢弃，避免阻塞（last_used_at非关键数据）
-		}
 
 		c.Next()
 	}
@@ -401,18 +688,10 @@ func (s *AuthService) RequireAPIAuth() gin.HandlerFunc {
 func (s *AuthService) HandleLogin(c *gin.Context) {
 	clientIP := c.ClientIP()
 
-	// 检查速率限制
-	if !s.loginRateLimiter.AllowAttempt(clientIP) {
-		lockoutTime := s.loginRateLimiter.GetLockoutTime(clientIP)
-		RespondErrorWithData(c, http.StatusTooManyRequests, "Too many failed login attempts", gin.H{
-			"message":         fmt.Sprintf("Account locked for %d seconds. Please try again later.", lockoutTime),
-			"lockout_seconds": lockoutTime,
-		})
-		return
-	}
-
 	var req struct {
-		Password string `json:"password" binding:"required"`
+		Mode     model.WebRole `json:"mode" binding:"required"`
+		Password string        `json:"password"`
+		Token    string        `json:"token"`
 	}
 
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -420,19 +699,52 @@ func (s *AuthService) HandleLogin(c *gin.Context) {
 		return
 	}
 
-	// 验证密码（bcrypt安全比较）
-	if err := bcrypt.CompareHashAndPassword(s.passwordHash, []byte(req.Password)); err != nil {
-		// 记录失败尝试（速率限制器已在AllowAttempt中增加计数）
-		attemptCount := s.loginRateLimiter.GetAttemptCount(clientIP)
-		log.Printf("[WARN]  登录失败: IP=%s, 尝试次数=%d/5", clientIP, attemptCount)
-
-		// [SECURITY] 不返回剩余尝试次数，避免攻击者推断速率限制状态
-		RespondErrorMsg(c, http.StatusUnauthorized, "Invalid password")
+	var session model.WebSession
+	switch req.Mode {
+	case model.WebRoleAdmin:
+		adminRateKey := "admin:" + clientIP
+		if !s.loginRateLimiter.AllowAttempt(adminRateKey) {
+			lockoutTime := s.loginRateLimiter.GetLockoutTime(adminRateKey)
+			RespondErrorWithData(c, http.StatusTooManyRequests, "Too many failed login attempts", gin.H{
+				"message":         fmt.Sprintf("Account locked for %d seconds. Please try again later.", lockoutTime),
+				"lockout_seconds": lockoutTime,
+			})
+			return
+		}
+		if err := bcrypt.CompareHashAndPassword(s.passwordHash, []byte(req.Password)); err != nil {
+			attemptCount := s.loginRateLimiter.GetAttemptCount(adminRateKey)
+			log.Printf("[WARN] 登录失败: IP=%s, 尝试次数=%d/5", clientIP, attemptCount)
+			RespondErrorMsg(c, http.StatusUnauthorized, "Invalid credentials")
+			return
+		}
+		s.loginRateLimiter.RecordSuccess(adminRateKey)
+		session.Role = model.WebRoleAdmin
+	case model.WebRoleAPIToken:
+		if err := s.refreshAuthTokensIfStale(); err != nil {
+			RespondErrorMsg(c, http.StatusServiceUnavailable, "authorization backend unavailable")
+			return
+		}
+		_, expiresAt, tokenID, exists := s.resolveAuthToken(strings.TrimSpace(req.Token))
+		if !exists || tokenID <= 0 || (expiresAt > 0 && time.Now().UnixMilli() > expiresAt) {
+			RespondErrorMsg(c, http.StatusUnauthorized, "Invalid credentials")
+			return
+		}
+		allowed, retryAfter := s.apiTokenSessionLimiter.allow(tokenID)
+		if !allowed {
+			retryAfterSeconds := int((retryAfter + time.Second - 1) / time.Second)
+			c.Header("Retry-After", fmt.Sprintf("%d", retryAfterSeconds))
+			RespondErrorWithData(c, http.StatusTooManyRequests, "Too many API Token web sessions", gin.H{
+				"message":             fmt.Sprintf("API Token web session limit exceeded. Please retry in %d seconds.", retryAfterSeconds),
+				"retry_after_seconds": retryAfterSeconds,
+			})
+			return
+		}
+		session.Role = model.WebRoleAPIToken
+		session.AuthTokenID = tokenID
+	default:
+		RespondErrorMsg(c, http.StatusBadRequest, "Invalid request format")
 		return
 	}
-
-	// 密码正确，重置速率限制
-	s.loginRateLimiter.RecordSuccess(clientIP)
 
 	// 生成Token
 	token, err := s.generateToken()
@@ -442,13 +754,15 @@ func (s *AuthService) HandleLogin(c *gin.Context) {
 		return
 	}
 	expiry := time.Now().Add(config.TokenExpiry)
+	session.ExpiresAt = expiry
 
 	// [INFO] 安全修复：存储tokenHash而非明文(2025-12)
 	tokenHash := model.HashToken(token)
 
 	// 存储TokenHash到内存
 	s.tokensMux.Lock()
-	s.validTokens[tokenHash] = expiry
+	session.TokenHash = tokenHash
+	s.validTokens[tokenHash] = session
 	s.tokensMux.Unlock()
 
 	// [INFO] 修复：同步写入数据库（SQLite本地写入极快，微秒级，无需异步）
@@ -457,8 +771,8 @@ func (s *AuthService) HandleLogin(c *gin.Context) {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 
-	if err := s.store.CreateAdminSession(ctx, token, expiry); err != nil {
-		log.Printf("[WARN]  保存管理员会话到数据库失败: %v", err)
+	if err := s.store.CreateWebSession(ctx, token, session); err != nil {
+		log.Printf("[WARN] 保存 Web 会话到数据库失败: %v", err)
 		// 注意：内存中的token仍然有效，下次重启会丢失此会话
 	}
 
@@ -468,6 +782,7 @@ func (s *AuthService) HandleLogin(c *gin.Context) {
 	RespondJSON(c, http.StatusOK, gin.H{
 		"token":     token,                             // 明文token返回给客户端
 		"expiresIn": int(config.TokenExpiry.Seconds()), // 秒数
+		"role":      session.Role,
 	})
 }
 
@@ -483,9 +798,7 @@ func (s *AuthService) HandleLogout(c *gin.Context) {
 		tokenHash := model.HashToken(token)
 
 		// 删除内存中的TokenHash
-		s.tokensMux.Lock()
-		delete(s.validTokens, tokenHash)
-		s.tokensMux.Unlock()
+		s.deleteWebSession(tokenHash)
 
 		// [INFO] 修复：同步删除数据库中的会话（SQLite本地删除极快，微秒级，无需异步）
 		// 原因：异步goroutine未受控，关机时可能写入已关闭的连接
@@ -493,7 +806,7 @@ func (s *AuthService) HandleLogout(c *gin.Context) {
 		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 		defer cancel()
 
-		if err := s.store.DeleteAdminSession(ctx, token); err != nil {
+		if err := s.store.DeleteWebSession(ctx, token); err != nil {
 			log.Printf("[WARN]  删除数据库会话失败: %v", err)
 		}
 	}
@@ -509,6 +822,26 @@ func (s *AuthService) HandleLogout(c *gin.Context) {
 // 用于CRUD操作后立即生效，无需重启服务
 // [FIX] 2025-12: 同时加载过期时间，支持懒惰过期校验
 func (s *AuthService) ReloadAuthTokens() error {
+	s.authTokensRefreshMu.Lock()
+	defer s.authTokensRefreshMu.Unlock()
+	return s.reloadAuthTokensAndRecordStateLocked()
+}
+
+func (s *AuthService) reloadAuthTokensAndRecordStateLocked() error {
+	err := s.reloadAuthTokensLocked()
+	if err != nil {
+		// 数据库中的权限可能已经变化。旧快照即使刚加载过也不能继续被信任。
+		s.authTokensReloadAt.Store(0)
+		s.authTokensReloadErr = err
+		s.authTokensNextRetry = time.Now().Add(time.Second)
+		return err
+	}
+	s.authTokensReloadErr = nil
+	s.authTokensNextRetry = time.Time{}
+	return nil
+}
+
+func (s *AuthService) reloadAuthTokensLocked() error {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
@@ -516,12 +849,14 @@ func (s *AuthService) ReloadAuthTokens() error {
 	if err != nil {
 		return fmt.Errorf("reload auth tokens: %w", err)
 	}
+	periodNow := time.Now()
 
 	// 构建新的令牌映射（存储过期时间而非bool）
 	newTokens := make(map[string]int64, len(tokens))
 	newTokenIDs := make(map[string]int64, len(tokens))
+	newTokenHashes := make(map[int64]string, len(tokens))
 	newTokenModels := make(map[string][]string, len(tokens))
-	newTokenChannels := make(map[string][]int64, len(tokens))
+	newTokenChannels := make(map[string]model.ChannelRestriction, len(tokens))
 	newTokenCostLimits := make(map[string]tokenCostLimit, len(tokens))
 	newTokenMaxConns := make(map[string]int, len(tokens))
 	for _, t := range tokens {
@@ -535,19 +870,31 @@ func (s *AuthService) ReloadAuthTokens() error {
 		}
 		newTokens[t.Token] = expiresAt
 		newTokenIDs[t.Token] = t.ID
+		newTokenHashes[t.ID] = t.Token
 		// 只有有限制时才存储（节省内存）
 		if len(t.AllowedModels) > 0 {
 			newTokenModels[t.Token] = t.AllowedModels
 		}
-		if len(t.AllowedChannelIDs) > 0 {
-			newTokenChannels[t.Token] = t.AllowedChannelIDs
+		channelRestriction, err := t.ChannelRestriction()
+		if err != nil {
+			return fmt.Errorf("invalid auth token %d: %w", t.ID, err)
+		}
+		if channelRestriction.Restricted() {
+			newTokenChannels[t.Token] = channelRestriction
 		}
 		// 费用限额：只为“有限额”的令牌维护状态（避免无谓内存占用）
-		limitMicro := t.CostLimitMicroUSD
-		if limitMicro > 0 {
+		if t.HasCostLimit() {
+			dailyUsed, monthlyUsed := t.CurrentPeriodCostUsed(periodNow)
+			dayStart, monthStart := model.AuthTokenCostPeriodStarts(periodNow)
 			newTokenCostLimits[t.Token] = tokenCostLimit{
-				usedMicroUSD:  t.CostUsedMicroUSD,
-				limitMicroUSD: limitMicro,
+				usedMicroUSD:         t.CostUsedMicroUSD,
+				limitMicroUSD:        t.CostLimitMicroUSD,
+				dailyUsedMicroUSD:    dailyUsed,
+				dailyLimitMicroUSD:   t.CostDailyLimitMicroUSD,
+				dailyPeriodStart:     dayStart,
+				monthlyUsedMicroUSD:  monthlyUsed,
+				monthlyLimitMicroUSD: t.CostMonthlyLimitMicroUSD,
+				monthlyPeriodStart:   monthStart,
 			}
 		}
 		if t.MaxConcurrency > 0 {
@@ -557,24 +904,102 @@ func (s *AuthService) ReloadAuthTokens() error {
 
 	// 原子替换（避免读写竞争）
 	s.authTokensMux.Lock()
+	revokedTokenIDs := make([]int64, 0)
+	now := time.Now().UnixMilli()
+	for tokenID, oldHash := range s.authTokenHashes {
+		newHash, active := newTokenHashes[tokenID]
+		oldExpiresAt := s.authTokens[oldHash]
+		if !active || newHash != oldHash || (oldExpiresAt > 0 && now > oldExpiresAt) {
+			revokedTokenIDs = append(revokedTokenIDs, tokenID)
+		}
+	}
 	// [FIX] P0-1: 防止 DB 滞后值覆盖内存实时累加。
 	// AddCostToCache 只更新内存，DB 由 UpdateTokenStats 异步落盘；reload 读到的 DB used
 	// 可能落后于内存累加。内存累加恒 ≥ 已落盘值，故取 max 保留未落盘的记账，避免限额被绕过。
 	// （管理员清零额度应走专门接口同步清内存，不依赖 reload 路径。）
 	for tok, lim := range newTokenCostLimits {
-		if old, ok := s.authTokenCostLimits[tok]; ok && old.usedMicroUSD > lim.usedMicroUSD {
-			lim.usedMicroUSD = old.usedMicroUSD
-			newTokenCostLimits[tok] = lim
+		old, ok := s.authTokenCostLimits[tok]
+		if !ok {
+			continue
 		}
+		if old.usedMicroUSD > lim.usedMicroUSD {
+			lim.usedMicroUSD = old.usedMicroUSD
+		}
+		if old.dailyPeriodStart == lim.dailyPeriodStart && old.dailyUsedMicroUSD > lim.dailyUsedMicroUSD {
+			lim.dailyUsedMicroUSD = old.dailyUsedMicroUSD
+		}
+		if old.monthlyPeriodStart == lim.monthlyPeriodStart && old.monthlyUsedMicroUSD > lim.monthlyUsedMicroUSD {
+			lim.monthlyUsedMicroUSD = old.monthlyUsedMicroUSD
+		}
+		newTokenCostLimits[tok] = lim
 	}
 	s.authTokens = newTokens
 	s.authTokenIDs = newTokenIDs
+	s.authTokenHashes = newTokenHashes
 	s.authTokenModels = newTokenModels
 	s.authTokenChannels = newTokenChannels
 	s.authTokenCostLimits = newTokenCostLimits
 	s.authTokenMaxConns = newTokenMaxConns
 	s.authTokensMux.Unlock()
+	s.authTokensReloadAt.Store(time.Now().UnixMilli())
+	if err := s.revokeWebSessions(revokedTokenIDs); err != nil {
+		return fmt.Errorf("revoke web sessions: %w", err)
+	}
 
+	return nil
+}
+
+func (s *AuthService) refreshAuthTokensIfStale() error {
+	if s == nil || s.store == nil {
+		return nil
+	}
+	lastReload := s.authTokensReloadAt.Load()
+	if lastReload > 0 && time.Since(time.UnixMilli(lastReload)) < authTokenReloadInterval {
+		return nil
+	}
+
+	s.authTokensRefreshMu.Lock()
+	defer s.authTokensRefreshMu.Unlock()
+	lastReload = s.authTokensReloadAt.Load()
+	if lastReload > 0 && time.Since(time.UnixMilli(lastReload)) < authTokenReloadInterval {
+		return nil
+	}
+	if time.Now().Before(s.authTokensNextRetry) {
+		return s.authTokensReloadErr
+	}
+	return s.reloadAuthTokensAndRecordStateLocked()
+}
+
+func (s *AuthService) revokeWebSessions(tokenIDs []int64) error {
+	if len(tokenIDs) == 0 {
+		return nil
+	}
+	revoked := make(map[int64]struct{}, len(tokenIDs))
+	for _, tokenID := range tokenIDs {
+		revoked[tokenID] = struct{}{}
+	}
+
+	s.tokensMux.Lock()
+	revokedSessionHashes := make([]string, 0)
+	for tokenHash, session := range s.validTokens {
+		if _, ok := revoked[session.AuthTokenID]; ok {
+			delete(s.validTokens, tokenHash)
+			revokedSessionHashes = append(revokedSessionHashes, tokenHash)
+		}
+	}
+	s.tokensMux.Unlock()
+	s.notifyWebSessionRevoked(revokedSessionHashes)
+
+	if s.store == nil {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	for _, tokenID := range tokenIDs {
+		if err := s.store.DeleteWebSessionsByAuthTokenID(ctx, tokenID); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
@@ -622,26 +1047,17 @@ func (s *AuthService) IsModelAllowed(tokenHash, model string) bool {
 	return ok
 }
 
-func (s *AuthService) getAllowedChannelSet(tokenHash string) (map[int64]struct{}, bool) {
+func (s *AuthService) getChannelRestriction(tokenHash string) (model.ChannelRestriction, bool) {
 	s.authTokensMux.RLock()
-	allowedChannels, hasRestriction := s.authTokenChannels[tokenHash]
+	restriction, hasRestriction := s.authTokenChannels[tokenHash]
 	s.authTokensMux.RUnlock()
-
-	if !hasRestriction || len(allowedChannels) == 0 {
-		return nil, false
-	}
-
-	allowedSet := make(map[int64]struct{}, len(allowedChannels))
-	for _, channelID := range allowedChannels {
-		allowedSet[channelID] = struct{}{}
-	}
-	return allowedSet, true
+	return restriction, hasRestriction
 }
 
 // FilterAllowedChannels 按 token 的渠道限制过滤候选渠道。
 // 返回值 restricted 表示该 token 是否启用了渠道限制。
 func (s *AuthService) FilterAllowedChannels(tokenHash string, channels []*model.Config) ([]*model.Config, bool) {
-	allowedSet, hasRestriction := s.getAllowedChannelSet(tokenHash)
+	restriction, hasRestriction := s.getChannelRestriction(tokenHash)
 	if !hasRestriction || len(channels) == 0 {
 		return channels, hasRestriction
 	}
@@ -651,7 +1067,7 @@ func (s *AuthService) FilterAllowedChannels(tokenHash string, channels []*model.
 		if cfg == nil {
 			continue
 		}
-		if _, ok := allowedSet[cfg.ID]; ok {
+		if restriction.Allows(cfg.ID) {
 			filtered = append(filtered, cfg)
 		}
 	}
@@ -661,12 +1077,11 @@ func (s *AuthService) FilterAllowedChannels(tokenHash string, channels []*model.
 // IsChannelAllowed 检查令牌是否允许访问指定渠道
 // 如果令牌没有渠道限制，返回 true
 func (s *AuthService) IsChannelAllowed(tokenHash string, channelID int64) bool {
-	allowedSet, hasRestriction := s.getAllowedChannelSet(tokenHash)
+	restriction, hasRestriction := s.getChannelRestriction(tokenHash)
 	if !hasRestriction {
 		return true
 	}
-	_, ok := allowedSet[channelID]
-	return ok
+	return restriction.Allows(channelID)
 }
 
 func (s *AuthService) acquireTokenConcurrencySlot(tokenHash string) (release func(), active, limit int, ok bool) {
@@ -709,29 +1124,32 @@ func (s *AuthService) acquireTokenConcurrencySlot(tokenHash string) (release fun
 // IsCostLimitExceeded 检查令牌是否超过费用限额（微美元，整数比较）
 // 若令牌无限额/未启用限额：exceeded=false 且 used/limit=0
 func (s *AuthService) IsCostLimitExceeded(tokenHash string) (usedMicroUSD, limitMicroUSD int64, exceeded bool) {
+	usedMicroUSD, limitMicroUSD, _, exceeded = s.costLimitState(tokenHash)
+	return usedMicroUSD, limitMicroUSD, exceeded
+}
+
+func (s *AuthService) costLimitState(tokenHash string) (usedMicroUSD, limitMicroUSD int64, window string, exceeded bool) {
 	s.authTokensMux.RLock()
 	v, ok := s.authTokenCostLimits[tokenHash]
 	s.authTokensMux.RUnlock()
 
-	if !ok || v.limitMicroUSD <= 0 {
-		return 0, 0, false
+	if !ok {
+		return 0, 0, "", false
 	}
-
-	return v.usedMicroUSD, v.limitMicroUSD, v.usedMicroUSD >= v.limitMicroUSD
+	return v.applyPeriod(time.Now()).exceededWindow()
 }
 
-// AddCostToCache 原子更新令牌的已消耗费用缓存
-// 仅更新内存缓存，数据库更新由 UpdateTokenStats 异步处理
-func (s *AuthService) AddCostToCache(tokenHash string, deltaMicroUSD int64) {
+// AddCostToCache 原子更新令牌的已消耗费用缓存。
+// completedAt 决定日/月周期归属，数据库更新由 UpdateTokenStats 异步处理。
+func (s *AuthService) AddCostToCache(tokenHash string, deltaMicroUSD int64, completedAt time.Time) {
 	if deltaMicroUSD <= 0 {
 		return
 	}
 
 	s.authTokensMux.Lock()
 	v, ok := s.authTokenCostLimits[tokenHash]
-	if ok && v.limitMicroUSD > 0 {
-		v.usedMicroUSD += deltaMicroUSD
-		s.authTokenCostLimits[tokenHash] = v
+	if ok {
+		s.authTokenCostLimits[tokenHash] = v.addCost(deltaMicroUSD, completedAt)
 	}
 	s.authTokensMux.Unlock()
 }

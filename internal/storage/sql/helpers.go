@@ -14,7 +14,6 @@ import (
 type ChannelInfo struct {
 	Name           string
 	Priority       int
-	Type           string
 	CostMultiplier float64
 }
 
@@ -30,12 +29,11 @@ func (s *SQLStore) fetchChannelInfoBatch(ctx context.Context, channelIDs map[int
 
 	// 查询所有渠道（全表扫描，渠道数<1000时比IN子查询更快）
 	// 优势：固定SQL（查询计划缓存）、无动态参数绑定、代码简单
-	rows, err := s.db.QueryContext(ctx, `
+	rows, err := s.QueryContext(ctx, `
 		SELECT
 			id,
 			name,
 			priority,
-			LOWER(COALESCE(NULLIF(TRIM(channel_type), ''), 'anthropic')),
 			COALESCE(cost_multiplier, 1)
 		FROM channels
 	`)
@@ -50,9 +48,8 @@ func (s *SQLStore) fetchChannelInfoBatch(ctx context.Context, channelIDs map[int
 		var id int64
 		var name string
 		var priority int
-		var channelType string
 		var costMultiplier float64
-		if err := rows.Scan(&id, &name, &priority, &channelType, &costMultiplier); err != nil {
+		if err := rows.Scan(&id, &name, &priority, &costMultiplier); err != nil {
 			log.Printf("[WARN] 扫描渠道信息失败: %v", err)
 			continue // 跳过扫描错误的行
 		}
@@ -61,7 +58,6 @@ func (s *SQLStore) fetchChannelInfoBatch(ctx context.Context, channelIDs map[int
 			channelInfos[id] = ChannelInfo{
 				Name:           name,
 				Priority:       priority,
-				Type:           channelType,
 				CostMultiplier: normalizeCostMultiplier(costMultiplier),
 			}
 		}
@@ -104,7 +100,7 @@ func (s *SQLStore) fetchAuthTokenDescriptionsBatch(ctx context.Context, tokenIDs
 	query := "SELECT id, description FROM auth_tokens WHERE id IN (" +
 		strings.Join(placeholders, ",") + ")"
 
-	rows, err := s.db.QueryContext(ctx, query, ids...)
+	rows, err := s.QueryContext(ctx, query, ids...)
 	if err != nil {
 		return nil, fmt.Errorf("query auth token descriptions: %w", err)
 	}
@@ -142,7 +138,7 @@ func (s *SQLStore) fetchChannelIDsByNameFilter(ctx context.Context, exact string
 		return nil, nil
 	}
 
-	rows, err := s.db.QueryContext(ctx, query, args...)
+	rows, err := s.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("query channel ids by name: %w", err)
 	}
@@ -162,53 +158,16 @@ func (s *SQLStore) fetchChannelIDsByNameFilter(ctx context.Context, exact string
 	return ids, nil
 }
 
-// fetchChannelIDsByType 根据暴露协议获取渠道ID集合：原生 channel_type 或 protocol_transforms 均匹配。
-// 目的：避免跨库JOIN，先解析为ID再过滤logs
-func (s *SQLStore) fetchChannelIDsByType(ctx context.Context, channelType string) ([]int64, error) {
-	if channelType == "" {
-		return nil, nil
-	}
-
-	query := `
-		SELECT id
-		FROM channels c
-		WHERE c.channel_type = ?
-		   OR EXISTS (
-		       SELECT 1
-		       FROM channel_protocol_transforms cpt
-		       WHERE cpt.channel_id = c.id AND cpt.protocol = ?
-		   )
-	`
-	rows, err := s.db.QueryContext(ctx, query, channelType, channelType)
-	if err != nil {
-		return nil, fmt.Errorf("query channel ids by type: %w", err)
-	}
-	defer func() { _ = rows.Close() }()
-
-	var ids []int64
-	for rows.Next() {
-		var id int64
-		if err := rows.Scan(&id); err != nil {
-			return nil, fmt.Errorf("scan channel id: %w", err)
-		}
-		ids = append(ids, id)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	return ids, nil
-}
-
-// applyChannelFilter 应用渠道类型或名称过滤（优先级：ChannelType > ChannelName/Like）
-// 返回值：是否应用了过滤、是否为空结果、错误
+// applyChannelFilter 将渠道名称过滤解析为渠道 ID。
+// 返回值：是否为空结果、错误
 // 注意：ChannelID 精确匹配不在此处处理，由 QueryBuilder.ApplyFilter 负责
-func (s *SQLStore) applyChannelFilter(ctx context.Context, qb *QueryBuilder, filter *model.LogFilter) (bool, bool, error) {
+func (s *SQLStore) applyChannelFilter(ctx context.Context, qb *QueryBuilder, filter *model.LogFilter) (bool, error) {
 	channelIDs, isEmpty, err := s.resolveChannelFilter(ctx, filter)
 	if err != nil {
-		return false, false, err
+		return false, err
 	}
 	if isEmpty {
-		return true, true, nil
+		return true, nil
 	}
 	if len(channelIDs) > 0 {
 		vals := make([]any, 0, len(channelIDs))
@@ -216,24 +175,8 @@ func (s *SQLStore) applyChannelFilter(ctx context.Context, qb *QueryBuilder, fil
 			vals = append(vals, id)
 		}
 		qb.WhereIn("channel_id", vals)
-		return true, false, nil
 	}
-	return false, false, nil
-}
-
-// intersectIDs 计算两个ID切片的交集
-func intersectIDs(a, b []int64) []int64 {
-	set := make(map[int64]bool, len(a))
-	for _, id := range a {
-		set[id] = true
-	}
-	var result []int64
-	for _, id := range b {
-		if set[id] {
-			result = append(result, id)
-		}
-	}
-	return result
+	return false, nil
 }
 
 // timeToUnix 将时间转换为Unix时间戳（秒）
@@ -247,13 +190,29 @@ func unixToTime(ts int64) time.Time {
 	return time.Unix(ts, 0)
 }
 
-// boolToInt 将布尔值转换为整数
-// SQLite和MySQL都使用 1=true, 0=false
-func boolToInt(b bool) int {
-	if b {
-		return 1
+// normalizeSQLArgs 将领域布尔值转换为三种数据库统一使用的整数布尔值。
+// 仅在遇到 bool 时复制参数，避免修改调用方复用的切片。
+func normalizeSQLArgs(args []any) []any {
+	for i, arg := range args {
+		if _, ok := arg.(bool); !ok {
+			continue
+		}
+
+		normalized := append([]any(nil), args...)
+		for j := i; j < len(normalized); j++ {
+			value, ok := normalized[j].(bool)
+			if !ok {
+				continue
+			}
+			if value {
+				normalized[j] = 1
+			} else {
+				normalized[j] = 0
+			}
+		}
+		return normalized
 	}
-	return 0
+	return args
 }
 
 // normalizeCostMultiplier 规范化成本倍率：负数退化为 1；0 表示免费渠道，保持不变

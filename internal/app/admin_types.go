@@ -4,12 +4,11 @@ import (
 	"encoding/json"
 	"fmt"
 	neturl "net/url"
-	"slices"
 	"strings"
 	"time"
 
+	"ccLoad/internal/cooldown"
 	"ccLoad/internal/model"
-	"ccLoad/internal/protocol"
 	"ccLoad/internal/util"
 )
 
@@ -18,25 +17,29 @@ import (
 
 // ChannelRequest 渠道创建/更新请求结构
 type ChannelRequest struct {
-	Name                  string                    `json:"name" binding:"required"`
-	APIKey                string                    `json:"api_key"`
-	APIKeys               []ChannelAPIKeyRequest    `json:"api_keys,omitempty"`
-	ChannelType           string                    `json:"channel_type,omitempty"` // 渠道类型:anthropic, codex, gemini
-	ProtocolTransformMode string                    `json:"protocol_transform_mode,omitempty"`
-	ProtocolTransforms    []string                  `json:"protocol_transforms,omitempty"`
-	KeyStrategy           string                    `json:"key_strategy,omitempty"` // Key使用策略:sequential, round_robin
-	URL                   string                    `json:"url" binding:"required"`
-	Priority              int                       `json:"priority"`
-	RPMLimit              int                       `json:"rpm_limit"`                       // 每分钟请求数限制，0表示无限制
-	MaxConcurrency        int                       `json:"max_concurrency"`                 // 每个 API Key 的最大并发请求数，0表示无限制
-	Models                []model.ModelEntry        `json:"models" binding:"required,min=1"` // 模型配置（包含重定向）
-	Enabled               bool                      `json:"enabled"`
-	ScheduledCheckEnabled bool                      `json:"scheduled_check_enabled"`
-	ScheduledCheckModel   string                    `json:"scheduled_check_model"`
-	DailyCostLimit        float64                   `json:"daily_cost_limit"` // 每日成本限额（美元），0表示无限制
-	CostMultiplier        float64                   `json:"cost_multiplier"`  // 成本倍率（默认1，0=免费，>=0）
-	CustomRequestRules    *model.CustomRequestRules `json:"custom_request_rules,omitempty"`
-	ProxyURL              string                    `json:"proxy_url,omitempty"` // 渠道级代理（http/https/socks5/socks5h）
+	Name                    string                        `json:"name" binding:"required"`
+	AuthType                string                        `json:"auth_type,omitempty"`
+	APIKey                  string                        `json:"api_key"`
+	APIKeys                 []ChannelAPIKeyRequest        `json:"api_keys,omitempty"`
+	Websockets              bool                          `json:"websockets,omitempty"`
+	ProtocolTransformMode   string                        `json:"protocol_transform_mode,omitempty"`
+	KeyStrategy             string                        `json:"key_strategy,omitempty"` // Key使用策略:sequential, round_robin
+	URLs                    model.ChannelURLs             `json:"urls" binding:"required,min=1"`
+	Priority                int                           `json:"priority"`
+	RPMLimit                int                           `json:"rpm_limit"`                       // 每分钟请求数限制，0表示无限制
+	MaxConcurrency          int                           `json:"max_concurrency"`                 // 最大并发请求数，0表示无限制
+	Models                  []model.ModelEntry            `json:"models" binding:"required,min=1"` // 模型配置（包含重定向）
+	Enabled                 bool                          `json:"enabled"`
+	ScheduledCheckEnabled   bool                          `json:"scheduled_check_enabled"`
+	ScheduledCheckModel     string                        `json:"scheduled_check_model"`
+	DailyCostLimit          float64                       `json:"daily_cost_limit"` // 每日成本限额（美元），0表示无限制
+	CostMultiplier          float64                       `json:"cost_multiplier"`  // 成本倍率（默认1，0=免费，>=0）
+	CustomRequestRules      *model.CustomRequestRules     `json:"custom_request_rules,omitempty"`
+	CooldownDetectionRules  *model.CooldownDetectionRules `json:"cooldown_detection_rules,omitempty"`
+	ProxyURL                string                        `json:"proxy_url,omitempty"` // 渠道级代理（http/https/socks5/socks5h）
+	AvailableTimeStart      string                        `json:"available_time_start,omitempty"`
+	AvailableTimeEnd        string                        `json:"available_time_end,omitempty"`
+	RetryOtherKeysOnFailure bool                          `json:"retry_other_keys_on_failure"`
 }
 
 // ChannelAPIKeyRequest describes one submitted API key and its admin-only note.
@@ -79,7 +82,7 @@ func apiKeyStrings(keys []ChannelAPIKeyRequest) []string {
 	return values
 }
 
-func validateChannelBaseURL(raw string) (string, error) {
+func validateChannelBaseURL(raw, authType string) (string, error) {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
 		return "", fmt.Errorf("url cannot be empty")
@@ -105,9 +108,14 @@ func validateChannelBaseURL(raw string) (string, error) {
 		return "", fmt.Errorf("url must not contain query or fragment")
 	}
 
-	// [FIX] 只禁止包含 /v1 的 path（防止误填 API endpoint 如 /v1/messages）
-	// 允许其他 path（如 /api, /openai 等用于反向代理或 API gateway）
-	if !exactURL && strings.Contains(u.Path, "/v1") {
+	// 普通渠道的 URL 不包含协议端点，运行时会追加 /v1/messages 等路径。
+	// xAI OAuth 是提供商例外：其固定 base URL 本身以 /v1 结尾，运行时只追加 /responses。
+	isXAIVersionedBasePath := model.NormalizeAuthType(authType) == model.AuthTypeXAIOAuth &&
+		strings.HasSuffix(strings.TrimRight(u.Path, "/"), "/v1")
+	// Z.ai Coding Plan is a second exception: ZCode publishes the routed
+	// endpoint (…/api/v1/ultra-zai/anthropic) and runtime appends /v1/messages.
+	isZAIRoutedBasePath := model.NormalizeAuthType(authType) == model.AuthTypeZAIOAuth
+	if !exactURL && !isXAIVersionedBasePath && !isZAIRoutedBasePath && strings.Contains(u.Path, "/v1") {
 		return "", fmt.Errorf("url should not contain API endpoint path like /v1 (current path: %q)", u.Path)
 	}
 
@@ -121,33 +129,47 @@ func validateChannelBaseURL(raw string) (string, error) {
 	return normalized, nil
 }
 
-// validateChannelURLs 校验换行分隔的多URL字段，逐个验证并标准化
-func validateChannelURLs(raw string) (string, error) {
-	if !strings.Contains(raw, "\n") {
-		return validateChannelBaseURL(raw)
+func normalizeChannelProxyURL(raw string) (string, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return "", nil
 	}
-	lines := strings.Split(raw, "\n")
-	var normalized []string
-	seen := make(map[string]struct{}, len(lines))
-	for _, line := range lines {
-		line = strings.TrimSpace(line)
-		if line == "" {
-			continue
+	proxyURL, err := neturl.Parse(raw)
+	if err != nil || proxyURL.Host == "" {
+		return "", fmt.Errorf("invalid proxy_url: %q", raw)
+	}
+	switch proxyURL.Scheme {
+	case "http", "https", "socks5", "socks5h":
+		return raw, nil
+	default:
+		return "", fmt.Errorf("invalid proxy_url scheme: %q (allowed: http, https, socks5, socks5h)", proxyURL.Scheme)
+	}
+}
+
+func validateChannelURLConfigs(urls model.ChannelURLs, authType string) (model.ChannelURLs, error) {
+	urls = urls.Clone()
+	if len(urls) == 0 {
+		return nil, fmt.Errorf("urls cannot be empty")
+	}
+	if err := urls.Normalize(); err != nil {
+		return nil, err
+	}
+	for i := range urls {
+		raw := urls[i].URL
+		if urls[i].Exact {
+			raw += model.ExactUpstreamURLMarker
 		}
-		u, err := validateChannelBaseURL(line)
+		normalized, err := validateChannelBaseURL(raw, authType)
 		if err != nil {
-			return "", err
+			return nil, fmt.Errorf("urls[%d]: %w", i, err)
 		}
-		if _, exists := seen[u]; exists {
-			continue
-		}
-		seen[u] = struct{}{}
-		normalized = append(normalized, u)
+		urls[i].Exact = model.HasExactUpstreamURLMarker(normalized)
+		urls[i].URL = model.StripExactUpstreamURLMarker(normalized)
 	}
-	if len(normalized) == 0 {
-		return "", fmt.Errorf("url cannot be empty")
+	if err := urls.Normalize(); err != nil {
+		return nil, err
 	}
-	return strings.Join(normalized, "\n"), nil
+	return urls, nil
 }
 
 // Validate 实现RequestValidator接口
@@ -157,9 +179,17 @@ func (cr *ChannelRequest) Validate() error {
 	if strings.TrimSpace(cr.Name) == "" {
 		return fmt.Errorf("name cannot be empty")
 	}
+	authType := model.NormalizeAuthType(cr.AuthType)
+	if authType == "" {
+		return fmt.Errorf("invalid auth_type %q", cr.AuthType)
+	}
+	cr.AuthType = authType
 	apiKeys := cr.normalizeAPIKeys()
-	if len(apiKeys) == 0 {
+	if authType == model.AuthTypeAPIKey && len(apiKeys) == 0 {
 		return fmt.Errorf("api_key cannot be empty")
+	}
+	if authType != model.AuthTypeAPIKey && len(apiKeys) != 0 {
+		return fmt.Errorf("OAuth channel cannot contain API keys")
 	}
 	for i, key := range apiKeys {
 		if strings.ContainsAny(key.APIKey, "\x00\r\n") {
@@ -200,38 +230,18 @@ func (cr *ChannelRequest) Validate() error {
 		}
 	}
 
-	// URL 验证：支持换行分隔的多URL，逐个校验并标准化
-	normalizedURL, err := validateChannelURLs(cr.URL)
+	// URL 能力属于具体端点；先规范化结构，再逐项验证网络地址。
+	var err error
+	cr.URLs, err = validateChannelURLConfigs(cr.URLs, authType)
 	if err != nil {
 		return err
 	}
-	cr.URL = normalizedURL
 
-	// [FIX] channel_type 白名单校验 + 标准化
-	// 设计：空值允许（使用默认值anthropic），非空值必须合法
-	cr.ChannelType = strings.TrimSpace(cr.ChannelType)
-	if cr.ChannelType != "" {
-		// 先标准化（小写化）
-		normalized := util.NormalizeChannelType(cr.ChannelType)
-		// 再白名单校验
-		if !util.IsValidChannelType(normalized) {
-			return fmt.Errorf("invalid channel_type: %q (allowed: anthropic, openai, gemini, codex)", cr.ChannelType)
-		}
-		cr.ChannelType = normalized // 应用标准化结果
-	}
 	rawProtocolTransformMode := cr.ProtocolTransformMode
-	cr.ProtocolTransformMode = model.NormalizeProtocolTransformMode(cr.ProtocolTransformMode)
+	cr.ProtocolTransformMode = model.NormalizeProtocolTransformMode(rawProtocolTransformMode)
 	if cr.ProtocolTransformMode == "" {
-		return fmt.Errorf("invalid protocol_transform_mode: %q (allowed: local, upstream)", rawProtocolTransformMode)
+		return fmt.Errorf("invalid protocol_transform_mode: %q (allowed: auto, upstream, local)", rawProtocolTransformMode)
 	}
-	if model.HasExactUpstreamURLMarker(cr.URL) && cr.ProtocolTransformMode == model.ProtocolTransformModeUpstream {
-		return fmt.Errorf("protocol_transform_mode upstream is not allowed when url uses exact upstream marker #")
-	}
-	if err := validateProtocolTransforms(cr.ChannelType, cr.ProtocolTransformMode, cr.ProtocolTransforms); err != nil {
-		return err
-	}
-	cr.ProtocolTransforms = normalizeProtocolTransforms(cr.ChannelType, cr.ProtocolTransformMode, cr.ProtocolTransforms)
-
 	// [FIX] key_strategy 白名单校验 + 标准化
 	// 设计：空值允许（使用默认值sequential），非空值必须合法
 	cr.KeyStrategy = strings.TrimSpace(cr.KeyStrategy)
@@ -251,19 +261,29 @@ func (cr *ChannelRequest) Validate() error {
 	if cr.CustomRequestRules != nil && cr.CustomRequestRules.IsEmpty() {
 		cr.CustomRequestRules = nil
 	}
-
-	cr.ProxyURL = strings.TrimSpace(cr.ProxyURL)
-	if cr.ProxyURL != "" {
-		pu, err := neturl.Parse(cr.ProxyURL)
-		if err != nil || pu.Host == "" {
-			return fmt.Errorf("invalid proxy_url: %q", cr.ProxyURL)
-		}
-		switch pu.Scheme {
-		case "http", "https", "socks5", "socks5h":
-		default:
-			return fmt.Errorf("invalid proxy_url scheme: %q (allowed: http, https, socks5, socks5h)", pu.Scheme)
-		}
+	if err := cooldown.NormalizeCooldownDetectionRules(cr.CooldownDetectionRules); err != nil {
+		return err
 	}
+	if cr.CooldownDetectionRules != nil && cr.CooldownDetectionRules.IsEmpty() {
+		cr.CooldownDetectionRules = nil
+	}
+
+	normalizedProxyURL, err := normalizeChannelProxyURL(cr.ProxyURL)
+	if err != nil {
+		return err
+	}
+	cr.ProxyURL = normalizedProxyURL
+	cr.AvailableTimeStart = strings.TrimSpace(cr.AvailableTimeStart)
+	cr.AvailableTimeEnd = strings.TrimSpace(cr.AvailableTimeEnd)
+	available := &model.Config{
+		AvailableTimeStart: cr.AvailableTimeStart,
+		AvailableTimeEnd:   cr.AvailableTimeEnd,
+	}
+	if err := available.NormalizeAvailableTime(); err != nil {
+		return err
+	}
+	cr.AvailableTimeStart = available.AvailableTimeStart
+	cr.AvailableTimeEnd = available.AvailableTimeEnd
 
 	if cr.RPMLimit < 0 {
 		return fmt.Errorf("rpm_limit must be >= 0 (got %d)", cr.RPMLimit)
@@ -295,22 +315,26 @@ func (cr *ChannelRequest) ToConfig() *model.Config {
 	}
 
 	return &model.Config{
-		Name:                  strings.TrimSpace(cr.Name),
-		ChannelType:           strings.TrimSpace(cr.ChannelType), // 传递渠道类型
-		ProtocolTransformMode: cr.ProtocolTransformMode,
-		ProtocolTransforms:    append([]string(nil), cr.ProtocolTransforms...),
-		URL:                   strings.TrimSpace(cr.URL),
-		Priority:              cr.Priority,
-		RPMLimit:              cr.RPMLimit,
-		MaxConcurrency:        cr.MaxConcurrency,
-		ModelEntries:          normalizedModels,
-		Enabled:               cr.Enabled,
-		ScheduledCheckEnabled: cr.ScheduledCheckEnabled,
-		ScheduledCheckModel:   cr.ScheduledCheckModel,
-		DailyCostLimit:        cr.DailyCostLimit,
-		CostMultiplier:        cr.CostMultiplier,
-		CustomRequestRules:    cr.CustomRequestRules,
-		ProxyURL:              cr.ProxyURL,
+		Name:                    strings.TrimSpace(cr.Name),
+		AuthType:                cr.AuthType,
+		Websockets:              cr.Websockets,
+		ProtocolTransformMode:   cr.ProtocolTransformMode,
+		URLs:                    cr.URLs.Clone(),
+		Priority:                cr.Priority,
+		RPMLimit:                cr.RPMLimit,
+		MaxConcurrency:          cr.MaxConcurrency,
+		ModelEntries:            normalizedModels,
+		Enabled:                 cr.Enabled,
+		ScheduledCheckEnabled:   cr.ScheduledCheckEnabled,
+		ScheduledCheckModel:     cr.ScheduledCheckModel,
+		DailyCostLimit:          cr.DailyCostLimit,
+		CostMultiplier:          cr.CostMultiplier,
+		CustomRequestRules:      cr.CustomRequestRules.Clone(),
+		CooldownDetectionRules:  cr.CooldownDetectionRules.Clone(),
+		ProxyURL:                cr.ProxyURL,
+		AvailableTimeStart:      cr.AvailableTimeStart,
+		AvailableTimeEnd:        cr.AvailableTimeEnd,
+		RetryOtherKeysOnFailure: cr.RetryOtherKeysOnFailure,
 	}
 }
 
@@ -414,70 +438,6 @@ func isValidCustomRulePath(p string) bool {
 	return true
 }
 
-func validateProtocolTransforms(channelType string, protocolTransformMode string, transforms []string) error {
-	base := protocol.Protocol(util.NormalizeChannelType(channelType))
-	mode := model.NormalizeProtocolTransformMode(protocolTransformMode)
-	if mode == "" {
-		mode = model.ProtocolTransformModeUpstream
-	}
-	seen := make(map[string]int, len(transforms))
-	for i, rawProtocol := range transforms {
-		rawProtocol = strings.TrimSpace(rawProtocol)
-		if rawProtocol == "" {
-			return fmt.Errorf("protocol_transforms[%d]: cannot be empty", i)
-		}
-
-		normalized := util.NormalizeChannelType(rawProtocol)
-		if !util.IsValidChannelType(normalized) {
-			return fmt.Errorf("protocol_transforms[%d]: invalid protocol %q (allowed: anthropic, openai, gemini, codex)", i, rawProtocol)
-		}
-		if normalized == string(base) {
-			return fmt.Errorf("protocol_transforms[%d]: %q duplicates channel_type %q", i, normalized, base)
-		}
-		if mode == model.ProtocolTransformModeLocal && !protocol.SupportsTransform(protocol.Protocol(normalized), base) {
-			return fmt.Errorf("protocol_transforms[%d]: unsupported protocol transform %s -> %s", i, normalized, base)
-		}
-		if firstIdx, exists := seen[normalized]; exists {
-			return fmt.Errorf("protocol_transforms[%d]: duplicate protocol %q (already defined at protocol_transforms[%d])", i, normalized, firstIdx)
-		}
-		seen[normalized] = i
-	}
-	return nil
-}
-
-func normalizeProtocolTransforms(channelType string, protocolTransformMode string, transforms []string) []string {
-	base := protocol.Protocol(util.NormalizeChannelType(channelType))
-	mode := model.NormalizeProtocolTransformMode(protocolTransformMode)
-	if mode == "" {
-		mode = model.ProtocolTransformModeUpstream
-	}
-	seen := make(map[string]struct{}, len(transforms))
-	normalized := make([]string, 0, len(transforms))
-	for _, protocolName := range transforms {
-		protocolName = strings.TrimSpace(protocolName)
-		if protocolName == "" {
-			continue
-		}
-		normalizedProtocol := util.NormalizeChannelType(protocolName)
-		if !util.IsValidChannelType(normalizedProtocol) {
-			continue
-		}
-		if normalizedProtocol == string(base) {
-			continue
-		}
-		if mode == model.ProtocolTransformModeLocal && !protocol.SupportsTransform(protocol.Protocol(normalizedProtocol), base) {
-			continue
-		}
-		if _, ok := seen[normalizedProtocol]; ok {
-			continue
-		}
-		seen[normalizedProtocol] = struct{}{}
-		normalized = append(normalized, normalizedProtocol)
-	}
-	slices.Sort(normalized)
-	return normalized
-}
-
 // KeyCooldownInfo Key级别冷却信息
 type KeyCooldownInfo struct {
 	KeyIndex            int        `json:"key_index"`
@@ -485,15 +445,41 @@ type KeyCooldownInfo struct {
 	CooldownRemainingMS int64      `json:"cooldown_remaining_ms,omitempty"`
 }
 
+// ModelCooldownInfo 模型级冷却信息。Model 是实际上游模型名，不是外部别名。
+type ModelCooldownInfo struct {
+	Model               string     `json:"model"`
+	CooldownUntil       *time.Time `json:"cooldown_until,omitempty"`
+	CooldownRemainingMS int64      `json:"cooldown_remaining_ms,omitempty"`
+}
+
+// ChannelModelStats 是渠道编辑器需要的轻量模型统计，避免复用完整统计接口时额外计算 RPM 和健康时间线。
+type ChannelModelStats struct {
+	Model                   string   `json:"model"`
+	Success                 int      `json:"success"`
+	Error                   int      `json:"error"`
+	Total                   int      `json:"total"`
+	AvgFirstByteTimeSeconds *float64 `json:"avg_first_byte_time_seconds,omitempty"`
+	AvgDurationSeconds      *float64 `json:"avg_duration_seconds,omitempty"`
+}
+
 // ChannelWithCooldown 带冷却状态的渠道响应结构
 type ChannelWithCooldown struct {
 	*model.Config
-	KeyStrategy         string            `json:"key_strategy,omitempty"` // [INFO] 修复 (2025-10-11): 添加key_strategy字段
-	CooldownUntil       *time.Time        `json:"cooldown_until,omitempty"`
-	CooldownRemainingMS int64             `json:"cooldown_remaining_ms,omitempty"`
-	KeyCooldowns        []KeyCooldownInfo `json:"key_cooldowns,omitempty"`
-	EffectivePriority   *float64          `json:"effective_priority,omitempty"` // 健康度模式下的有效优先级
-	SuccessRate         *float64          `json:"success_rate,omitempty"`       // 成功率(0-1)
+	CodexPlanType                string              `json:"codex_plan_type,omitempty"`
+	CodexSubscriptionActiveUntil *time.Time          `json:"codex_subscription_active_until,omitempty"`
+	AnthropicPlanType            string              `json:"anthropic_plan_type,omitempty"`
+	OAuthUsage                   *oauthUsageSummary  `json:"oauth_usage,omitempty"`
+	AntigravityPaidTier          string              `json:"antigravity_paid_tier,omitempty"`
+	XAIEmail                     string              `json:"xai_email,omitempty"`
+	XAISubscriptionTier          string              `json:"xai_subscription_tier,omitempty"`
+	XAIEntitlementStatus         string              `json:"xai_entitlement_status,omitempty"`
+	KeyStrategy                  string              `json:"key_strategy,omitempty"` // [INFO] 修复 (2025-10-11): 添加key_strategy字段
+	CooldownUntil                *time.Time          `json:"cooldown_until,omitempty"`
+	CooldownRemainingMS          int64               `json:"cooldown_remaining_ms,omitempty"`
+	KeyCooldowns                 []KeyCooldownInfo   `json:"key_cooldowns,omitempty"`
+	ModelCooldowns               []ModelCooldownInfo `json:"model_cooldowns,omitempty"`
+	EffectivePriority            *float64            `json:"effective_priority,omitempty"` // 健康度模式下的有效优先级
+	SuccessRate                  *float64            `json:"success_rate,omitempty"`       // 成功率(0-1)
 }
 
 // ChannelImportSummary 导入结果统计
@@ -517,19 +503,24 @@ type SettingUpdateRequest struct {
 
 // CheckDuplicateRequest 渠道重复检测请求
 type CheckDuplicateRequest struct {
-	ChannelType string   `json:"channel_type" binding:"required"`
-	URLs        []string `json:"urls"         binding:"required,min=1"`
+	URLs model.ChannelURLs `json:"urls" binding:"required,min=1"`
 }
 
-// Validate 实现 RequestValidator 接口，无额外业务约束
-func (r *CheckDuplicateRequest) Validate() error { return nil }
+// Validate implements RequestValidator.
+func (r *CheckDuplicateRequest) Validate() error {
+	urls, err := validateChannelURLConfigs(r.URLs, model.AuthTypeAPIKey)
+	if err != nil {
+		return err
+	}
+	r.URLs = urls
+	return nil
+}
 
 // DuplicateChannelInfo 重复渠道信息
 type DuplicateChannelInfo struct {
-	ID          int64  `json:"id"`
-	Name        string `json:"name"`
-	ChannelType string `json:"channel_type"`
-	URL         string `json:"url"`
+	ID   int64             `json:"id"`
+	Name string            `json:"name"`
+	URLs model.ChannelURLs `json:"urls"`
 }
 
 // CheckDuplicateResponse 重复检测响应

@@ -6,8 +6,175 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"strings"
 	"time"
+
+	"ccLoad/internal/model"
 )
+
+// logsClientProtocolBackfillCase 按模型名把历史日志分类到四种客户端协议。
+const logsClientProtocolBackfillCase = `CASE
+		WHEN LOWER(TRIM(model)) LIKE 'gpt-5%'
+			OR LOWER(TRIM(model)) LIKE '%/gpt-5%'
+			OR LOWER(TRIM(model)) LIKE 'codex-%'
+			OR LOWER(TRIM(model)) LIKE '%/codex-%'
+			THEN 'codex'
+		WHEN LOWER(TRIM(model)) LIKE 'claude-%'
+			OR LOWER(TRIM(model)) LIKE '%/claude-%'
+			OR LOWER(TRIM(model)) LIKE 'opus-%'
+			OR LOWER(TRIM(model)) LIKE '%/opus-%'
+			OR LOWER(TRIM(model)) LIKE 'sonnet-%'
+			OR LOWER(TRIM(model)) LIKE '%/sonnet-%'
+			OR LOWER(TRIM(model)) LIKE 'haiku-%'
+			OR LOWER(TRIM(model)) LIKE '%/haiku-%'
+			THEN 'anthropic'
+		WHEN LOWER(TRIM(model)) LIKE 'gemini-%'
+			OR LOWER(TRIM(model)) LIKE '%/gemini-%'
+			THEN 'gemini'
+		ELSE 'openai'
+	END`
+
+// backfillLogsClientProtocol 按模型名推断历史日志的 client_protocol。
+//
+// 模型名推断是 best-effort 启发式：client_protocol 的语义是客户端入口协议，与模型名
+// 没有必然对应（经 OpenAI 兼容端点调用 Claude 模型的历史日志会被误标为 anthropic）。
+// 历史数据仅用于统计展示，新日志由代理链路准确写入，误差可接受。
+//
+// 幂等标记在全部步骤完成后写入：中途失败重跑时从剩余未回填行继续。
+func backfillLogsClientProtocol(ctx context.Context, db *sql.DB, dialect Dialect) error {
+	if hasMigration(ctx, db, clientProtocolBackfillMigrationVersion, dialect) {
+		return nil
+	}
+
+	if err := backfillLogsClientProtocolBatches(ctx, db, dialect, 0); err != nil {
+		return err
+	}
+
+	return recordMigration(ctx, db, clientProtocolBackfillMigrationVersion, dialect)
+}
+
+// backfillLogsClientProtocolBatches 分批更新 logs.client_protocol，每批独立提交，
+// 避免单事务全表 UPDATE 在 SQLite 长持写锁、在 MySQL/PG 膨胀 undo/dead tuple。
+func backfillLogsClientProtocolBatches(ctx context.Context, db *sql.DB, dialect Dialect, batchSize int) error {
+	var query string
+	switch dialect {
+	case DialectMySQL:
+		if batchSize <= 0 {
+			batchSize = 10_000
+		}
+		query = "UPDATE logs SET client_protocol = " + logsClientProtocolBackfillCase +
+			" WHERE log_source = 'proxy' AND client_protocol = '' LIMIT ?"
+	default:
+		// SQLite/PostgreSQL 的 UPDATE 不支持 LIMIT，用子查询圈定批次
+		if batchSize <= 0 {
+			batchSize = 5_000
+		}
+		query = "UPDATE logs SET client_protocol = " + logsClientProtocolBackfillCase +
+			" WHERE id IN (SELECT id FROM logs WHERE log_source = 'proxy' AND client_protocol = '' LIMIT ?)"
+	}
+	query = rebindIfPostgres(dialect, query)
+
+	for {
+		res, err := db.ExecContext(ctx, query, batchSize)
+		if err != nil {
+			return fmt.Errorf("classify historical proxy logs: %w", err)
+		}
+		affected, err := res.RowsAffected()
+		if err != nil {
+			return err
+		}
+		if affected == 0 {
+			return nil
+		}
+	}
+}
+
+func migrateChannelURLsToStructuredJSON(ctx context.Context, db *sql.DB, dialect Dialect) error {
+	if hasMigration(ctx, db, structuredChannelURLsMigrationVersion, dialect) {
+		return nil
+	}
+
+	rows, err := db.QueryContext(ctx, "SELECT id, url FROM channels ORDER BY id")
+	if err != nil {
+		return fmt.Errorf("query channel URLs: %w", err)
+	}
+	type candidate struct {
+		id      int64
+		encoded string
+	}
+	candidates := make([]candidate, 0)
+	for rows.Next() {
+		var channelID int64
+		var raw string
+		if err := rows.Scan(&channelID, &raw); err != nil {
+			_ = rows.Close()
+			return fmt.Errorf("scan channel URL: %w", err)
+		}
+
+		trimmed := strings.TrimSpace(raw)
+		if trimmed == "" {
+			_ = rows.Close()
+			return fmt.Errorf("channel %d has empty URL configuration", channelID)
+		}
+
+		var urls model.ChannelURLs
+		jsonErr := json.Unmarshal([]byte(trimmed), &urls)
+		if jsonErr != nil {
+			if strings.HasPrefix(trimmed, "[") || strings.HasPrefix(trimmed, "{") {
+				_ = rows.Close()
+				return fmt.Errorf("channel %d has invalid structured URL JSON: %w", channelID, jsonErr)
+			}
+			for line := range strings.SplitSeq(raw, "\n") {
+				line = strings.TrimSpace(line)
+				if line == "" {
+					continue
+				}
+				exact := model.HasExactUpstreamURLMarker(line)
+				urls = append(urls, model.ChannelURL{
+					URL:   model.StripExactUpstreamURLMarker(line),
+					Exact: exact,
+				})
+			}
+		}
+		if len(urls) == 0 {
+			_ = rows.Close()
+			return fmt.Errorf("channel %d has no valid URLs", channelID)
+		}
+		if err := urls.Normalize(); err != nil {
+			_ = rows.Close()
+			return fmt.Errorf("channel %d: %w", channelID, err)
+		}
+		encoded, err := json.Marshal(urls)
+		if err != nil {
+			_ = rows.Close()
+			return fmt.Errorf("marshal channel %d URLs: %w", channelID, err)
+		}
+		candidates = append(candidates, candidate{id: channelID, encoded: string(encoded)})
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return fmt.Errorf("iterate channel URLs: %w", err)
+	}
+	if err := rows.Close(); err != nil {
+		return fmt.Errorf("close channel URL rows: %w", err)
+	}
+
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin structured URL migration: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	updateSQL := rebindIfPostgres(dialect, "UPDATE channels SET url = ? WHERE id = ?")
+	for _, item := range candidates {
+		if _, err := tx.ExecContext(ctx, updateSQL, item.encoded, item.id); err != nil {
+			return fmt.Errorf("update channel %d structured URLs: %w", item.id, err)
+		}
+	}
+	if err := recordMigrationTx(ctx, tx, structuredChannelURLsMigrationVersion, dialect); err != nil {
+		return fmt.Errorf("record structured URL migration: %w", err)
+	}
+	return tx.Commit()
+}
 
 // backfillLogsMinuteBucketSQLite 分批回填 logs.minute_bucket（SQLite）
 func backfillLogsMinuteBucketSQLite(ctx context.Context, db *sql.DB, batchSize int) error {
@@ -64,9 +231,7 @@ func backfillLogsMinuteBucketMySQL(ctx context.Context, db *sql.DB, batchSize in
 // 3. 放宽channels表废弃字段约束(NOT NULL → NULL)，保留兼容性以支持版本回滚
 func migrateChannelModelsSchema(ctx context.Context, db *sql.DB, dialect Dialect) error {
 	// 检查迁移是否已执行（幂等性保证）
-	if applied, err := isMigrationApplied(ctx, db, channelModelsRedirectMigrationVersion); err != nil {
-		return fmt.Errorf("check migration status: %w", err)
-	} else if applied {
+	if hasMigration(ctx, db, channelModelsRedirectMigrationVersion, dialect) {
 		return nil // 已执行，跳过
 	}
 
@@ -193,7 +358,7 @@ func migrateModelRedirectsData(ctx context.Context, db *sql.DB, dialect Dialect)
 				VALUES (?, ?, ?, ?)
 				ON CONFLICT(channel_id, model) DO UPDATE SET redirect_model = excluded.redirect_model, created_at = excluded.created_at`
 		}
-		if _, err := tx.ExecContext(ctx, upsertSQL, e.channelID, e.model, e.redirectModel, e.createdAt); err != nil {
+		if _, err := tx.ExecContext(ctx, rebindIfPostgres(dialect, upsertSQL), e.channelID, e.model, e.redirectModel, e.createdAt); err != nil {
 			return fmt.Errorf("upsert channel_model: %w", err)
 		}
 	}
@@ -203,11 +368,11 @@ func migrateModelRedirectsData(ctx context.Context, db *sql.DB, dialect Dialect)
 }
 
 func repairLegacyChannelModelOrder(ctx context.Context, db *sql.DB, dialect Dialect) error {
-	if hasMigration(ctx, db, channelModelsOrderRepairVersion) {
+	if hasMigration(ctx, db, channelModelsOrderRepairVersion, dialect) {
 		return nil
 	}
 
-	appliedAt, ok, err := migrationAppliedAt(ctx, db, channelModelsRedirectMigrationVersion)
+	appliedAt, ok, err := migrationAppliedAt(ctx, db, channelModelsRedirectMigrationVersion, dialect)
 	if err != nil {
 		return err
 	}
@@ -223,11 +388,11 @@ func repairLegacyChannelModelOrder(ctx context.Context, db *sql.DB, dialect Dial
 		return recordMigration(ctx, db, channelModelsOrderRepairVersion, dialect)
 	}
 
-	rows, err := db.QueryContext(ctx, `
+	rows, err := db.QueryContext(ctx, rebindIfPostgres(dialect, `
 		SELECT id, created_at, models, model_redirects
 		FROM channels
 		WHERE models IS NOT NULL AND models != '' AND models != '[]' AND updated_at <= ?
-	`, appliedAt)
+	`), appliedAt)
 	if err != nil {
 		return fmt.Errorf("query legacy channel order candidates: %w", err)
 	}
@@ -261,7 +426,7 @@ func repairLegacyChannelModelOrder(ctx context.Context, db *sql.DB, dialect Dial
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	updateStmt, err := tx.PrepareContext(ctx, `UPDATE channel_models SET created_at = ? WHERE channel_id = ? AND model = ?`)
+	updateStmt, err := tx.PrepareContext(ctx, rebindIfPostgres(dialect, `UPDATE channel_models SET created_at = ? WHERE channel_id = ? AND model = ?`))
 	if err != nil {
 		return fmt.Errorf("prepare legacy order repair update: %w", err)
 	}
@@ -280,7 +445,7 @@ func repairLegacyChannelModelOrder(ctx context.Context, db *sql.DB, dialect Dial
 		if err != nil {
 			return fmt.Errorf("channel %d parse model_redirects JSON: %w", candidate.channelID, err)
 		}
-		if !legacyChannelModelsNeedOrderRepair(ctx, tx, candidate.channelID, desiredOrder, desiredRedirects) {
+		if !legacyChannelModelsNeedOrderRepair(ctx, tx, dialect, candidate.channelID, desiredOrder, desiredRedirects) {
 			continue
 		}
 
@@ -301,13 +466,13 @@ func repairLegacyChannelModelOrder(ctx context.Context, db *sql.DB, dialect Dial
 	return tx.Commit()
 }
 
-func legacyChannelModelsNeedOrderRepair(ctx context.Context, tx *sql.Tx, channelID int64, desiredOrder []string, desiredRedirects map[string]string) bool {
-	rows, err := tx.QueryContext(ctx, `
+func legacyChannelModelsNeedOrderRepair(ctx context.Context, tx *sql.Tx, dialect Dialect, channelID int64, desiredOrder []string, desiredRedirects map[string]string) bool {
+	rows, err := tx.QueryContext(ctx, rebindIfPostgres(dialect, `
 		SELECT model, redirect_model
 		FROM channel_models
 		WHERE channel_id = ?
 		ORDER BY created_at ASC, model ASC
-	`, channelID)
+	`), channelID)
 	if err != nil {
 		return false
 	}
@@ -346,8 +511,8 @@ func legacyChannelModelsNeedOrderRepair(ctx context.Context, tx *sql.Tx, channel
 // needChannelModelsMigration 检查是否需要迁移
 // 检查 channels.models 字段是否存在（未被重命名为 _deprecated_models）
 func needChannelModelsMigration(ctx context.Context, db *sql.DB, dialect Dialect) (bool, error) {
-	if dialect == DialectMySQL {
-		// MySQL: 检查 models 字段是否存在
+	switch dialect {
+	case DialectMySQL:
 		var count int
 		err := db.QueryRowContext(ctx,
 			"SELECT COUNT(*) FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='channels' AND COLUMN_NAME='models'",
@@ -356,14 +521,23 @@ func needChannelModelsMigration(ctx context.Context, db *sql.DB, dialect Dialect
 			return false, fmt.Errorf("check models column: %w", err)
 		}
 		return count > 0, nil
+	case DialectPostgres:
+		var count int
+		err := db.QueryRowContext(ctx,
+			"SELECT COUNT(*) FROM information_schema.columns WHERE table_schema=current_schema() AND table_name='channels' AND column_name='models'",
+		).Scan(&count)
+		if err != nil {
+			return false, fmt.Errorf("check models column: %w", err)
+		}
+		return count > 0, nil
+	default:
+		// SQLite: 检查 models 字段是否存在
+		existingCols, err := sqliteExistingColumns(ctx, db, "channels")
+		if err != nil {
+			return false, nil // 表不存在或其他错误，视为无需迁移
+		}
+		return existingCols["models"], nil
 	}
-
-	// SQLite: 检查 models 字段是否存在
-	existingCols, err := sqliteExistingColumns(ctx, db, "channels")
-	if err != nil {
-		return false, nil // 表不存在或其他错误，视为无需迁移
-	}
-	return existingCols["models"], nil
 }
 
 // parseModelsForMigration 解析 models JSON 数组用于迁移
@@ -395,7 +569,8 @@ func parseModelRedirectsForMigration(jsonStr string) (map[string]string, error) 
 // 将 models 和 model_redirects 从 NOT NULL 改为允许 NULL
 // 这样新版程序 INSERT 时不提供这些字段也不会报错，同时保留字段名以支持版本回滚
 func relaxDeprecatedChannelFields(ctx context.Context, db *sql.DB, dialect Dialect) error {
-	if dialect == DialectMySQL {
+	switch dialect {
+	case DialectMySQL:
 		// MySQL: 使用 MODIFY COLUMN 去除 NOT NULL
 		var count int
 		err := db.QueryRowContext(ctx,
@@ -426,12 +601,42 @@ func relaxDeprecatedChannelFields(ctx context.Context, db *sql.DB, dialect Diale
 			log.Printf("[MIGRATE] 已修改 channels.model_redirects: NOT NULL → NULL")
 		}
 		return nil
-	}
+	case DialectPostgres:
+		for _, column := range []string{"models", "model_redirects"} {
+			var isNullable string
+			err := db.QueryRowContext(ctx, `
+				SELECT is_nullable
+				FROM information_schema.columns
+				WHERE table_schema = current_schema() AND table_name = 'channels' AND column_name = $1
+			`, column).Scan(&isNullable)
+			if err == sql.ErrNoRows {
+				continue
+			}
+			if err != nil {
+				return fmt.Errorf("check channels.%s nullability: %w", column, err)
+			}
+			if isNullable == "YES" {
+				continue
+			}
 
-	// SQLite: 不支持直接修改列约束，但 TEXT 类型天然允许 NULL
-	// SQLite 的 NOT NULL 约束只在显式 INSERT 该列时检查
-	// 新版程序 INSERT 语句不包含这些列，SQLite 会使用默认值（NULL）
-	return nil
+			var alterSQL string
+			switch column {
+			case "models":
+				alterSQL = "ALTER TABLE channels ALTER COLUMN models DROP NOT NULL"
+			case "model_redirects":
+				alterSQL = "ALTER TABLE channels ALTER COLUMN model_redirects DROP NOT NULL"
+			}
+			if _, err := db.ExecContext(ctx, alterSQL); err != nil {
+				return fmt.Errorf("relax channels.%s nullability: %w", column, err)
+			}
+			log.Printf("[MIGRATE] 已修改 channels.%s: NOT NULL → NULL", column)
+		}
+		return nil
+	default:
+		// SQLite: 不支持直接修改列约束，但 TEXT 类型天然允许 NULL。
+		// 新版程序 INSERT 不包含旧列，历史 schema 的默认值继续生效。
+		return nil
+	}
 }
 
 func validateAuthTokensAllowedModelsJSON(ctx context.Context, db *sql.DB) error {
@@ -485,12 +690,41 @@ func validateJSONColumn(ctx context.Context, db *sql.DB, table, col string, pars
 	return nil
 }
 
+func validateAuthTokensChannelRestrictionMode(ctx context.Context, db *sql.DB) error {
+	rows, err := db.QueryContext(ctx, `SELECT id, channel_restriction_mode FROM auth_tokens`)
+	if err != nil {
+		return fmt.Errorf("query auth_tokens.channel_restriction_mode: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	for rows.Next() {
+		var id int64
+		var mode string
+		if err := rows.Scan(&id, &mode); err != nil {
+			return fmt.Errorf("scan auth_tokens.channel_restriction_mode: %w", err)
+		}
+		if _, err := model.NormalizeChannelRestrictionMode(mode); err != nil {
+			return fmt.Errorf(
+				"auth_tokens.channel_restriction_mode invalid: id=%d value=%q: %w (fix: set channel_restriction_mode to 'allow' or 'deny')",
+				id,
+				mode,
+				err,
+			)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("iterate auth_tokens.channel_restriction_mode: %w", err)
+	}
+	return nil
+}
+
 func validateAuthTokensMaxConcurrency(ctx context.Context, db *sql.DB) error {
 	rows, err := db.QueryContext(ctx, `
 		SELECT id, cost_limit_microusd, max_concurrency
 		FROM auth_tokens
 		WHERE max_concurrency < 0
-		   OR (cost_limit_microusd > 0 AND max_concurrency <= 0)
+		   OR ((cost_limit_microusd > 0 OR cost_daily_limit_microusd > 0 OR cost_monthly_limit_microusd > 0)
+		       AND max_concurrency <= 0)
 	`)
 	if err != nil {
 		return fmt.Errorf("query auth_tokens.max_concurrency: %w", err)
@@ -524,13 +758,13 @@ func validateAuthTokensMaxConcurrency(ctx context.Context, db *sql.DB) error {
 
 const authTokenCostLimitDefaultMaxConcurrency = 100
 
-func backfillAuthTokensCostLimitMaxConcurrency(ctx context.Context, db *sql.DB) error {
-	res, err := db.ExecContext(ctx, `
+func backfillAuthTokensCostLimitMaxConcurrency(ctx context.Context, db *sql.DB, dialect Dialect) error {
+	res, err := db.ExecContext(ctx, rebindIfPostgres(dialect, `
 		UPDATE auth_tokens
 		SET max_concurrency = ?
-		WHERE cost_limit_microusd > 0
+		WHERE (cost_limit_microusd > 0 OR cost_daily_limit_microusd > 0 OR cost_monthly_limit_microusd > 0)
 		  AND max_concurrency = 0
-	`, authTokenCostLimitDefaultMaxConcurrency)
+	`), authTokenCostLimitDefaultMaxConcurrency)
 	if err != nil {
 		return fmt.Errorf("backfill auth_tokens max_concurrency for cost limits: %w", err)
 	}
@@ -550,7 +784,7 @@ func backfillAuthTokensCostLimitMaxConcurrency(ctx context.Context, db *sql.DB) 
 const debugLogsPKRebuildVersion = "v1_debug_logs_pk_log_id"
 
 func rebuildDebugLogsPrimaryKey(ctx context.Context, db *sql.DB, dialect Dialect) error {
-	if hasMigration(ctx, db, debugLogsPKRebuildVersion) {
+	if hasMigration(ctx, db, debugLogsPKRebuildVersion, dialect) {
 		return nil
 	}
 
@@ -575,7 +809,7 @@ func rebuildDebugLogsPrimaryKey(ctx context.Context, db *sql.DB, dialect Dialect
 const debugLogsRespBodyNullableVersion = "v2_debug_logs_resp_body_nullable"
 
 func relaxDebugLogsRespBodyNullable(ctx context.Context, db *sql.DB, dialect Dialect) error {
-	if hasMigration(ctx, db, debugLogsRespBodyNullableVersion) {
+	if hasMigration(ctx, db, debugLogsRespBodyNullableVersion, dialect) {
 		return nil
 	}
 	if _, err := db.ExecContext(ctx, "DROP TABLE IF EXISTS debug_logs"); err != nil {
@@ -585,8 +819,46 @@ func relaxDebugLogsRespBodyNullable(ctx context.Context, db *sql.DB, dialect Dia
 	return recordMigration(ctx, db, debugLogsRespBodyNullableVersion, dialect)
 }
 
+// debug_logs 只保存短期调试数据。新增本地协议转换的原始请求与转换后响应字段时，
+// 直接重建表，避免为三种数据库维护无价值的临时数据搬迁逻辑。
+const debugLogsProtocolPayloadsVersion = "v3_debug_logs_protocol_payloads"
+
+func rebuildDebugLogsForProtocolPayloads(ctx context.Context, db *sql.DB, dialect Dialect) error {
+	if hasMigration(ctx, db, debugLogsProtocolPayloadsVersion, dialect) {
+		return nil
+	}
+	if _, err := db.ExecContext(ctx, "DROP TABLE IF EXISTS debug_logs"); err != nil {
+		return fmt.Errorf("drop debug_logs for protocol payloads: %w", err)
+	}
+	log.Printf("[MIGRATE] 已删除 debug_logs 表以增加协议转换调试字段")
+	return recordMigration(ctx, db, debugLogsProtocolPayloadsVersion, dialect)
+}
+
+func ensureDebugLogsProtocolMetadata(ctx context.Context, db *sql.DB, dialect Dialect) error {
+	columns := []mysqlColumnDef{
+		{name: "upstream_error", definition: "TEXT"},
+		{name: "original_req_url", definition: "TEXT"},
+		{name: "original_req_headers", definition: "TEXT"},
+		{name: "translated_resp_status", definition: "INT NOT NULL DEFAULT 0"},
+		{name: "translated_resp_headers", definition: "TEXT"},
+	}
+	switch dialect {
+	case DialectSQLite:
+		sqliteColumns := make([]sqliteColumnDef, 0, len(columns))
+		for _, column := range columns {
+			sqliteColumns = append(sqliteColumns, sqliteColumnDef(column))
+		}
+		return ensureSQLiteColumns(ctx, db, "debug_logs", sqliteColumns)
+	case DialectPostgres:
+		return ensurePostgresColumns(ctx, db, "debug_logs", columns)
+	default:
+		return ensureMySQLColumns(ctx, db, "debug_logs", columns)
+	}
+}
+
 func debugLogsHasLegacyIDColumn(ctx context.Context, db *sql.DB, dialect Dialect) (bool, error) {
-	if dialect == DialectMySQL {
+	switch dialect {
+	case DialectMySQL:
 		var count int
 		err := db.QueryRowContext(ctx,
 			"SELECT COUNT(*) FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='debug_logs' AND COLUMN_NAME='id'",
@@ -595,14 +867,22 @@ func debugLogsHasLegacyIDColumn(ctx context.Context, db *sql.DB, dialect Dialect
 			return false, fmt.Errorf("check debug_logs.id existence: %w", err)
 		}
 		return count > 0, nil
+	case DialectPostgres:
+		var count int
+		err := db.QueryRowContext(ctx,
+			"SELECT COUNT(*) FROM information_schema.columns WHERE table_schema=current_schema() AND table_name='debug_logs' AND column_name='id'",
+		).Scan(&count)
+		if err != nil {
+			return false, fmt.Errorf("check debug_logs.id existence: %w", err)
+		}
+		return count > 0, nil
+	default:
+		existing, err := sqliteExistingColumns(ctx, db, "debug_logs")
+		if err != nil {
+			return false, nil
+		}
+		return existing["id"], nil
 	}
-
-	// SQLite: 表不存在时 PRAGMA 返回空结果集，视为无旧列
-	existing, err := sqliteExistingColumns(ctx, db, "debug_logs")
-	if err != nil {
-		return false, nil
-	}
-	return existing["id"], nil
 }
 
 // rebuildChannelURLStatesPrimaryKey 将 channel_url_states 旧结构
@@ -613,7 +893,7 @@ func debugLogsHasLegacyIDColumn(ctx context.Context, db *sql.DB, dialect Dialect
 const channelURLStatesPKRebuildVersion = "v1_channel_url_states_pk_url_hash"
 
 func rebuildChannelURLStatesPrimaryKey(ctx context.Context, db *sql.DB, dialect Dialect) error {
-	if hasMigration(ctx, db, channelURLStatesPKRebuildVersion) {
+	if hasMigration(ctx, db, channelURLStatesPKRebuildVersion, dialect) {
 		return nil
 	}
 
@@ -634,20 +914,24 @@ func rebuildChannelURLStatesPrimaryKey(ctx context.Context, db *sql.DB, dialect 
 // channelURLStatesHasLegacySchema 判定旧表是否存在：
 // 表已存在 AND 没有 url_hash 列（说明是 v2.7.0 早期 SQLite 部署的旧 schema）。
 func channelURLStatesHasLegacySchema(ctx context.Context, db *sql.DB, dialect Dialect) (bool, error) {
-	if dialect == DialectMySQL {
+	if dialect == DialectMySQL || dialect == DialectPostgres {
+		var tableSQL, hashSQL string
+		if dialect == DialectMySQL {
+			tableSQL = "SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='channel_url_states'"
+			hashSQL = "SELECT COUNT(*) FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='channel_url_states' AND COLUMN_NAME='url_hash'"
+		} else {
+			tableSQL = "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema=current_schema() AND table_name='channel_url_states'"
+			hashSQL = "SELECT COUNT(*) FROM information_schema.columns WHERE table_schema=current_schema() AND table_name='channel_url_states' AND column_name='url_hash'"
+		}
 		var tableCount int
-		if err := db.QueryRowContext(ctx,
-			"SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='channel_url_states'",
-		).Scan(&tableCount); err != nil {
+		if err := db.QueryRowContext(ctx, tableSQL).Scan(&tableCount); err != nil {
 			return false, fmt.Errorf("check channel_url_states existence: %w", err)
 		}
 		if tableCount == 0 {
 			return false, nil
 		}
 		var hashCount int
-		if err := db.QueryRowContext(ctx,
-			"SELECT COUNT(*) FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='channel_url_states' AND COLUMN_NAME='url_hash'",
-		).Scan(&hashCount); err != nil {
+		if err := db.QueryRowContext(ctx, hashSQL).Scan(&hashCount); err != nil {
 			return false, fmt.Errorf("check channel_url_states.url_hash: %w", err)
 		}
 		return hashCount == 0, nil

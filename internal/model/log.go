@@ -72,16 +72,19 @@ type LogEntry struct {
 	ChannelName          string   `json:"channel_name,omitempty"`
 	StatusCode           int      `json:"status_code"`
 	Message              string   `json:"message"`
-	Duration             float64  `json:"duration"`               // 总耗时（秒）
-	IsStreaming          bool     `json:"is_streaming"`           // 是否为流式请求
-	FirstByteTime        float64  `json:"first_byte_time"`        // 上游首字节响应时间（秒）
-	APIKeyUsed           string   `json:"api_key_used"`           // 使用的API Key（写入时强制脱敏为 abc.xyz 格式，数据库不存明文）
-	APIKeyHash           string   `json:"api_key_hash,omitempty"` // API Key 的 SHA256（仅用于后台精确定位 key_index，不泄露明文）
-	AuthTokenID          int64    `json:"auth_token_id"`          // 客户端使用的API令牌ID（新增2025-12，0表示未使用token）
-	AuthTokenDescription string   `json:"auth_token_description"` // API令牌描述（查询时从auth_tokens表JOIN获取）
-	ClientIP             string   `json:"client_ip"`              // 客户端IP地址（新增2025-12）
-	BaseURL              string   `json:"base_url,omitempty"`     // 请求使用的上游URL（多URL场景）
-	ServiceTier          string   `json:"service_tier,omitempty"` // OpenAI service_tier: "priority"(2x)/"flex"(0.5x)
+	Duration             float64  `json:"duration"`                     // 总耗时（秒）
+	IsStreaming          bool     `json:"is_streaming"`                 // 是否为流式请求
+	UpstreamWebsocket    bool     `json:"upstream_websocket,omitempty"` // 实际上游请求是否使用WebSocket
+	FirstByteTime        float64  `json:"first_byte_time"`              // 上游首字节响应时间（秒）
+	APIKeyUsed           string   `json:"api_key_used"`                 // 使用的API Key（写入时强制脱敏为 abc.xyz 格式，数据库不存明文）
+	APIKeyHash           string   `json:"api_key_hash,omitempty"`       // API Key 的 SHA256（仅用于后台精确定位 key_index，不泄露明文）
+	AuthTokenID          int64    `json:"auth_token_id"`                // 客户端使用的API令牌ID（新增2025-12，0表示未使用token）
+	AuthTokenDescription string   `json:"auth_token_description"`       // API令牌描述（查询时从auth_tokens表JOIN获取）
+	ClientProtocol       string   `json:"client_protocol,omitempty"`    // 客户端入口协议（anthropic/openai/gemini/codex）
+	UpstreamProtocol     string   `json:"upstream_protocol,omitempty"`  // 当前尝试实际使用的上游协议
+	ClientIP             string   `json:"client_ip"`                    // 客户端IP地址（新增2025-12）
+	BaseURL              string   `json:"base_url,omitempty"`           // 请求使用的上游URL（多URL场景）
+	ServiceTier          string   `json:"service_tier,omitempty"`       // OpenAI service_tier；Codex priority 按模型计 Fast 倍率
 	ThinkingEffort       string   `json:"thinking_effort,omitempty"`
 
 	// Token统计（2025-11新增，支持Claude API usage字段）
@@ -97,39 +100,20 @@ type LogEntry struct {
 
 	// 瞬态字段：不持久化到 logs 表，仅用于传递 debug 数据到写入管道
 	DebugData *DebugLogEntry `json:"-"`
-
-	// 瞬态字段：重试尝试次数（1-based，全局累计）。
-	// 不持久化（logs 表无此列）；写入时由 app 层持有，写库拿到 ID 后缓存 ID→index，
-	// 查询时由 app 层从内存缓存按 log.ID 回填。
-	AttemptIndex int32 `json:"attempt_index,omitempty"`
-
-	// 瞬态字段：该日志是否为所属请求链的「最后一条」（attempt_index 等于该链最大值）。
-	// 不持久化；查询时由 app 层按 log.ID 从内存缓存回填。
-	IsFinal bool `json:"is_final,omitempty"`
-
-	// 瞬态字段：所属请求链 ID（activeReqID），仅用于写库后缓存 reqID→max idx，
-	// 不返回给前端。
-	RequestID int64 `json:"-"`
-
-	// 瞬态字段：标记该日志为所属请求链「真正返回给 client 的最终结果」。
-	// 用于覆盖 attempt_index maxIdx 派生判定——多渠道全失败时，汇总日志
-	// （writeFinalProxyResponse）而非最后一条上游失败日志，才是返回 client 的那条。
-	// 不持久化；写库后由 LogService 记入 attemptIndexCache 的 final override。
-	// 不返回给前端。
-	IsTerminalOverride bool `json:"-"`
 }
 
 // LogFilter 日志查询过滤条件
 type LogFilter struct {
-	ChannelID       *int64
-	ChannelName     string
-	ChannelNameLike string
-	Model           string
-	ModelLike       string
-	StatusCode      *int
-	ChannelType     string // 渠道类型过滤（anthropic/openai/gemini/codex）
-	AuthTokenID     *int64 // API令牌ID过滤
-	LogSource       string
+	ChannelID        *int64
+	ChannelName      string
+	ChannelNameLike  string
+	Model            string
+	ModelLike        string
+	StatusCode       *int
+	ClientProtocol   string // 客户端入口协议过滤
+	UpstreamProtocol string // 实际上游协议过滤
+	AuthTokenID      *int64 // API令牌ID过滤
+	LogSource        string
 }
 
 // ChannelURLLogStat 是基于持久化日志聚合出的 URL 启动快照。

@@ -4,10 +4,12 @@ import (
 	"bytes"
 	"encoding/json"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 
 	"ccLoad/internal/model"
+	"ccLoad/internal/protocol"
 	"ccLoad/internal/util"
 )
 
@@ -102,7 +104,7 @@ func TestBuildLogEntry_StreamDiagMsg(t *testing.T) {
 		})
 
 		expected := (100*2.50+10*15.00)/1_000_000 + 0.041592
-		if !floatEquals(entry.Cost, expected, 0.000001) {
+		if !floatEquals(entry.Cost, expected) {
 			t.Fatalf("entry cost = %.6f, 期望 %.6f", entry.Cost, expected)
 		}
 	})
@@ -163,6 +165,45 @@ func TestBuildLogEntry_StreamDiagMsg(t *testing.T) {
 		})
 		if entry.Message != errMsg {
 			t.Errorf("expected Message=%q, got %q", errMsg, entry.Message)
+		}
+	})
+
+	t.Run("响应头前传输错误明确没有上游响应体", func(t *testing.T) {
+		res := &fwResult{
+			Status: http.StatusBadGateway,
+			Body:   []byte("unexpected EOF"),
+		}
+		entry := buildLogEntry(logEntryParams{
+			RequestModel: "claude-sonnet-5",
+			ChannelID:    channelID,
+			StatusCode:   http.StatusBadGateway,
+			Duration:     1.5,
+			Result:       res,
+			ErrMsg:       "unexpected EOF",
+		})
+		if !strings.Contains(entry.Message, "before HTTP response (no response body)") ||
+			!strings.Contains(entry.Message, "unexpected EOF") {
+			t.Fatalf("transport error message=%q", entry.Message)
+		}
+	})
+
+	t.Run("处理错误时普通日志保留上游响应体", func(t *testing.T) {
+		res := &fwResult{
+			Status:         http.StatusBadGateway,
+			UpstreamStatus: http.StatusBadRequest,
+			Body:           []byte(`{"error":{"message":"invalid thinking level"}}`),
+		}
+		entry := buildLogEntry(logEntryParams{
+			RequestModel: "claude-sonnet-5",
+			ChannelID:    channelID,
+			StatusCode:   http.StatusBadGateway,
+			Duration:     1.5,
+			Result:       res,
+			ErrMsg:       "decode upstream response",
+		})
+		if !strings.Contains(entry.Message, "decode upstream response") ||
+			!strings.Contains(entry.Message, "invalid thinking level") {
+			t.Fatalf("upstream error message=%q", entry.Message)
 		}
 	})
 
@@ -255,15 +296,50 @@ func TestComputeRequestCost_ServiceTierAppliesOnlyAsOpenAIPriceMultiplier(t *tes
 	gpt54LongContext := &fwResult{InputTokens: 300_000, OutputTokens: 1_000}
 	got := computeRequestCost("gpt-5.4", "priority", gpt54LongContext)
 	want := util.CalculateCostDetailed("gpt-5.4", 300_000, 1_000, 0, 0, 0) * 2
-	if !floatEquals(got, want, 0.000001) {
+	if !floatEquals(got, want) {
 		t.Fatalf("gpt-5.4 priority cost=%.6f, want %.6f", got, want)
 	}
 
 	qwenLongContext := &fwResult{InputTokens: 300_000, OutputTokens: 1_000_000}
 	got = computeRequestCost("qwen3.5-plus", "priority", qwenLongContext)
 	want = util.CalculateCostDetailed("qwen3.5-plus", 300_000, 1_000_000, 0, 0, 0)
-	if !floatEquals(got, want, 0.000001) {
+	if !floatEquals(got, want) {
 		t.Fatalf("qwen priority cost=%.6f, want service_tier ignored cost %.6f", got, want)
+	}
+}
+
+func TestResolveProxyBillingModel_AlphaSearchUsesSearchCall(t *testing.T) {
+	t.Parallel()
+
+	got := resolveProxyBillingModel("/v1/alpha/search", "", "")
+	if got != util.BillingModelSearchCall {
+		t.Fatalf("billing model=%q, want %q", got, util.BillingModelSearchCall)
+	}
+
+	// 普通 chat 路径仍按模型计费
+	got = resolveProxyBillingModel("/v1/responses", "gpt-5.4", "gpt-5.4")
+	if got != "gpt-5.4" {
+		t.Fatalf("billing model=%q, want gpt-5.4", got)
+	}
+}
+
+func TestBuildLogEntry_AlphaSearchFixedCost(t *testing.T) {
+	t.Parallel()
+
+	entry := buildLogEntry(logEntryParams{
+		RequestModel: "",
+		RequestPath:  "/v1/alpha/search",
+		ChannelID:    1,
+		StatusCode:   http.StatusOK,
+		Duration:     1.2,
+		Result:       &fwResult{Status: 200},
+	})
+
+	if entry.Model != util.BillingModelSearchCall {
+		t.Fatalf("model=%q, want %q", entry.Model, util.BillingModelSearchCall)
+	}
+	if !floatEquals(entry.Cost, 0.01) {
+		t.Fatalf("cost=%.6f, want 0.01", entry.Cost)
 	}
 }
 
@@ -624,7 +700,7 @@ func TestPrepareRequestBody_FuzzyMatch(t *testing.T) {
 			}
 
 			// 调用被测函数
-			actualModel, bodyToSend := s.prepareRequestBody(cfg, reqCtx)
+			actualModel, bodyToSend := s.prepareRequestBody(cfg, reqCtx, protocol.OpenAI)
 
 			// 验证返回的模型名
 			if actualModel != tt.wantModel {
@@ -659,7 +735,7 @@ func TestPrepareRequestBody_PreservesLargeIntegersOnModelRewrite(t *testing.T) {
 		body:          []byte(`{"model":"gemini-3-flash","id":9223372036854775807,"messages":[]}`),
 	}
 
-	actualModel, bodyToSend := s.prepareRequestBody(cfg, reqCtx)
+	actualModel, bodyToSend := s.prepareRequestBody(cfg, reqCtx, protocol.OpenAI)
 	if actualModel != "gemini-3-flash-preview" {
 		t.Fatalf("actualModel = %q, want %q", actualModel, "gemini-3-flash-preview")
 	}
@@ -842,15 +918,102 @@ func TestReplaceModelInPath_GeminiAPI(t *testing.T) {
 	}
 }
 
+func TestInjectAnthropicBetaFlag_MergesIntoRawLowercaseKey(t *testing.T) {
+	t.Parallel()
+
+	req, err := http.NewRequest(http.MethodPost, "https://anyrouter.top/v1/messages", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	setRawHeader(req.Header, "anthropic-beta", "claude-code-20250219,oauth-2025-04-20")
+
+	injectAnthropicBetaFlag(req, "context-1m-2025-08-07")
+
+	var keys []string
+	var values []string
+	for name, vs := range req.Header {
+		if strings.EqualFold(name, "anthropic-beta") {
+			keys = append(keys, name)
+			values = append(values, vs...)
+		}
+	}
+	if len(keys) != 1 || keys[0] != "anthropic-beta" {
+		t.Fatalf("anthropic-beta keys = %v, want a single raw key", keys)
+	}
+	joined := strings.Join(values, ",")
+	if !strings.Contains(joined, "claude-code-20250219") || !strings.Contains(joined, "context-1m-2025-08-07") {
+		t.Fatalf("anthropic-beta = %v, want CLI betas plus context-1m", values)
+	}
+	if strings.Count(joined, "context-1m-2025-08-07") != 1 {
+		t.Fatalf("context-1m duplicated: %v", values)
+	}
+
+	injectAnthropicBetaFlag(req, "context-1m-2025-08-07")
+	if strings.Count(joinedHeaderValuesFold(req.Header, "anthropic-beta"), "context-1m-2025-08-07") != 1 {
+		t.Fatalf("second inject duplicated the flag: %v", req.Header)
+	}
+}
+
+func TestInjectAnthropicBetaFlagUsesExactTokensAndDropsEmptyValues(t *testing.T) {
+	t.Parallel()
+
+	const flag = "context-1m-2025-08-07"
+	req, err := http.NewRequest(http.MethodPost, "https://anyrouter.top/v1/messages", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	setRawHeader(req.Header, "anthropic-beta", "  foo-"+flag+"-bar, , oauth-2025-04-20  ")
+
+	injectAnthropicBetaFlag(req, flag)
+
+	got := joinedHeaderValuesFold(req.Header, "anthropic-beta")
+	if got != "foo-"+flag+"-bar,oauth-2025-04-20,"+flag {
+		t.Fatalf("anthropic-beta = %q, want exact token append without empty values", got)
+	}
+	for _, token := range strings.Split(got, ",") {
+		if token == flag {
+			return
+		}
+	}
+	t.Fatalf("anthropic-beta = %q, exact flag token missing", got)
+}
+
+func TestInjectAnthropicBetaFlagHandlesEmptyExistingHeader(t *testing.T) {
+	t.Parallel()
+
+	const flag = "context-1m-2025-08-07"
+	req, err := http.NewRequest(http.MethodPost, "https://anyrouter.top/v1/messages", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	setRawHeader(req.Header, "anthropic-beta", "")
+
+	injectAnthropicBetaFlag(req, flag)
+
+	if got := joinedHeaderValuesFold(req.Header, "anthropic-beta"); got != flag {
+		t.Fatalf("anthropic-beta = %q, want %q without a leading comma", got, flag)
+	}
+}
+
+func joinedHeaderValuesFold(h http.Header, name string) string {
+	var values []string
+	for key, vs := range h {
+		if strings.EqualFold(key, name) {
+			values = append(values, vs...)
+		}
+	}
+	return strings.Join(values, ",")
+}
+
 func TestStripAnthropicProtocolHeaders(t *testing.T) {
 	t.Parallel()
 
 	anthropicHeaders := []string{"anthropic-version", "anthropic-beta", "anthropic-dangerous-direct-browser-access"}
 
 	tests := []struct {
-		name        string
-		channelType string
-		shouldStrip bool
+		name             string
+		upstreamProtocol string
+		shouldStrip      bool
 	}{
 		{"anthropic upstream keeps headers", "anthropic", false},
 		{"openai upstream strips headers", "openai", true},
@@ -867,15 +1030,15 @@ func TestStripAnthropicProtocolHeaders(t *testing.T) {
 			req.Header.Set("anthropic-dangerous-direct-browser-access", "true")
 			req.Header.Set("Content-Type", "application/json") // 非 Anthropic 头应保留
 
-			stripAnthropicProtocolHeaders(req, tt.channelType)
+			stripAnthropicProtocolHeaders(req, tt.upstreamProtocol)
 
 			for _, h := range anthropicHeaders {
 				got := req.Header.Get(h)
 				if tt.shouldStrip && got != "" {
-					t.Errorf("header %q should be stripped for %s upstream, got %q", h, tt.channelType, got)
+					t.Errorf("header %q should be stripped for %s upstream, got %q", h, tt.upstreamProtocol, got)
 				}
 				if !tt.shouldStrip && got == "" {
-					t.Errorf("header %q should be kept for %s upstream", h, tt.channelType)
+					t.Errorf("header %q should be kept for %s upstream", h, tt.upstreamProtocol)
 				}
 			}
 			// 非 Anthropic 头始终保留
@@ -884,10 +1047,30 @@ func TestStripAnthropicProtocolHeaders(t *testing.T) {
 			}
 		})
 	}
+
+	t.Run("openai upstream strips raw lowercase fingerprint keys", func(t *testing.T) {
+		t.Parallel()
+		req, _ := http.NewRequest("POST", "http://example.com/v1/chat/completions", nil)
+		setRawHeader(req.Header, "anthropic-version", "2023-06-01")
+		setRawHeader(req.Header, "anthropic-beta", "claude-code-20250219")
+		setRawHeader(req.Header, "anthropic-dangerous-direct-browser-access", "true")
+		setRawHeader(req.Header, "Content-Type", "application/json")
+		stripAnthropicProtocolHeaders(req, "openai")
+		for name := range req.Header {
+			if strings.EqualFold(name, "anthropic-version") ||
+				strings.EqualFold(name, "anthropic-beta") ||
+				strings.EqualFold(name, "anthropic-dangerous-direct-browser-access") {
+				t.Fatalf("raw Anthropic header %q survived strip: %v", name, req.Header)
+			}
+		}
+		if rawHeaderValues(req.Header, "Content-Type")[0] != "application/json" {
+			t.Fatalf("Content-Type should be kept: %v", req.Header)
+		}
+	})
 }
 
 func anyrouterAnthropicCfg() *model.Config {
-	return &model.Config{Name: "anyrouter-claude", URL: "https://anyrouter.top", ChannelType: util.ChannelTypeAnthropic}
+	return &model.Config{Name: "anyrouter-claude", URLs: model.ChannelURLs{{URL: "https://anyrouter.top"}}}
 }
 
 func TestNormalizeAnyrouterAdaptiveThinking(t *testing.T) {
@@ -919,7 +1102,7 @@ func TestNormalizeAnyrouterAdaptiveThinking(t *testing.T) {
 
 	t.Run("anyrouter without thinking → inject adaptive", func(t *testing.T) {
 		body := []byte(`{"model":"claude-opus-4-8","messages":[]}`)
-		got := decode(normalizeAnyrouterAdaptiveThinking(anyrouterAnthropicCfg(), "/v1/messages", body))
+		got := decode(normalizeAnyrouterAdaptiveThinking(anyrouterAnthropicCfg(), string(protocol.Anthropic), "/v1/messages", body))
 		if thinkingType(got) != "adaptive" {
 			t.Fatalf("thinking.type want adaptive, got %q", thinkingType(got))
 		}
@@ -930,7 +1113,7 @@ func TestNormalizeAnyrouterAdaptiveThinking(t *testing.T) {
 
 	t.Run("anyrouter thinking.type=enabled → patch to adaptive + output_config.effort", func(t *testing.T) {
 		body := []byte(`{"model":"claude-opus-4-8","thinking":{"type":"enabled","budget_tokens":4096}}`)
-		got := decode(normalizeAnyrouterAdaptiveThinking(anyrouterAnthropicCfg(), "/v1/messages", body))
+		got := decode(normalizeAnyrouterAdaptiveThinking(anyrouterAnthropicCfg(), string(protocol.Anthropic), "/v1/messages", body))
 		if thinkingType(got) != "adaptive" {
 			t.Fatalf("thinking.type want adaptive, got %q", thinkingType(got))
 		}
@@ -941,7 +1124,7 @@ func TestNormalizeAnyrouterAdaptiveThinking(t *testing.T) {
 
 	t.Run("budget_tokens=16384 → high effort", func(t *testing.T) {
 		body := []byte(`{"model":"claude-opus-4-8","thinking":{"type":"enabled","budget_tokens":16384}}`)
-		got := decode(normalizeAnyrouterAdaptiveThinking(anyrouterAnthropicCfg(), "/v1/messages", body))
+		got := decode(normalizeAnyrouterAdaptiveThinking(anyrouterAnthropicCfg(), string(protocol.Anthropic), "/v1/messages", body))
 		if outputEffort(got) != "high" {
 			t.Fatalf("want high, got %q", outputEffort(got))
 		}
@@ -949,7 +1132,7 @@ func TestNormalizeAnyrouterAdaptiveThinking(t *testing.T) {
 
 	t.Run("missing budget_tokens → high effort", func(t *testing.T) {
 		body := []byte(`{"model":"claude-opus-4-8","thinking":{"type":"enabled"}}`)
-		got := decode(normalizeAnyrouterAdaptiveThinking(anyrouterAnthropicCfg(), "/v1/messages", body))
+		got := decode(normalizeAnyrouterAdaptiveThinking(anyrouterAnthropicCfg(), string(protocol.Anthropic), "/v1/messages", body))
 		if outputEffort(got) != "high" {
 			t.Fatalf("want high, got %q", outputEffort(got))
 		}
@@ -957,7 +1140,7 @@ func TestNormalizeAnyrouterAdaptiveThinking(t *testing.T) {
 
 	t.Run("thinking.type=adaptive → unchanged", func(t *testing.T) {
 		body := []byte(`{"model":"claude-opus-4-8","thinking":{"type":"adaptive"}}`)
-		got := decode(normalizeAnyrouterAdaptiveThinking(anyrouterAnthropicCfg(), "/v1/messages", body))
+		got := decode(normalizeAnyrouterAdaptiveThinking(anyrouterAnthropicCfg(), string(protocol.Anthropic), "/v1/messages", body))
 		if thinkingType(got) != "adaptive" {
 			t.Fatalf("want adaptive unchanged, got %q", thinkingType(got))
 		}
@@ -967,9 +1150,9 @@ func TestNormalizeAnyrouterAdaptiveThinking(t *testing.T) {
 	})
 
 	t.Run("anyrouter URL is enough even when channel name does not contain anyrouter", func(t *testing.T) {
-		cfg := &model.Config{Name: "regular-channel", URL: "https://anyrouter.top", ChannelType: util.ChannelTypeAnthropic}
+		cfg := &model.Config{Name: "regular-channel", URLs: model.ChannelURLs{{URL: "https://anyrouter.top"}}}
 		body := []byte(`{"model":"claude-opus-4-8","thinking":{"type":"enabled","budget_tokens":1024}}`)
-		got := decode(normalizeAnyrouterAdaptiveThinking(cfg, "/v1/messages", body))
+		got := decode(normalizeAnyrouterAdaptiveThinking(cfg, string(protocol.Anthropic), "/v1/messages", body))
 		if thinkingType(got) != "adaptive" {
 			t.Fatalf("thinking.type want adaptive, got %q", thinkingType(got))
 		}
@@ -979,18 +1162,18 @@ func TestNormalizeAnyrouterAdaptiveThinking(t *testing.T) {
 	})
 
 	t.Run("regular anthropic channel → no fallback normalization", func(t *testing.T) {
-		cfg := &model.Config{Name: "regular-channel", URL: "https://api.anthropic.com", ChannelType: util.ChannelTypeAnthropic}
+		cfg := &model.Config{Name: "regular-channel", URLs: model.ChannelURLs{{URL: "https://api.anthropic.com"}}}
 		body := []byte(`{"model":"claude-opus-4-8","thinking":{"type":"enabled","budget_tokens":1024}}`)
-		got := decode(normalizeAnyrouterAdaptiveThinking(cfg, "/v1/messages", body))
+		got := decode(normalizeAnyrouterAdaptiveThinking(cfg, string(protocol.Anthropic), "/v1/messages", body))
 		if thinkingType(got) != "enabled" {
 			t.Fatalf("regular anthropic channel should keep existing thinking.type, got %q", thinkingType(got))
 		}
 	})
 
 	t.Run("non-anthropic channel → no injection", func(t *testing.T) {
-		cfg := &model.Config{Name: "anyrouter", ChannelType: "openai"}
+		cfg := &model.Config{Name: "anyrouter"}
 		body := []byte(`{"model":"gpt-4o","messages":[]}`)
-		got := decode(normalizeAnyrouterAdaptiveThinking(cfg, "/v1/messages", body))
+		got := decode(normalizeAnyrouterAdaptiveThinking(cfg, string(protocol.OpenAI), "/v1/messages", body))
 		if thinkingType(got) != "" {
 			t.Fatalf("non-anthropic should not inject thinking, got %q", thinkingType(got))
 		}

@@ -13,7 +13,7 @@ import (
 // Gemini API 特殊处理
 // ============================================================================
 
-func (s *Server) filterVisibleModelsForRequest(c *gin.Context, protocol string, models []string) []string {
+func (s *Server) filterVisibleModelsForRequest(c *gin.Context, _ string, models []string) []string {
 	if s.authService == nil {
 		return models
 	}
@@ -24,26 +24,23 @@ func (s *Server) filterVisibleModelsForRequest(c *gin.Context, protocol string, 
 		return models
 	}
 
-	if allowedChannelSet, hasRestriction := s.authService.getAllowedChannelSet(tokenHashStr); hasRestriction {
-		channels, err := s.getEnabledChannelsByExposedProtocol(c.Request.Context(), protocol)
+	if restriction, hasRestriction := s.authService.getChannelRestriction(tokenHashStr); hasRestriction {
+		channels, err := s.GetEnabledChannelsByModel(c.Request.Context(), "*")
 		if err != nil {
 			return nil
 		}
 		modelSet := make(map[string]struct{})
 		for _, cfg := range channels {
-			if cfg == nil {
+			if cfg == nil || !restriction.Allows(cfg.ID) {
 				continue
 			}
-			if _, ok := allowedChannelSet[cfg.ID]; !ok {
-				continue
-			}
-			for _, model := range cfg.GetModels() {
-				modelSet[model] = struct{}{}
+			for _, modelName := range cfg.GetModels() {
+				modelSet[modelName] = struct{}{}
 			}
 		}
 		models = make([]string, 0, len(modelSet))
-		for model := range modelSet {
-			models = append(models, model)
+		for modelName := range modelSet {
+			models = append(models, modelName)
 		}
 	}
 
@@ -55,8 +52,7 @@ func (s *Server) filterVisibleModelsForRequest(c *gin.Context, protocol string, 
 func (s *Server) handleListGeminiModels(c *gin.Context) {
 	ctx := c.Request.Context()
 
-	// 获取所有暴露 gemini 协议的去重模型列表
-	models, err := s.getModelsByExposedProtocol(ctx, "gemini")
+	models, err := s.getAllEnabledModels(ctx)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to load models"})
 		return
@@ -83,9 +79,9 @@ func (s *Server) handleListGeminiModels(c *gin.Context) {
 	})
 }
 
-// detectModelsChannelType 根据请求头判断 /v1/models 应返回哪种渠道类型的模型
+// detectModelsClientProtocol 根据请求头判断 /v1/models 的客户端协议。
 // anthropic-version 头存在 → anthropic 渠道；否则 → openai 渠道
-func detectModelsChannelType(c *gin.Context) string {
+func detectModelsClientProtocol(c *gin.Context) string {
 	if c.GetHeader("anthropic-version") != "" {
 		return "anthropic"
 	}
@@ -102,16 +98,16 @@ func detectModelsChannelType(c *gin.Context) string {
 func (s *Server) handleListOpenAIModels(c *gin.Context) {
 	ctx := c.Request.Context()
 
-	channelType := detectModelsChannelType(c)
-	models, err := s.getModelsByExposedProtocol(ctx, channelType)
+	clientProtocol := detectModelsClientProtocol(c)
+	models, err := s.getAllEnabledModels(ctx)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to load models"})
 		return
 	}
-	models = s.filterVisibleModelsForRequest(c, channelType, models)
+	models = s.filterVisibleModelsForRequest(c, clientProtocol, models)
 	sort.Strings(models)
 
-	if channelType == "anthropic" {
+	if clientProtocol == "anthropic" {
 		type ModelInfo struct {
 			ID          string `json:"id"`
 			DisplayName string `json:"display_name"`
@@ -142,10 +138,11 @@ func (s *Server) handleListOpenAIModels(c *gin.Context) {
 
 	// 构造 OpenAI API 响应格式
 	type ModelInfo struct {
-		ID      string `json:"id"`
-		Object  string `json:"object"`
-		Created int64  `json:"created"`
-		OwnedBy string `json:"owned_by"`
+		ID                string `json:"id"`
+		Object            string `json:"object"`
+		Created           int64  `json:"created"`
+		OwnedBy           string `json:"owned_by"`
+		MultiAgentVersion string `json:"multi_agent_version,omitempty"`
 	}
 
 	modelList := make([]ModelInfo, 0, len(models))
@@ -155,6 +152,12 @@ func (s *Server) handleListOpenAIModels(c *gin.Context) {
 			Object:  "model",
 			Created: 0,
 			OwnedBy: "system",
+			MultiAgentVersion: func() string {
+				if clientProtocol == "codex" {
+					return "v2"
+				}
+				return ""
+			}(),
 		})
 	}
 

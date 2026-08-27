@@ -296,6 +296,7 @@ func BindAndValidate(c *gin.Context, obj RequestValidator) error {
 // - channel_name_like: 模糊匹配渠道名称
 // - model: 精确匹配模型名称
 // - model_like: 模糊匹配模型名称
+// - client_protocol: 精确匹配客户端入口协议
 func BuildLogFilter(c *gin.Context) model.LogFilter {
 	var lf model.LogFilter
 
@@ -333,9 +334,12 @@ func BuildLogFilter(c *gin.Context) model.LogFilter {
 		}
 	}
 
-	// 渠道类型过滤（anthropic/openai/gemini/codex）
-	if ct := strings.TrimSpace(c.Query("channel_type")); ct != "" {
-		lf.ChannelType = ct
+	if clientProtocol := strings.ToLower(strings.TrimSpace(c.Query("client_protocol"))); clientProtocol != "" && clientProtocol != "all" {
+		lf.ClientProtocol = clientProtocol
+	}
+
+	if upstreamProtocol := strings.ToLower(strings.TrimSpace(c.Query("upstream_protocol"))); upstreamProtocol != "" && upstreamProtocol != "all" {
+		lf.UpstreamProtocol = upstreamProtocol
 	}
 
 	// API令牌ID过滤
@@ -359,6 +363,8 @@ func BuildLogFilter(c *gin.Context) model.LogFilter {
 	default:
 		lf.LogSource = model.LogSourceProxy
 	}
+
+	ApplyWebIdentityScope(c, &lf)
 
 	return lf
 }

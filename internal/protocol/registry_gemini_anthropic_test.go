@@ -9,6 +9,8 @@ import (
 
 	"ccLoad/internal/protocol"
 	"ccLoad/internal/protocol/builtin"
+
+	"github.com/tidwall/gjson"
 )
 
 func TestRegistry_TranslateRequest_GeminiToAnthropic(t *testing.T) {
@@ -34,26 +36,59 @@ func TestRegistry_TranslateRequest_GeminiToAnthropic(t *testing.T) {
 	if err := json.Unmarshal(got, &req); err != nil {
 		t.Fatalf("unmarshal anthropic request: %v", err)
 	}
-	if len(req.System) != 1 || req.System[0]["text"] != "be careful" {
+	if len(req.System) != 0 {
 		t.Fatalf("unexpected anthropic system: %+v", req.System)
 	}
-	if len(req.Messages) != 3 {
+	if len(req.Messages) != 4 {
 		t.Fatalf("unexpected anthropic messages: %+v", req.Messages)
 	}
-	if req.Messages[0].Role != "user" || req.Messages[0].Content[0]["text"] != "hello" {
+	if req.Messages[0].Role != "user" || req.Messages[0].Content[0]["text"] != "be careful" {
 		t.Fatalf("unexpected user message: %+v", req.Messages[0])
 	}
-	if req.Messages[1].Role != "assistant" || req.Messages[1].Content[0]["type"] != "tool_use" || req.Messages[1].Content[0]["id"] != "call_1" || req.Messages[1].Content[0]["name"] != "lookup" {
-		t.Fatalf("unexpected tool use message: %+v", req.Messages[1])
+	if req.Messages[1].Role != "user" || req.Messages[1].Content[0]["text"] != "hello" {
+		t.Fatalf("unexpected user message: %+v", req.Messages[1])
 	}
-	if req.Messages[2].Role != "user" || req.Messages[2].Content[0]["type"] != "tool_result" || req.Messages[2].Content[0]["tool_use_id"] != "call_1" || req.Messages[2].Content[0]["content"] != "done" {
-		t.Fatalf("unexpected tool result message: %+v", req.Messages[2])
+	toolUseID, _ := req.Messages[2].Content[0]["id"].(string)
+	if req.Messages[2].Role != "assistant" || req.Messages[2].Content[0]["type"] != "tool_use" || toolUseID == "" || req.Messages[2].Content[0]["name"] != "lookup" {
+		t.Fatalf("unexpected tool use message: %+v", req.Messages[2])
+	}
+	if req.Messages[3].Role != "user" || req.Messages[3].Content[0]["type"] != "tool_result" || req.Messages[3].Content[0]["tool_use_id"] != toolUseID || req.Messages[3].Content[0]["content"] != "done" {
+		t.Fatalf("unexpected tool result message: %+v", req.Messages[3])
 	}
 	if len(req.Tools) != 1 || req.Tools[0]["name"] != "lookup" || req.Tools[0]["description"] != "lookup docs" {
 		t.Fatalf("unexpected anthropic tools: %+v", req.Tools)
 	}
 	if req.ToolChoice["type"] != "tool" || req.ToolChoice["name"] != "lookup" {
 		t.Fatalf("unexpected anthropic tool choice: %+v", req.ToolChoice)
+	}
+}
+
+func TestRegistry_TranslateRequest_Gemini_DefaultsMissingRoleToUser(t *testing.T) {
+	t.Parallel()
+
+	reg := protocol.NewRegistry()
+	builtin.Register(reg)
+
+	raw := []byte(`{"contents":[{"parts":[{"text":"hello"}]}]}`)
+	tests := []struct {
+		name     string
+		target   protocol.Protocol
+		rolePath string
+	}{
+		{name: "Anthropic", target: protocol.Anthropic, rolePath: "messages.0.role"},
+		{name: "OpenAI", target: protocol.OpenAI, rolePath: "messages.0.role"},
+		{name: "Codex", target: protocol.Codex, rolePath: "input.0.role"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := reg.TranslateRequest(protocol.Gemini, tt.target, "test-model", raw, false)
+			if err != nil {
+				t.Fatalf("TranslateRequest failed: %v", err)
+			}
+			if role := gjson.GetBytes(got, tt.rolePath).String(); role != "user" {
+				t.Fatalf("missing Gemini role translated to %s role %q, want user: %s", tt.target, role, got)
+			}
+		})
 	}
 }
 
@@ -203,9 +238,8 @@ func TestRegistry_TranslateResponseStream_AnthropicToGemini_ThinkingBlock(t *tes
 	}
 
 	result := allOutput.String()
-	// thinking 内容不应出现在 Gemini 输出中（Gemini 不支持 thinking）
-	if strings.Contains(result, "step 1") {
-		t.Fatalf("thinking content should be discarded, got:\n%s", result)
+	if !strings.Contains(result, `"thought":true`) || !strings.Contains(result, `"text":"step 1"`) {
+		t.Fatalf("expected Anthropic thinking as Gemini thought content, got:\n%s", result)
 	}
 	// 文本块应正常输出
 	if !strings.Contains(result, `"hello gemini"`) {
@@ -245,7 +279,9 @@ func TestRegistry_TranslateResponseStream_AnthropicToGemini_RedactedThinking(t *
 	}
 
 	result := allOutput.String()
-	// redacted_thinking 不应导致错误，文本内容正常输出
+	if !strings.Contains(result, `"thoughtSignature":"opaque"`) {
+		t.Fatalf("expected redacted thinking as Gemini thought signature, got:\n%s", result)
+	}
 	if !strings.Contains(result, `"answer"`) {
 		t.Fatalf("expected text 'answer', got:\n%s", result)
 	}
@@ -282,6 +318,9 @@ func TestRegistry_TranslateResponseStream_AnthropicToGemini_SignatureDelta(t *te
 	}
 
 	result := allOutput.String()
+	if !strings.Contains(result, `"thoughtSignature":"abc123"`) {
+		t.Fatalf("expected Gemini thought signature, got:\n%s", result)
+	}
 	// 必须有 finishReason（流完整关闭）
 	if !strings.Contains(result, `"finishReason":"STOP"`) {
 		t.Fatalf("expected finishReason=STOP, stream hung: got:\n%s", result)

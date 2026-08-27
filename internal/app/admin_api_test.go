@@ -10,11 +10,14 @@ import (
 	"mime/multipart"
 	"net/http"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
+	"ccLoad/internal/codexauth"
 	"ccLoad/internal/model"
+	"ccLoad/internal/xaiauth"
 
 	"github.com/gin-gonic/gin"
 )
@@ -30,24 +33,24 @@ func TestAdminAPI_ExportChannelsCSV(t *testing.T) {
 	ctx := context.Background()
 	testChannels := []*model.Config{
 		{
-			Name:     "Test-Export-1",
-			URL:      "https://api1.example.com",
-			Priority: 10,
+			Name:       "Test-Export-1",
+			URLs:       model.ChannelURLs{{URL: "https://api1.example.com"}},
+			Priority:   10,
+			Websockets: true,
 			ModelEntries: []model.ModelEntry{
 				{Model: "model-1", RedirectModel: ""},
 			},
-			ChannelType: "anthropic",
-			Enabled:     true,
+			Enabled:                 true,
+			RetryOtherKeysOnFailure: true,
 		},
 		{
 			Name:     "Test-Export-2",
-			URL:      "https://api2.example.com",
+			URLs:     model.ChannelURLs{{URL: "https://api2.example.com"}},
 			Priority: 5,
 			ModelEntries: []model.ModelEntry{
 				{Model: "model-2", RedirectModel: ""},
 			},
-			ChannelType: "gemini",
-			Enabled:     false,
+			Enabled: false,
 		},
 	}
 
@@ -109,9 +112,9 @@ func TestAdminAPI_ExportChannelsCSV(t *testing.T) {
 		header[0] = strings.TrimPrefix(header[0], "\ufeff")
 	}
 
-	expectedHeaders := []string{"id", "name", "api_key", "url", "priority", "rpm_limit", "max_concurrency", "models", "model_redirects", "channel_type", "protocol_transforms", "protocol_transform_mode", "key_strategy", "enabled", "scheduled_check_enabled", "scheduled_check_model"}
+	expectedHeaders := []string{"id", "name", "api_key", "urls", "priority", "rpm_limit", "max_concurrency", "models", "model_redirects", "protocol_transform_mode", "key_strategy", "enabled", "scheduled_check_enabled", "scheduled_check_model", "cooldown_detection_rules", "retry_other_keys_on_failure", "auth_type", "oauth_credential", "websockets"}
 	if len(header) != len(expectedHeaders) {
-		t.Errorf("Header字段数量不匹配: 期望 %d, 实际: %d\nHeader: %v", len(expectedHeaders), len(header), header)
+		t.Fatalf("Header字段数量不匹配: 期望 %d, 实际: %d\nHeader: %v", len(expectedHeaders), len(header), header)
 	}
 
 	for i, expected := range expectedHeaders {
@@ -120,9 +123,275 @@ func TestAdminAPI_ExportChannelsCSV(t *testing.T) {
 		}
 	}
 
-	// 验证数据行（应该有16个字段）
 	if len(records[1]) < 16 {
 		t.Errorf("数据行字段不足，期望至少16个字段，实际: %d", len(records[1]))
+	}
+	if len(records[1]) >= 16 && records[1][15] != "true" {
+		t.Errorf("retry_other_keys_on_failure 导出值错误: got %q, want true", records[1][15])
+	}
+	websocketsIndex := slices.Index(header, "websockets")
+	if websocketsIndex < 0 || records[1][websocketsIndex] != "true" {
+		t.Errorf("websockets 导出值错误: row=%v", records[1])
+	}
+}
+
+func TestAdminAPI_ExportChannelsCSVSelectedIDs(t *testing.T) {
+	t.Parallel()
+	server := newInMemoryServer(t)
+	ctx := context.Background()
+
+	ids := make([]int64, 0, 3)
+	for _, name := range []string{"Selected-A", "Skipped-B", "Selected-C"} {
+		created, err := server.store.CreateConfig(ctx, &model.Config{
+			Name:         name,
+			URLs:         model.ChannelURLs{{URL: "https://" + strings.ToLower(name) + ".example.com"}},
+			ModelEntries: []model.ModelEntry{{Model: "model-1"}},
+			Enabled:      true,
+		})
+		if err != nil {
+			t.Fatalf("CreateConfig(%s): %v", name, err)
+		}
+		ids = append(ids, created.ID)
+	}
+
+	target := fmt.Sprintf("/admin/channels/export?ids=%d,%d", ids[0], ids[2])
+	c, w := newTestContext(t, newRequest(http.MethodGet, target, nil))
+	server.HandleExportChannelsCSV(c)
+	if w.Code != http.StatusOK {
+		t.Fatalf("export status=%d, want 200", w.Code)
+	}
+
+	records, err := csv.NewReader(bytes.NewReader(w.Body.Bytes())).ReadAll()
+	if err != nil {
+		t.Fatalf("parse exported CSV: %v", err)
+	}
+	if len(records) != 3 {
+		t.Fatalf("exported row count=%d, want header plus two selected channels", len(records))
+	}
+	headerIndex := buildCSVColumnIndex(records[0])
+	exported := []string{records[1][headerIndex["name"]], records[2][headerIndex["name"]]}
+	if !slices.Contains(exported, "Selected-A") || !slices.Contains(exported, "Selected-C") {
+		t.Fatalf("exported channels=%v, want Selected-A and Selected-C", exported)
+	}
+	if slices.Contains(exported, "Skipped-B") {
+		t.Fatal("unselected channel leaked into the export")
+	}
+
+	badC, badW := newTestContext(t, newRequest(http.MethodGet, "/admin/channels/export?ids=abc", nil))
+	server.HandleExportChannelsCSV(badC)
+	if badW.Code != http.StatusBadRequest {
+		t.Fatalf("invalid ids status=%d, want 400", badW.Code)
+	}
+}
+
+func TestAdminAPI_CSVExportImportOAuthChannelWithFilters(t *testing.T) {
+	server := newInMemoryServer(t)
+	ctx := context.Background()
+	const desiredCredential = `{"type":"codex","access_token":"wanted-access","refresh_token":"wanted-refresh","expired":"2030-01-01T00:00:00Z"}`
+
+	testChannels := []*model.Config{
+		{
+			Name: "Needle Codex", AuthType: model.AuthTypeCodexOAuth, OAuthCredential: desiredCredential,
+			URLs: model.ChannelURLs{{URL: "https://codex.example.com"}}, Enabled: true, Websockets: true,
+			ModelEntries: []model.ModelEntry{{Model: "grok-4.5"}},
+		},
+		{
+			Name: "Needle Disabled", AuthType: model.AuthTypeCodexOAuth, OAuthCredential: desiredCredential,
+			URLs: model.ChannelURLs{{URL: "https://disabled.example.com"}}, Enabled: false,
+			ModelEntries: []model.ModelEntry{{Model: "grok-4.5"}},
+		},
+		{
+			Name: "Needle Other Model", AuthType: model.AuthTypeCodexOAuth, OAuthCredential: desiredCredential,
+			URLs: model.ChannelURLs{{URL: "https://model.example.com"}}, Enabled: true,
+			ModelEntries: []model.ModelEntry{{Model: "other-model"}},
+		},
+		{
+			Name: "Other Codex", AuthType: model.AuthTypeCodexOAuth, OAuthCredential: desiredCredential,
+			URLs: model.ChannelURLs{{URL: "https://name.example.com"}}, Enabled: true,
+			ModelEntries: []model.ModelEntry{{Model: "grok-4.5"}},
+		},
+		{
+			Name: "Needle xAI", AuthType: model.AuthTypeXAIOAuth,
+			OAuthCredential: `{"type":"xai","auth_kind":"oauth","access_token":"xai-access","refresh_token":"xai-refresh","expired":"2030-01-01T00:00:00Z"}`,
+			URLs:            model.ChannelURLs{{URL: "https://xai.example.com"}}, Enabled: true,
+			ModelEntries: []model.ModelEntry{{Model: "grok-4.5"}},
+		},
+	}
+	var desiredID int64
+	for _, cfg := range testChannels {
+		created, err := server.store.CreateConfig(ctx, cfg)
+		if err != nil {
+			t.Fatalf("CreateConfig(%s): %v", cfg.Name, err)
+		}
+		if cfg.Name == "Needle Codex" {
+			desiredID = created.ID
+		}
+	}
+
+	exportRequest := newRequest(http.MethodGet, "/admin/channels/export?search=needle&status=enabled&auth_type=codex_oauth&model=grok-4.5", nil)
+	exportC, exportW := newTestContext(t, exportRequest)
+	server.HandleExportChannelsCSV(exportC)
+	if exportW.Code != http.StatusOK {
+		t.Fatalf("export status=%d", exportW.Code)
+	}
+	records, err := csv.NewReader(bytes.NewReader(exportW.Body.Bytes())).ReadAll()
+	if err != nil {
+		t.Fatalf("parse exported CSV: %v", err)
+	}
+	if len(records) != 2 {
+		t.Fatalf("exported row count=%d, want header plus one matching channel", len(records))
+	}
+	headerIndex := buildCSVColumnIndex(records[0])
+	for _, column := range []string{"auth_type", "oauth_credential", "api_key", "websockets"} {
+		if _, exists := headerIndex[column]; !exists {
+			t.Fatalf("exported CSV is missing %s", column)
+		}
+	}
+	row := records[1]
+	if row[headerIndex["name"]] != "Needle Codex" || row[headerIndex["auth_type"]] != model.AuthTypeCodexOAuth {
+		t.Fatal("exported CSV did not contain the matching Codex OAuth channel")
+	}
+	if row[headerIndex["api_key"]] != "" || row[headerIndex["oauth_credential"]] == "" {
+		t.Fatal("exported OAuth credential columns are inconsistent")
+	}
+	if row[headerIndex["websockets"]] != "true" {
+		t.Fatal("exported OAuth channel lost its websockets setting")
+	}
+
+	if err := server.store.DeleteConfig(ctx, desiredID); err != nil {
+		t.Fatalf("delete exported channel: %v", err)
+	}
+	body := &bytes.Buffer{}
+	writer := multipart.NewWriter(body)
+	part, err := writer.CreateFormFile("file", "oauth-roundtrip.csv")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := part.Write(exportW.Body.Bytes()); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	importRequest := newRequest(http.MethodPost, "/admin/channels/import", bytes.NewReader(body.Bytes()))
+	importRequest.Header.Set("Content-Type", writer.FormDataContentType())
+	importC, importW := newTestContext(t, importRequest)
+	server.HandleImportChannelsCSV(importC)
+	if importW.Code != http.StatusOK {
+		t.Fatalf("import status=%d", importW.Code)
+	}
+
+	configs, err := server.store.ListConfigs(ctx)
+	if err != nil {
+		t.Fatalf("list restored OAuth channels: %v", err)
+	}
+	var restored *model.Config
+	for _, cfg := range configs {
+		if cfg.Name == "Needle Codex" {
+			restored = cfg
+			break
+		}
+	}
+	if restored == nil {
+		t.Fatal("restored OAuth channel not found by name")
+	}
+	credential, err := codexauth.ParseCredential([]byte(restored.OAuthCredential))
+	if err != nil {
+		t.Fatal("restored OAuth credential is invalid")
+	}
+	if restored.GetAuthType() != model.AuthTypeCodexOAuth || credential.AccessToken != "wanted-access" {
+		t.Fatal("restored OAuth channel lost its authentication state")
+	}
+	if !restored.Websockets {
+		t.Fatal("restored OAuth channel lost its websockets setting")
+	}
+	keys, err := server.store.GetAPIKeys(ctx, restored.ID)
+	if err != nil || len(keys) != 0 {
+		t.Fatalf("restored OAuth channel API key count=%d err=%v", len(keys), err)
+	}
+}
+
+func TestAdminAPI_CSVExportImportSupportsEveryOAuthType(t *testing.T) {
+	source := newInMemoryServer(t)
+	ctx := context.Background()
+	testChannels := []*model.Config{
+		{
+			Name: "Codex OAuth", AuthType: model.AuthTypeCodexOAuth,
+			OAuthCredential: `{"type":"codex","access_token":"codex-access","refresh_token":"codex-refresh","expired":"2030-01-01T00:00:00Z"}`,
+			URLs:            model.ChannelURLs{{URL: "https://codex.example.com"}}, Enabled: true,
+			ModelEntries: []model.ModelEntry{{Model: "gpt-5.4"}},
+		},
+		{
+			Name: "Antigravity OAuth", AuthType: model.AuthTypeAntigravityOAuth,
+			OAuthCredential: `{"type":"antigravity","access_token":"gravity-access","refresh_token":"gravity-refresh","expired":"2030-01-01T00:00:00Z"}`,
+			URLs:            model.ChannelURLs{{URL: "https://gravity.example.com"}}, Enabled: true,
+			ModelEntries: []model.ModelEntry{{Model: "gemini-3-pro"}},
+		},
+		{
+			Name: "xAI OAuth", AuthType: model.AuthTypeXAIOAuth,
+			OAuthCredential: `{"type":"xai","auth_kind":"oauth","access_token":"xai-access","refresh_token":"xai-refresh","expired":"2030-01-01T00:00:00Z"}`,
+			URLs:            model.ChannelURLs{{URL: xaiauth.CLIBaseURL}}, Enabled: true,
+			ModelEntries: []model.ModelEntry{{Model: "grok-4.5"}},
+		},
+		{
+			Name: "Anthropic OAuth", AuthType: model.AuthTypeAnthropicOAuth,
+			OAuthCredential: `{"type":"anthropic","access_token":"anthropic-access","refresh_token":"anthropic-refresh","expired":"2030-01-01T00:00:00Z","account_uuid":"account-1"}`,
+			URLs:            model.ChannelURLs{{URL: "https://api.anthropic.com", Protocols: []string{"anthropic"}}}, Enabled: true,
+			ModelEntries: []model.ModelEntry{{Model: "claude-sonnet-4-6"}},
+		},
+	}
+	for _, cfg := range testChannels {
+		if _, err := source.store.CreateConfig(ctx, cfg); err != nil {
+			t.Fatalf("CreateConfig(%s): %v", cfg.Name, err)
+		}
+	}
+
+	exportC, exportW := newTestContext(t, newRequest(http.MethodGet, "/admin/channels/export", nil))
+	source.HandleExportChannelsCSV(exportC)
+	if exportW.Code != http.StatusOK {
+		t.Fatalf("export status=%d", exportW.Code)
+	}
+
+	target := newInMemoryServer(t)
+	body := &bytes.Buffer{}
+	writer := multipart.NewWriter(body)
+	part, err := writer.CreateFormFile("file", "oauth-channels.csv")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := part.Write(exportW.Body.Bytes()); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	request := newRequest(http.MethodPost, "/admin/channels/import", bytes.NewReader(body.Bytes()))
+	request.Header.Set("Content-Type", writer.FormDataContentType())
+	importC, importW := newTestContext(t, request)
+	target.HandleImportChannelsCSV(importC)
+	if importW.Code != http.StatusOK {
+		t.Fatalf("import status=%d", importW.Code)
+	}
+
+	configs, err := target.store.ListConfigs(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(configs) != len(testChannels) {
+		t.Fatalf("restored channel count=%d, want %d", len(configs), len(testChannels))
+	}
+	wantAuthType := make(map[string]string, len(testChannels))
+	for _, cfg := range testChannels {
+		wantAuthType[cfg.Name] = cfg.GetAuthType()
+	}
+	for _, cfg := range configs {
+		if cfg.GetAuthType() != wantAuthType[cfg.Name] || cfg.OAuthCredential == "" {
+			t.Fatalf("restored channel %q lost its OAuth authentication type", cfg.Name)
+		}
+		keys, err := target.store.GetAPIKeys(ctx, cfg.ID)
+		if err != nil || len(keys) != 0 {
+			t.Fatalf("restored OAuth channel %q API key count=%d err=%v", cfg.Name, len(keys), err)
+		}
 	}
 }
 
@@ -131,9 +400,9 @@ func TestAdminAPI_ImportChannelsCSV(t *testing.T) {
 	server := newInMemoryServer(t)
 
 	// 创建测试CSV文件（注意：列名是api_key而不是api_keys）
-	csvContent := `name,url,priority,rpm_limit,max_concurrency,models,model_redirects,channel_type,protocol_transforms,enabled,api_key,key_strategy,scheduled_check_model
-Import-Test-1,https://import1.example.com,10,0,3,test-model-1,{},anthropic,openai,true,sk-import-key-1,sequential,test-model-1
-Import-Test-2,https://import2.example.com,5,0,0,"test-model-2,test-model-3","{""old"":""new""}",gemini,"openai,anthropic",false,sk-import-key-2,round_robin,test-model-3
+	csvContent := `name,urls,priority,rpm_limit,max_concurrency,websockets,models,model_redirects,protocol_transform_mode,protocol_transforms,enabled,api_key,key_strategy,scheduled_check_model
+Import-Test-1,"[{""url"":""https://import1.example.com"",""protocols"" : [""anthropic"",""openai""]}]",10,0,3,true,test-model-1,{},local,openai,true,sk-import-key-1,sequential,test-model-1
+Import-Test-2,"[{""url"":""https://import2.example.com"",""exact"":true}]",5,0,0,false,"test-model-2,test-model-3","{""old"":""new""}",upstream,"openai,anthropic",false,sk-import-key-2,round_robin,test-model-3
 `
 
 	// 创建multipart表单
@@ -222,60 +491,109 @@ Import-Test-2,https://import2.example.com,5,0,0,"test-model-2,test-model-3","{""
 		if cfg.Name == "Import-Test-1" && cfg.MaxConcurrency != 3 {
 			t.Errorf("渠道 %s max_concurrency = %d, want 3", cfg.Name, cfg.MaxConcurrency)
 		}
+		if cfg.Name == "Import-Test-1" && !cfg.Websockets {
+			t.Errorf("渠道 %s websockets = false, want true", cfg.Name)
+		}
 		if cfg.Name == "Import-Test-2" && cfg.MaxConcurrency != 0 {
 			t.Errorf("渠道 %s max_concurrency = %d, want 0", cfg.Name, cfg.MaxConcurrency)
+		}
+		if cfg.Name == "Import-Test-2" && cfg.Websockets {
+			t.Errorf("渠道 %s websockets = true, want false", cfg.Name)
 		}
 		if cfg.Name == "Import-Test-2" && cfg.ScheduledCheckModel != "test-model-3" {
 			t.Errorf("渠道 %s scheduled_check_model = %q", cfg.Name, cfg.ScheduledCheckModel)
 		}
-		if cfg.Name == "Import-Test-1" && (len(cfg.ProtocolTransforms) != 1 || cfg.ProtocolTransforms[0] != "openai") {
-			t.Errorf("渠道 %s protocol_transforms = %#v", cfg.Name, cfg.ProtocolTransforms)
-		}
-		if cfg.Name == "Import-Test-2" && (len(cfg.ProtocolTransforms) != 2 || cfg.ProtocolTransforms[0] != "anthropic" || cfg.ProtocolTransforms[1] != "openai") {
-			t.Errorf("渠道 %s protocol_transforms = %#v", cfg.Name, cfg.ProtocolTransforms)
-		}
-		if cfg.GetProtocolTransformMode() != model.ProtocolTransformModeUpstream {
+		if cfg.Name == "Import-Test-1" && cfg.GetProtocolTransformMode() != model.ProtocolTransformModeLocal {
 			t.Errorf("渠道 %s protocol_transform_mode = %q", cfg.Name, cfg.GetProtocolTransformMode())
+		}
+		if cfg.Name == "Import-Test-1" && (len(cfg.URLs) != 1 || !slices.Equal(cfg.URLs[0].Protocols, []string{"anthropic", "openai"})) {
+			t.Errorf("渠道 %s URLs = %+v", cfg.Name, cfg.URLs)
+		}
+		if cfg.Name == "Import-Test-2" && cfg.GetProtocolTransformMode() != model.ProtocolTransformModeUpstream {
+			t.Errorf("渠道 %s protocol_transform_mode = %q", cfg.Name, cfg.GetProtocolTransformMode())
+		}
+		if cfg.Name == "Import-Test-2" && (len(cfg.URLs) != 1 || !cfg.URLs[0].Exact) {
+			t.Errorf("渠道 %s URLs = %+v", cfg.Name, cfg.URLs)
 		}
 	}
 }
 
-func TestAdminAPI_ImportChannelsCSV_UsesExplicitIDForRename(t *testing.T) {
+func TestAdminAPI_ImportChannelsCSV_IgnoresIDAndMatchesByName(t *testing.T) {
 	server := newInMemoryServer(t)
 	ctx := context.Background()
 
-	created, err := server.store.CreateConfig(ctx, &model.Config{
-		Name:         "Import-Rename-Source",
-		URL:          "https://old-id.example.com",
+	IDOwner, err := server.store.CreateConfig(ctx, &model.Config{
+		Name:         "Import-ID-Owner",
+		URLs:         model.ChannelURLs{{URL: "https://id-owner.example.com"}},
 		Priority:     10,
-		ModelEntries: []model.ModelEntry{{Model: "old-model", RedirectModel: ""}},
-		ChannelType:  "openai",
+		ModelEntries: []model.ModelEntry{{Model: "owner-model"}},
 		Enabled:      true,
 	})
 	if err != nil {
-		t.Fatalf("创建现有渠道失败: %v", err)
+		t.Fatalf("创建 ID 占用渠道失败: %v", err)
 	}
 	if err := server.store.CreateAPIKeysBatch(ctx, []*model.APIKey{{
-		ChannelID:   created.ID,
+		ChannelID:   IDOwner.ID,
 		KeyIndex:    0,
-		APIKey:      "sk-old-id-key",
+		APIKey:      "sk-owner-key",
 		KeyStrategy: model.KeyStrategySequential,
 	}}); err != nil {
-		t.Fatalf("创建现有 key 失败: %v", err)
+		t.Fatalf("创建 ID 占用渠道 key 失败: %v", err)
 	}
 
-	csvContent := fmt.Sprintf(`id,name,url,priority,models,model_redirects,channel_type,enabled,api_key,key_strategy
-%d,Import-Rename-Target,https://new-id.example.com,20,new-model,{},openai,true,sk-new-id-key,sequential
-,Import-Rename-Brand-New,https://brand-new.example.com,5,brand-model,{},anthropic,true,sk-brand-new,sequential
-`, created.ID)
+	nameMatch, err := server.store.CreateConfig(ctx, &model.Config{
+		Name:         "Import-Name-Match",
+		URLs:         model.ChannelURLs{{URL: "https://name-old.example.com"}},
+		Priority:     10,
+		Websockets:   true,
+		ModelEntries: []model.ModelEntry{{Model: "name-old-model"}},
+		Enabled:      true,
+	})
+	if err != nil {
+		t.Fatalf("创建名称匹配渠道失败: %v", err)
+	}
+	if err := server.store.CreateAPIKeysBatch(ctx, []*model.APIKey{{
+		ChannelID:   nameMatch.ID,
+		KeyIndex:    0,
+		APIKey:      "sk-name-old",
+		KeyStrategy: model.KeyStrategySequential,
+	}}); err != nil {
+		t.Fatalf("创建名称匹配渠道 key 失败: %v", err)
+	}
+
+	var csvContent bytes.Buffer
+	csvWriter := csv.NewWriter(&csvContent)
+	if err := csvWriter.Write([]string{
+		"id", "name", "auth_type", "oauth_credential", "urls", "priority", "models",
+		"model_redirects", "enabled", "api_key", "key_strategy", "websockets",
+	}); err != nil {
+		t.Fatalf("写入 CSV 表头失败: %v", err)
+	}
+	if err := csvWriter.Write([]string{
+		strconv.FormatInt(IDOwner.ID, 10), "Import-Name-Match", model.AuthTypeAPIKey, "",
+		`[{"url":"https://name-new.example.com"}]`, "20", "name-new-model", "{}", "true", "sk-name-new", model.KeyStrategySequential, "false",
+	}); err != nil {
+		t.Fatalf("写入名称匹配行失败: %v", err)
+	}
+	if err := csvWriter.Write([]string{
+		strconv.FormatInt(nameMatch.ID, 10), "Import-New-Codex", model.AuthTypeCodexOAuth,
+		`{"type":"codex","access_token":"new-access","refresh_token":"new-refresh","expired":"2030-01-01T00:00:00Z"}`,
+		`[{"url":"https://codex-new.example.com"}]`, "5", "gpt-5.4", "{}", "true", "", model.KeyStrategySequential, "false",
+	}); err != nil {
+		t.Fatalf("写入 OAuth 新增行失败: %v", err)
+	}
+	csvWriter.Flush()
+	if err := csvWriter.Error(); err != nil {
+		t.Fatalf("生成 CSV 失败: %v", err)
+	}
 
 	body := &bytes.Buffer{}
 	writer := multipart.NewWriter(body)
-	part, err := writer.CreateFormFile("file", "explicit-id-import.csv")
+	part, err := writer.CreateFormFile("file", "cross-database-import.csv")
 	if err != nil {
 		t.Fatalf("创建表单文件字段失败: %v", err)
 	}
-	if _, err := io.WriteString(part, csvContent); err != nil {
+	if _, err := part.Write(csvContent.Bytes()); err != nil {
 		t.Fatalf("写入CSV内容失败: %v", err)
 	}
 	if err := writer.Close(); err != nil {
@@ -298,45 +616,65 @@ func TestAdminAPI_ImportChannelsCSV_UsesExplicitIDForRename(t *testing.T) {
 		t.Fatalf("期望更新1条并创建1条，实际 summary=%+v", summary)
 	}
 
-	updated, err := server.store.GetConfig(ctx, created.ID)
+	updated, err := server.store.GetConfig(ctx, nameMatch.ID)
 	if err != nil {
-		t.Fatalf("查询按ID更新后的渠道失败: %v", err)
+		t.Fatalf("查询按名称更新后的渠道失败: %v", err)
 	}
-	if updated.Name != "Import-Rename-Target" {
-		t.Fatalf("期望按ID更新名称，实际为 %q", updated.Name)
+	if updated.Name != "Import-Name-Match" {
+		t.Fatalf("名称匹配渠道被错误改名为 %q", updated.Name)
 	}
-	if updated.URL != "https://new-id.example.com" {
-		t.Fatalf("期望按ID更新 URL，实际为 %q", updated.URL)
+	if urls := updated.GetURLs(); len(urls) != 1 || urls[0] != "https://name-new.example.com" {
+		t.Fatalf("期望按名称更新 URL，实际为 %v", urls)
 	}
-	if len(updated.ModelEntries) != 1 || updated.ModelEntries[0].Model != "new-model" {
-		t.Fatalf("期望按ID更新模型，实际为 %+v", updated.ModelEntries)
+	if len(updated.ModelEntries) != 1 || updated.ModelEntries[0].Model != "name-new-model" {
+		t.Fatalf("期望按名称更新模型，实际为 %+v", updated.ModelEntries)
 	}
-	keys, err := server.store.GetAPIKeys(ctx, created.ID)
+	if updated.Websockets {
+		t.Fatal("CSV 中显式 websockets=false 应覆盖已有 true")
+	}
+	keys, err := server.store.GetAPIKeys(ctx, nameMatch.ID)
 	if err != nil {
-		t.Fatalf("查询按ID更新后的 key 失败: %v", err)
+		t.Fatalf("查询按名称更新后的 key 失败: %v", err)
 	}
-	if len(keys) != 1 || keys[0].APIKey != "sk-new-id-key" {
-		t.Fatalf("期望按ID更新 key，实际为 %+v", keys)
+	if len(keys) != 1 || keys[0].APIKey != "sk-name-new" {
+		t.Fatalf("期望按名称更新 key，实际为 %+v", keys)
+	}
+
+	owner, err := server.store.GetConfig(ctx, IDOwner.ID)
+	if err != nil {
+		t.Fatalf("查询 ID 占用渠道失败: %v", err)
+	}
+	if owner.Name != "Import-ID-Owner" || owner.GetURLs()[0] != "https://id-owner.example.com" {
+		t.Fatalf("CSV ID 不应修改占用该 ID 的渠道: %+v", owner)
+	}
+	ownerKeys, err := server.store.GetAPIKeys(ctx, IDOwner.ID)
+	if err != nil || len(ownerKeys) != 1 || ownerKeys[0].APIKey != "sk-owner-key" {
+		t.Fatalf("ID 占用渠道 key 不应被修改: keys=%+v err=%v", ownerKeys, err)
 	}
 
 	configs, err := server.store.ListConfigs(ctx)
 	if err != nil {
 		t.Fatalf("查询渠道列表失败: %v", err)
 	}
-	newCount := 0
+	var newCodex *model.Config
 	for _, cfg := range configs {
-		if cfg.Name == "Import-Rename-Brand-New" {
-			newCount++
-			if cfg.ID == created.ID {
-				t.Fatalf("新渠道不应复用旧 ID")
-			}
-		}
-		if cfg.Name == "Import-Rename-Source" {
-			t.Fatalf("旧名称渠道不应保留为额外记录")
+		if cfg.Name == "Import-New-Codex" {
+			newCodex = cfg
+			break
 		}
 	}
-	if newCount != 1 {
-		t.Fatalf("期望新增渠道1条，实际: %d", newCount)
+	if newCodex == nil {
+		t.Fatal("未找到新增 OAuth 渠道")
+	}
+	if newCodex.ID == IDOwner.ID || newCodex.ID == nameMatch.ID {
+		t.Fatalf("新渠道不应复用 CSV 中的跨库 ID: %d", newCodex.ID)
+	}
+	if newCodex.GetAuthType() != model.AuthTypeCodexOAuth {
+		t.Fatalf("新渠道认证类型错误: %s", newCodex.GetAuthType())
+	}
+	newCodexKeys, err := server.store.GetAPIKeys(ctx, newCodex.ID)
+	if err != nil || len(newCodexKeys) != 0 {
+		t.Fatalf("OAuth 渠道不应导入 API key: keys=%+v err=%v", newCodexKeys, err)
 	}
 }
 
@@ -345,14 +683,19 @@ func TestAdminAPI_ImportChannelsCSV_MissingScheduledCheckColumnPreservesExisting
 	ctx := context.Background()
 
 	created, err := server.store.CreateConfig(ctx, &model.Config{
-		Name:                  "Import-Preserve-Scheduled",
-		URL:                   "https://old.example.com",
-		Priority:              10,
-		ModelEntries:          []model.ModelEntry{{Model: "old-model", RedirectModel: ""}},
-		ChannelType:           "openai",
-		Enabled:               true,
-		ScheduledCheckEnabled: true,
-		ScheduledCheckModel:   "old-model",
+		Name:                    "Import-Preserve-Scheduled",
+		URLs:                    model.ChannelURLs{{URL: "https://old.example.com"}},
+		Priority:                10,
+		Websockets:              true,
+		ModelEntries:            []model.ModelEntry{{Model: "old-model", RedirectModel: ""}},
+		Enabled:                 true,
+		RetryOtherKeysOnFailure: true,
+		ScheduledCheckEnabled:   true,
+		ScheduledCheckModel:     "old-model",
+		CooldownDetectionRules: &model.CooldownDetectionRules{Rules: []model.CooldownDetectionRule{{
+			Enabled: true, Name: "preserved-rule", Priority: 0, StatusCodes: []int{429},
+			Scope: model.CooldownScopeKey, Mode: model.CooldownModeFixed, CooldownSeconds: 90,
+		}}},
 	})
 	if err != nil {
 		t.Fatalf("创建现有渠道失败: %v", err)
@@ -366,8 +709,8 @@ func TestAdminAPI_ImportChannelsCSV_MissingScheduledCheckColumnPreservesExisting
 		t.Fatalf("创建现有 key 失败: %v", err)
 	}
 
-	csvContent := `name,url,priority,models,model_redirects,channel_type,enabled,api_key,key_strategy
-Import-Preserve-Scheduled,https://new.example.com,20,"old-model,new-model",{},openai,true,sk-new-key,sequential
+	csvContent := `name,urls,priority,models,model_redirects,enabled,api_key,key_strategy
+Import-Preserve-Scheduled,"[{""url"":""https://new.example.com""}]",20,"old-model,new-model",{},true,sk-new-key,sequential
 `
 
 	body := &bytes.Buffer{}
@@ -409,8 +752,17 @@ Import-Preserve-Scheduled,https://new.example.com,20,"old-model,new-model",{},op
 	if updated.ScheduledCheckModel != "old-model" {
 		t.Fatalf("缺少 scheduled_check_model 列时应保留旧值 old-model，实际为 %q", updated.ScheduledCheckModel)
 	}
-	if updated.URL != "https://new.example.com" {
-		t.Fatalf("期望 URL 已更新，实际为 %s", updated.URL)
+	if updated.CooldownDetectionRules == nil || len(updated.CooldownDetectionRules.Rules) != 1 || updated.CooldownDetectionRules.Rules[0].Name != "preserved-rule" {
+		t.Fatalf("缺少 cooldown_detection_rules 列时应保留旧规则，实际为 %#v", updated.CooldownDetectionRules)
+	}
+	if !updated.RetryOtherKeysOnFailure {
+		t.Fatal("缺少 retry_other_keys_on_failure 列时应保留旧值 true")
+	}
+	if !updated.Websockets {
+		t.Fatal("缺少 websockets 列时应保留旧值 true")
+	}
+	if urls := updated.GetURLs(); len(urls) != 1 || urls[0] != "https://new.example.com" {
+		t.Fatalf("期望 URL 已更新，实际为 %v", urls)
 	}
 	if len(updated.ModelEntries) != 2 || updated.ModelEntries[0].Model != "old-model" || updated.ModelEntries[1].Model != "new-model" {
 		t.Fatalf("期望模型已更新，实际为 %+v", updated.ModelEntries)
@@ -430,10 +782,9 @@ func TestAdminAPI_ImportChannelsCSV_MissingScheduledCheckColumnClearsInvalidLega
 
 	created, err := server.store.CreateConfig(ctx, &model.Config{
 		Name:                  "Import-Clear-Scheduled",
-		URL:                   "https://old.example.com",
+		URLs:                  model.ChannelURLs{{URL: "https://old.example.com"}},
 		Priority:              10,
 		ModelEntries:          []model.ModelEntry{{Model: "old-model", RedirectModel: ""}},
-		ChannelType:           "openai",
 		Enabled:               true,
 		ScheduledCheckEnabled: true,
 		ScheduledCheckModel:   "old-model",
@@ -450,8 +801,8 @@ func TestAdminAPI_ImportChannelsCSV_MissingScheduledCheckColumnClearsInvalidLega
 		t.Fatalf("创建现有 key 失败: %v", err)
 	}
 
-	csvContent := `name,url,priority,models,model_redirects,channel_type,enabled,api_key,key_strategy
-Import-Clear-Scheduled,https://new.example.com,20,new-model,{},openai,true,sk-new-key,sequential
+	csvContent := `name,urls,priority,models,model_redirects,enabled,api_key,key_strategy
+Import-Clear-Scheduled,"[{""url"":""https://new.example.com""}]",20,new-model,{},true,sk-new-key,sequential
 `
 
 	body := &bytes.Buffer{}
@@ -495,9 +846,9 @@ Import-Clear-Scheduled,https://new.example.com,20,new-model,{},openai,true,sk-ne
 func TestAdminAPI_ImportChannelsCSV_InvalidURLRejected(t *testing.T) {
 	server := newInMemoryServer(t)
 
-	csvContent := `name,url,priority,models,model_redirects,channel_type,enabled,api_key,key_strategy
-Bad-URL,https://bad.example.com/v1,10,test-model,{},anthropic,true,sk-import-key-1,sequential
-Good-URL,https://good.example.com,10,test-model,{},anthropic,true,sk-import-key-2,sequential
+	csvContent := `name,urls,priority,models,model_redirects,enabled,api_key,key_strategy
+Bad-URL,"[{""url"":""https://bad.example.com/v1""}]",10,test-model,{},true,sk-import-key-1,sequential
+Good-URL,"[{""url"":""https://good.example.com""}]",10,test-model,{},true,sk-import-key-2,sequential
 `
 
 	body := &bytes.Buffer{}
@@ -564,8 +915,8 @@ Good-URL,https://good.example.com,10,test-model,{},anthropic,true,sk-import-key-
 func TestAdminAPI_ImportChannelsCSV_InvalidScheduledCheckModelRejected(t *testing.T) {
 	server := newInMemoryServer(t)
 
-	csvContent := `name,url,priority,models,model_redirects,channel_type,enabled,api_key,key_strategy,scheduled_check_model
-Bad-Scheduled-Model,https://bad.example.com,10,test-model,{},anthropic,true,sk-import-key-1,sequential,missing-model
+	csvContent := `name,urls,priority,models,model_redirects,enabled,api_key,key_strategy,scheduled_check_model
+Bad-Scheduled-Model,"[{""url"":""https://bad.example.com""}]",10,test-model,{},true,sk-import-key-1,sequential,missing-model
 `
 
 	body := &bytes.Buffer{}
@@ -601,12 +952,12 @@ Bad-Scheduled-Model,https://bad.example.com,10,test-model,{},anthropic,true,sk-i
 	}
 }
 
-func TestAdminAPI_ImportChannelsCSV_InvalidProtocolTransformsRejected(t *testing.T) {
+func TestAdminAPI_ImportChannelsCSV_RemovedProtocolColumnsAreIgnored(t *testing.T) {
 	server := newInMemoryServer(t)
 
-	csvContent := `name,url,priority,models,model_redirects,channel_type,protocol_transforms,enabled,api_key,key_strategy
-Bad-Transforms,https://bad.example.com,10,test-model,{},anthropic,"openai,gemini,openai",true,sk-import-key-1,sequential
-Good-Transforms,https://good.example.com,10,test-model,{},anthropic,openai,true,sk-import-key-2,sequential
+	csvContent := `name,urls,priority,models,model_redirects,protocol_transforms,enabled,api_key,key_strategy
+Bad-Transforms,"[{""url"":""https://bad.example.com""}]",10,test-model,{},"openai,gemini,openai",true,sk-import-key-1,sequential
+Good-Transforms,"[{""url"":""https://good.example.com""}]",10,test-model,{},openai,true,sk-import-key-2,sequential
 `
 
 	body := &bytes.Buffer{}
@@ -634,11 +985,8 @@ Good-Transforms,https://good.example.com,10,test-model,{},anthropic,openai,true,
 
 	var summary ChannelImportSummary
 	mustUnmarshalAPIResponseData(t, w.Body.Bytes(), &summary)
-	if summary.Skipped != 1 || len(summary.Errors) == 0 {
-		t.Fatalf("期望非法 protocol_transforms 行被跳过并返回错误，实际 summary=%+v", summary)
-	}
-	if !strings.Contains(summary.Errors[0], "protocol_transforms") {
-		t.Fatalf("期望错误包含 protocol_transforms，实际: %v", summary.Errors)
+	if summary.Created != 2 || summary.Skipped != 0 {
+		t.Fatalf("removed protocol columns should be ignored, summary=%+v", summary)
 	}
 
 	ctx := context.Background()
@@ -656,11 +1004,8 @@ Good-Transforms,https://good.example.com,10,test-model,{},anthropic,openai,true,
 			hasGood = true
 		}
 	}
-	if hasBad {
-		t.Fatalf("Bad-Transforms 不应被导入")
-	}
-	if !hasGood {
-		t.Fatalf("Good-Transforms 应被导入")
+	if !hasBad || !hasGood {
+		t.Fatalf("both rows should be imported when obsolete columns are ignored: bad=%v good=%v", hasBad, hasGood)
 	}
 }
 
@@ -670,10 +1015,9 @@ func TestAdminAPI_ImportChannelsCSV_PrunesURLSelectorStateForUpdatedChannel(t *t
 
 	targetCfg, err := server.store.CreateConfig(ctx, &model.Config{
 		Name:         "Import-Prune-Target",
-		URL:          "https://old-import.example.com\nhttps://keep-import.example.com",
+		URLs:         channelURLsForTest("https://old-import.example.com", "https://keep-import.example.com"),
 		Priority:     10,
 		ModelEntries: []model.ModelEntry{{Model: "m1", RedirectModel: ""}},
-		ChannelType:  "anthropic",
 		Enabled:      true,
 	})
 	if err != nil {
@@ -690,10 +1034,9 @@ func TestAdminAPI_ImportChannelsCSV_PrunesURLSelectorStateForUpdatedChannel(t *t
 
 	otherCfg, err := server.store.CreateConfig(ctx, &model.Config{
 		Name:         "Import-Prune-Other",
-		URL:          "https://other-import.example.com",
+		URLs:         model.ChannelURLs{{URL: "https://other-import.example.com"}},
 		Priority:     10,
 		ModelEntries: []model.ModelEntry{{Model: "m1", RedirectModel: ""}},
-		ChannelType:  "anthropic",
 		Enabled:      true,
 	})
 	if err != nil {
@@ -705,8 +1048,8 @@ func TestAdminAPI_ImportChannelsCSV_PrunesURLSelectorStateForUpdatedChannel(t *t
 	server.urlSelector.CooldownURL(targetCfg.ID, "https://old-import.example.com")
 	server.urlSelector.RecordLatency(otherCfg.ID, "https://other-import.example.com", 30*time.Millisecond)
 
-	csvContent := `name,url,priority,models,model_redirects,channel_type,enabled,api_key,key_strategy
-Import-Prune-Target,https://keep-import.example.com,10,m1,{},anthropic,true,sk-target-import,sequential
+	csvContent := `name,urls,priority,models,model_redirects,enabled,api_key,key_strategy
+Import-Prune-Target,"[{""url"":""https://keep-import.example.com""}]",10,m1,{},true,sk-target-import,sequential
 `
 
 	body := &bytes.Buffer{}
@@ -758,10 +1101,9 @@ func TestAdminAPI_ImportChannelsCSV_CleansOrphanedURLDisabledStateForNameUpdate(
 
 	targetCfg, err := server.store.CreateConfig(ctx, &model.Config{
 		Name:         "Import-URL-State",
-		URL:          "https://old-import-state.example.com\nhttps://keep-import-state.example.com",
+		URLs:         channelURLsForTest("https://old-import-state.example.com", "https://keep-import-state.example.com"),
 		Priority:     10,
 		ModelEntries: []model.ModelEntry{{Model: "m1", RedirectModel: ""}},
-		ChannelType:  "anthropic",
 		Enabled:      true,
 	})
 	if err != nil {
@@ -778,10 +1120,9 @@ func TestAdminAPI_ImportChannelsCSV_CleansOrphanedURLDisabledStateForNameUpdate(
 
 	otherCfg, err := server.store.CreateConfig(ctx, &model.Config{
 		Name:         "Import-URL-State-Other",
-		URL:          "https://other-import-state.example.com",
+		URLs:         model.ChannelURLs{{URL: "https://other-import-state.example.com"}},
 		Priority:     10,
 		ModelEntries: []model.ModelEntry{{Model: "m1", RedirectModel: ""}},
-		ChannelType:  "anthropic",
 		Enabled:      true,
 	})
 	if err != nil {
@@ -798,8 +1139,8 @@ func TestAdminAPI_ImportChannelsCSV_CleansOrphanedURLDisabledStateForNameUpdate(
 		t.Fatalf("禁用其他渠道 URL 失败: %v", err)
 	}
 
-	csvContent := `name,url,priority,models,model_redirects,channel_type,enabled,api_key,key_strategy
-Import-URL-State,https://keep-import-state.example.com,10,m1,{},anthropic,true,sk-import-state,sequential
+	csvContent := `name,urls,priority,models,model_redirects,enabled,api_key,key_strategy
+Import-URL-State,"[{""url"":""https://keep-import-state.example.com""}]",10,m1,{},true,sk-import-state,sequential
 `
 
 	body := &bytes.Buffer{}
@@ -855,16 +1196,20 @@ func TestAdminAPI_ExportImportRoundTrip(t *testing.T) {
 
 	// 步骤1：创建原始测试数据
 	originalConfig := &model.Config{
-		Name:     "RoundTrip-Test",
-		URL:      "https://roundtrip.example.com",
-		Priority: 15,
+		Name:       "RoundTrip-Test",
+		URLs:       model.ChannelURLs{{URL: "https://roundtrip.example.com"}},
+		Priority:   15,
+		Websockets: true,
 		ModelEntries: []model.ModelEntry{
 			{Model: "model-a", RedirectModel: ""},
 			{Model: "model-b", RedirectModel: ""},
 			{Model: "old-model", RedirectModel: "new-model"},
 		},
-		ChannelType: "anthropic",
-		Enabled:     true,
+		Enabled: true,
+		CooldownDetectionRules: &model.CooldownDetectionRules{Rules: []model.CooldownDetectionRule{{
+			Enabled: true, Name: "Round-trip cooldown", Priority: 0, StatusCodes: []int{429},
+			Scope: model.CooldownScopeKey, Mode: model.CooldownModeFixed, CooldownSeconds: 90,
+		}}},
 	}
 
 	created, err := server.store.CreateConfig(ctx, originalConfig)
@@ -950,16 +1295,26 @@ func TestAdminAPI_ExportImportRoundTrip(t *testing.T) {
 	}
 
 	// 验证字段完整性
-	if restoredConfig.URL != originalConfig.URL {
-		t.Errorf("URL不匹配: 期望 %s, 实际 %s", originalConfig.URL, restoredConfig.URL)
+	if restoredConfig.GetURLs()[0] != originalConfig.GetURLs()[0] {
+		t.Errorf("URL不匹配: 期望 %v, 实际 %v", originalConfig.GetURLs(), restoredConfig.GetURLs())
 	}
 
 	if restoredConfig.Priority != originalConfig.Priority {
 		t.Errorf("Priority不匹配: 期望 %d, 实际 %d", originalConfig.Priority, restoredConfig.Priority)
 	}
+	if restoredConfig.Websockets != originalConfig.Websockets {
+		t.Errorf("Websockets不匹配: 期望 %t, 实际 %t", originalConfig.Websockets, restoredConfig.Websockets)
+	}
 
 	if len(restoredConfig.ModelEntries) != len(originalConfig.ModelEntries) {
 		t.Errorf("ModelEntries数量不匹配: 期望 %d, 实际 %d", len(originalConfig.ModelEntries), len(restoredConfig.ModelEntries))
+	}
+	if restoredConfig.CooldownDetectionRules == nil || len(restoredConfig.CooldownDetectionRules.Rules) != 1 {
+		t.Fatalf("冷却探测规则未恢复: %#v", restoredConfig.CooldownDetectionRules)
+	}
+	restoredRule := restoredConfig.CooldownDetectionRules.Rules[0]
+	if restoredRule.Name != "Round-trip cooldown" || restoredRule.Scope != model.CooldownScopeKey || restoredRule.CooldownSeconds != 90 {
+		t.Fatalf("恢复的冷却探测规则不匹配: %#v", restoredRule)
 	}
 
 	// 验证API Keys
@@ -980,8 +1335,8 @@ func TestAdminAPI_ImportCSV_InvalidFormat(t *testing.T) {
 	server := newInMemoryServer(t)
 
 	// 缺少必要字段的CSV
-	invalidCSV := `name,url
-Test-Invalid,https://invalid.com
+	invalidCSV := `name,urls
+Test-Invalid,"[{""url"":""https://invalid.com""}]"
 `
 
 	body := &bytes.Buffer{}
@@ -1024,10 +1379,9 @@ func TestAdminAPI_ImportCSV_DuplicateNames(t *testing.T) {
 	// 先创建一个渠道
 	existing := &model.Config{
 		Name:         "Duplicate-Test",
-		URL:          "https://existing.com",
+		URLs:         model.ChannelURLs{{URL: "https://existing.com"}},
 		Priority:     10,
 		ModelEntries: []model.ModelEntry{{Model: "model-1", RedirectModel: ""}},
-		ChannelType:  "anthropic",
 		Enabled:      true,
 	}
 
@@ -1037,8 +1391,8 @@ func TestAdminAPI_ImportCSV_DuplicateNames(t *testing.T) {
 	}
 
 	// 尝试导入同名渠道 - [INFO] 修复：添加必需的api_key和key_strategy列
-	duplicateCSV := `name,url,priority,models,model_redirects,channel_type,enabled,api_key,key_strategy
-Duplicate-Test,https://duplicate.com,5,model-2,{},gemini,false,sk-duplicate-key,sequential
+	duplicateCSV := `name,urls,priority,models,model_redirects,enabled,api_key,key_strategy
+Duplicate-Test,"[{""url"":""https://duplicate.com""}]",5,model-2,{},false,sk-duplicate-key,sequential
 `
 
 	body := &bytes.Buffer{}

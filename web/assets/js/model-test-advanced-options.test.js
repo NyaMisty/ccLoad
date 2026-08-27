@@ -84,7 +84,7 @@ test('buildChatRequestPayload applies sampling options and limits recent message
   const payload = buildChatRequestPayload({
     model: 'gpt-test',
     stream: true,
-    thinking_effort: 'medium',
+    thinking_effort: 'max',
     builtin_search: false
   }, messages, {
     systemPrompt: 'answer tersely',
@@ -97,7 +97,7 @@ test('buildChatRequestPayload applies sampling options and limits recent message
   assert.deepEqual(payload, {
     model: 'gpt-test',
     stream: true,
-    thinking_effort: 'medium',
+    thinking_effort: 'max',
     builtin_search: false,
     messages: [
       { role: 'assistant', content: 'two' },
@@ -123,5 +123,24 @@ test('buildChatRequestPayload treats empty or zero context as unlimited', () => 
   assert.deepEqual(
     buildChatRequestPayload({ model: 'gpt-test' }, messages, {}).messages,
     messages
+  );
+});
+
+test('buildChatRequestPayload strips UI-only thinking field from messages', () => {
+  const messages = [
+    { role: 'user', content: 'why?' },
+    {
+      role: 'assistant',
+      content: 'because',
+      thinking: 'internal chain of thought that must not leave the browser'
+    }
+  ];
+
+  assert.deepEqual(
+    buildChatRequestPayload({ model: 'gpt-test' }, messages, {}).messages,
+    [
+      { role: 'user', content: 'why?' },
+      { role: 'assistant', content: 'because' }
+    ]
   );
 });

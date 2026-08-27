@@ -4,11 +4,13 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"runtime"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -23,10 +25,44 @@ import (
 	"golang.org/x/crypto/bcrypt"
 )
 
+const antigravitySandboxDailyBaseURLForTest = "https://daily-cloudcode-pa.sandbox.googleapis.com"
+
+func channelURLsForTest(rawValues ...string) model.ChannelURLs {
+	urls := make(model.ChannelURLs, 0, len(rawValues))
+	for _, raw := range rawValues {
+		for line := range strings.SplitSeq(raw, "\n") {
+			line = strings.TrimSpace(line)
+			if line == "" {
+				continue
+			}
+			urls = append(urls, model.ChannelURL{
+				URL:   model.StripExactUpstreamURLMarker(line),
+				Exact: model.HasExactUpstreamURLMarker(line),
+			})
+		}
+	}
+	return urls
+}
+
 type roundTripperFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripperFunc) RoundTrip(req *http.Request) (*http.Response, error) {
 	return f(req)
+}
+
+func automaticFallbackToPath(wantPath string, next http.RoundTripper) http.RoundTripper {
+	return roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+		if req.URL.Path == wantPath {
+			return next.RoundTrip(req)
+		}
+		body := fmt.Sprintf(`{"error":{"message":"Invalid URL (%s %s)"}}`, req.Method, req.URL.Path)
+		return &http.Response{
+			StatusCode: http.StatusNotFound,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body:       io.NopCloser(strings.NewReader(body)),
+			Request:    req,
+		}, nil
+	})
 }
 
 type testHTTPServer struct {
@@ -46,6 +82,46 @@ type testHTTPResponseWriter struct {
 	ready          chan struct{}
 	readyOnce      sync.Once
 	mu             sync.Mutex
+}
+
+type dataThenBlockReadCloser struct {
+	closeOnce sync.Once
+	data      []byte
+	offset    int
+	maxChunk  int
+	closed    chan struct{}
+}
+
+func newDataThenBlockReadCloser(data []byte, maxChunk int) *dataThenBlockReadCloser {
+	return &dataThenBlockReadCloser{
+		data:     data,
+		maxChunk: maxChunk,
+		closed:   make(chan struct{}),
+	}
+}
+
+func (r *dataThenBlockReadCloser) Read(p []byte) (int, error) {
+	if r.offset < len(r.data) {
+		n := len(r.data) - r.offset
+		if r.maxChunk > 0 && n > r.maxChunk {
+			n = r.maxChunk
+		}
+		if n > len(p) {
+			n = len(p)
+		}
+		copy(p, r.data[r.offset:r.offset+n])
+		r.offset += n
+		return n, nil
+	}
+	<-r.closed
+	return 0, errors.New("read closed")
+}
+
+func (r *dataThenBlockReadCloser) Close() error {
+	r.closeOnce.Do(func() {
+		close(r.closed)
+	})
+	return nil
 }
 
 var (
@@ -259,6 +335,15 @@ func newTestContext(t testing.TB, req *http.Request) (*gin.Context, *httptest.Re
 	return testutil.NewTestContext(t, req)
 }
 
+// setMaxBodyBytesForTest 收紧单个 Server 及其尚未创建的 Responses 会话上限。
+func setMaxBodyBytesForTest(t testing.TB, srv *Server, limit int) {
+	t.Helper()
+	srv.bodyLimits = newRequestBodyLimits(limit, limit)
+	if srv.responsesExecutionSessions != nil {
+		srv.responsesExecutionSessions.maxBodyBytes = int64(limit)
+	}
+}
+
 func newRecorder() *httptest.ResponseRecorder {
 	return testutil.NewRecorder()
 }
@@ -312,15 +397,29 @@ func serveHTTP(t testing.TB, h http.Handler, req *http.Request) *httptest.Respon
 }
 
 func newInMemoryServer(t testing.TB) *Server {
+	return newInMemoryServerWithSettings(t, nil)
+}
+
+func newInMemoryServerWithSettings(t testing.TB, settings map[string]string) *Server {
 	t.Helper()
 
 	store, err := storage.CreateSQLiteStore(":memory:")
 	if err != nil {
 		t.Fatalf("CreateSQLiteStore failed: %v", err)
 	}
+	if len(settings) > 0 {
+		if err = store.BatchUpdateSettings(context.Background(), settings); err != nil {
+			_ = store.Close()
+			t.Fatalf("BatchUpdateSettings failed: %v", err)
+		}
+	}
 
 	srv := NewServer(store)
-	srv.client = newTestHTTPClient()
+	closeUpstreamHTTPClient(srv.client)
+	closeUpstreamHTTPClient(srv.antigravityClient)
+	testClient := newTestHTTPClient()
+	srv.client = testClient
+	srv.antigravityClient = testClient
 	t.Cleanup(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 		defer cancel()
@@ -380,16 +479,26 @@ func newTestAuthService(t testing.TB) *AuthService {
 		authTokens:          make(map[string]int64),
 		authTokenIDs:        make(map[string]int64),
 		authTokenModels:     make(map[string][]string),
-		authTokenChannels:   make(map[string][]int64),
+		authTokenChannels:   make(map[string]model.ChannelRestriction),
 		authTokenCostLimits: make(map[string]tokenCostLimit),
 		authTokenMaxConns:   make(map[string]int),
 		authTokenActiveReqs: make(map[string]int),
-		validTokens:         make(map[string]time.Time),
+		authTokenHashes:     make(map[int64]string),
+		validTokens:         make(map[string]model.WebSession),
 		lastUsedCh:          make(chan string, 256),
 		done:                make(chan struct{}),
 	}
 	t.Cleanup(s.Close) // 幂等关闭（closeOnce 保护）
 	return s
+}
+
+func mustChannelRestriction(t testing.TB, mode string, channelIDs ...int64) model.ChannelRestriction {
+	t.Helper()
+	restriction, err := model.NewChannelRestriction(mode, channelIDs)
+	if err != nil {
+		t.Fatalf("NewChannelRestriction failed: %v", err)
+	}
+	return restriction
 }
 
 // injectAPIToken 注入测试 API token 到 AuthService 的内存映射
@@ -398,6 +507,7 @@ func injectAPIToken(svc *AuthService, token string, expiresAt int64, tokenID int
 	svc.authTokensMux.Lock()
 	svc.authTokens[tokenHash] = expiresAt
 	svc.authTokenIDs[tokenHash] = tokenID
+	svc.authTokenHashes[tokenID] = tokenHash
 	svc.authTokensMux.Unlock()
 }
 
@@ -405,7 +515,7 @@ func injectAPIToken(svc *AuthService, token string, expiresAt int64, tokenID int
 func injectAdminToken(svc *AuthService, token string, expiry time.Time) {
 	tokenHash := model.HashToken(token)
 	svc.tokensMux.Lock()
-	svc.validTokens[tokenHash] = expiry
+	svc.validTokens[tokenHash] = model.WebSession{TokenHash: tokenHash, Role: model.WebRoleAdmin, ExpiresAt: expiry}
 	svc.tokensMux.Unlock()
 }
 

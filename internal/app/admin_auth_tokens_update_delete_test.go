@@ -72,6 +72,16 @@ func TestHandleUpdateAuthToken(t *testing.T) {
 		}
 	})
 
+	t.Run("invalid channel restriction mode", func(t *testing.T) {
+		c, w := newTestContext(t, newJSONRequestBytes(http.MethodPut, "/admin/auth-tokens/1", []byte(`{"channel_restriction_mode":"denyy"}`)))
+		c.Params = gin.Params{{Key: "id", Value: "1"}}
+
+		server.HandleUpdateAuthToken(c)
+		if w.Code != http.StatusBadRequest {
+			t.Fatalf("status=%d, want %d, body=%s", w.Code, http.StatusBadRequest, w.Body.String())
+		}
+	})
+
 	t.Run("not found", func(t *testing.T) {
 		c, w := newTestContext(t, newJSONRequestBytes(http.MethodPut, "/admin/auth-tokens/999", []byte(`{"allowed_models":[]}`)))
 		c.Params = gin.Params{{Key: "id", Value: "999"}}
@@ -92,16 +102,66 @@ func TestHandleUpdateAuthToken(t *testing.T) {
 		}
 	})
 
+	t.Run("negative daily cost limit", func(t *testing.T) {
+		c, w := newTestContext(t, newJSONRequestBytes(http.MethodPut, "/admin/auth-tokens/1", []byte(`{"cost_daily_limit_usd":-1}`)))
+		c.Params = gin.Params{{Key: "id", Value: "1"}}
+
+		server.HandleUpdateAuthToken(c)
+		if w.Code != http.StatusBadRequest {
+			t.Fatalf("status=%d, want %d", w.Code, http.StatusBadRequest)
+		}
+	})
+
+	t.Run("daily cost limit requires max concurrency", func(t *testing.T) {
+		c, w := newTestContext(t, newJSONRequestBytes(http.MethodPut, "/admin/auth-tokens/1", []byte(`{"cost_daily_limit_usd":1.5}`)))
+		c.Params = gin.Params{{Key: "id", Value: "1"}}
+
+		server.HandleUpdateAuthToken(c)
+		if w.Code != http.StatusBadRequest {
+			t.Fatalf("status=%d, want %d, body=%s", w.Code, http.StatusBadRequest, w.Body.String())
+		}
+	})
+
+	t.Run("deny mode persists and reloads", func(t *testing.T) {
+		body := map[string]any{
+			"allowed_channel_ids":      []int64{11, 22},
+			"channel_restriction_mode": model.ChannelRestrictionModeDeny,
+		}
+		c, w := newTestContext(t, newJSONRequest(t, http.MethodPut, "/admin/auth-tokens/1", body))
+		c.Params = gin.Params{{Key: "id", Value: strconv.FormatInt(token.ID, 10)}}
+
+		server.HandleUpdateAuthToken(c)
+		if w.Code != http.StatusOK {
+			t.Fatalf("status=%d, want %d, body=%s", w.Code, http.StatusOK, w.Body.String())
+		}
+
+		updated, err := store.GetAuthToken(ctx, token.ID)
+		if err != nil {
+			t.Fatalf("GetAuthToken failed: %v", err)
+		}
+		if updated.ChannelRestrictionMode != model.ChannelRestrictionModeDeny {
+			t.Fatalf("ChannelRestrictionMode=%q, want deny", updated.ChannelRestrictionMode)
+		}
+		if server.authService.IsChannelAllowed(token.Token, 11) {
+			t.Fatal("deny-listed channel should be rejected after ReloadAuthTokens")
+		}
+		if !server.authService.IsChannelAllowed(token.Token, 33) {
+			t.Fatal("channel outside deny list should be allowed after ReloadAuthTokens")
+		}
+	})
+
 	t.Run("success", func(t *testing.T) {
 		body := map[string]any{
-			"description":         "new-desc",
-			"is_active":           false,
-			"expires_at":          expiresAt,
-			"allowed_models":      []string{"m1", "m2"},
-			"allowed_channel_ids": []int64{11, 22},
-			"cost_limit_usd":      1.5,
-			"max_concurrency":     3,
-			"unknown_ignored":     "x",
+			"description":            "new-desc",
+			"is_active":              false,
+			"expires_at":             expiresAt,
+			"allowed_models":         []string{"m1", "m2"},
+			"allowed_channel_ids":    []int64{11, 22},
+			"cost_limit_usd":         1.5,
+			"cost_daily_limit_usd":   0.4,
+			"cost_monthly_limit_usd": 9,
+			"max_concurrency":        3,
+			"unknown_ignored":        "x",
 		}
 		c, w := newTestContext(t, newJSONRequest(t, http.MethodPut, "/admin/auth-tokens/1", body))
 		c.Params = gin.Params{{Key: "id", Value: "1"}}
@@ -112,13 +172,15 @@ func TestHandleUpdateAuthToken(t *testing.T) {
 		}
 
 		type respData struct {
-			Description       string  `json:"description"`
-			IsActive          bool    `json:"is_active"`
-			Token             string  `json:"token"`
-			ExpiresAt         *int64  `json:"expires_at,omitempty"`
-			CostLimitUSD      float64 `json:"cost_limit_usd"`
-			AllowedChannelIDs []int64 `json:"allowed_channel_ids"`
-			MaxConcurrency    int     `json:"max_concurrency"`
+			Description         string  `json:"description"`
+			IsActive            bool    `json:"is_active"`
+			Token               string  `json:"token"`
+			ExpiresAt           *int64  `json:"expires_at,omitempty"`
+			CostLimitUSD        float64 `json:"cost_limit_usd"`
+			CostDailyLimitUSD   float64 `json:"cost_daily_limit_usd"`
+			CostMonthlyLimitUSD float64 `json:"cost_monthly_limit_usd"`
+			AllowedChannelIDs   []int64 `json:"allowed_channel_ids"`
+			MaxConcurrency      int     `json:"max_concurrency"`
 		}
 		resp := mustParseAPIResponse[respData](t, w.Body.Bytes())
 		if !resp.Success {
@@ -139,6 +201,12 @@ func TestHandleUpdateAuthToken(t *testing.T) {
 		if resp.Data.CostLimitUSD < 1.49 || resp.Data.CostLimitUSD > 1.51 {
 			t.Fatalf("cost_limit_usd=%v, want ~1.5", resp.Data.CostLimitUSD)
 		}
+		if resp.Data.CostDailyLimitUSD < 0.39 || resp.Data.CostDailyLimitUSD > 0.41 {
+			t.Fatalf("cost_daily_limit_usd=%v, want ~0.4", resp.Data.CostDailyLimitUSD)
+		}
+		if resp.Data.CostMonthlyLimitUSD < 8.99 || resp.Data.CostMonthlyLimitUSD > 9.01 {
+			t.Fatalf("cost_monthly_limit_usd=%v, want ~9", resp.Data.CostMonthlyLimitUSD)
+		}
 		if len(resp.Data.AllowedChannelIDs) != 2 || resp.Data.AllowedChannelIDs[0] != 11 || resp.Data.AllowedChannelIDs[1] != 22 {
 			t.Fatalf("allowed_channel_ids=%v, want [11 22]", resp.Data.AllowedChannelIDs)
 		}
@@ -158,6 +226,12 @@ func TestHandleUpdateAuthToken(t *testing.T) {
 		}
 		if updated.CostLimitMicroUSD != 1_500_000 {
 			t.Fatalf("CostLimitMicroUSD=%d, want %d", updated.CostLimitMicroUSD, 1_500_000)
+		}
+		if updated.CostDailyLimitMicroUSD != 400_000 {
+			t.Fatalf("CostDailyLimitMicroUSD=%d, want %d", updated.CostDailyLimitMicroUSD, 400_000)
+		}
+		if updated.CostMonthlyLimitMicroUSD != 9_000_000 {
+			t.Fatalf("CostMonthlyLimitMicroUSD=%d, want %d", updated.CostMonthlyLimitMicroUSD, 9_000_000)
 		}
 		if len(updated.AllowedModels) != 2 {
 			t.Fatalf("AllowedModels=%v, want 2 items", updated.AllowedModels)
@@ -310,5 +384,63 @@ func TestHandleDeleteAuthToken(t *testing.T) {
 
 	if _, err := store.GetAuthToken(ctx, token.ID); err == nil {
 		t.Fatalf("expected token deleted from DB")
+	}
+}
+
+func TestHandleDeleteAuthToken_ReloadFailureFailsClosed(t *testing.T) {
+	server, store, cleanup := setupAdminTestServer(t)
+	defer cleanup()
+
+	plainToken := "deleted-while-primary-read-fails"
+	token := &model.AuthToken{
+		Token: model.HashToken(plainToken), Description: "fail closed", IsActive: true,
+	}
+	if err := store.CreateAuthToken(context.Background(), token); err != nil {
+		t.Fatalf("CreateAuthToken: %v", err)
+	}
+
+	svc := newTestAuthService(t)
+	injectAPIToken(svc, plainToken, 0, token.ID)
+	sessionToken := "web-session-for-deleted-token"
+	sessionHash := model.HashToken(sessionToken)
+	svc.tokensMux.Lock()
+	svc.validTokens[sessionHash] = model.WebSession{
+		TokenHash: sessionHash, Role: model.WebRoleAPIToken, AuthTokenID: token.ID,
+		ExpiresAt: time.Now().Add(time.Hour),
+	}
+	svc.tokensMux.Unlock()
+	failingStore := &failingAuthReloadStore{Store: store}
+	svc.store = failingStore
+	svc.authTokensReloadAt.Store(time.Now().UnixMilli())
+	server.authService = svc
+
+	c, w := newTestContext(t, newRequest(http.MethodDelete, "/admin/auth-tokens/1", nil))
+	c.Params = gin.Params{{Key: "id", Value: strconv.FormatInt(token.ID, 10)}}
+	server.HandleDeleteAuthToken(c)
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("delete status=%d, want 503: %s", w.Code, w.Body.String())
+	}
+	if _, err := store.GetAuthToken(context.Background(), token.ID); err == nil {
+		t.Fatal("token must remain deleted in the authoritative database")
+	}
+
+	apiReq := newRequest(http.MethodGet, "/test", nil)
+	apiReq.Header.Set("Authorization", "Bearer "+plainToken)
+	if got := runMiddleware(t, svc.RequireAPIAuth(), apiReq); got.Code != http.StatusServiceUnavailable {
+		t.Fatalf("API auth status=%d, want 503: %s", got.Code, got.Body.String())
+	}
+	webReq := newRequest(http.MethodGet, "/test", nil)
+	webReq.Header.Set("Authorization", "Bearer "+sessionToken)
+	if got := runMiddleware(t, svc.RequireWebAuth(), webReq); got.Code != http.StatusServiceUnavailable {
+		t.Fatalf("Web auth status=%d, want 503: %s", got.Code, got.Body.String())
+	}
+	if calls := failingStore.calls.Load(); calls != 1 {
+		t.Fatalf("reload calls=%d, want one attempt during retry backoff", calls)
+	}
+	svc.tokensMux.RLock()
+	_, sessionExists := svc.validTokens[sessionHash]
+	svc.tokensMux.RUnlock()
+	if !sessionExists {
+		t.Fatal("temporary reload failure must not delete the Web session")
 	}
 }

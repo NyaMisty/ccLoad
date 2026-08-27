@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"encoding/json"
+	"math"
 	"net/http"
 	"slices"
 	"sort"
@@ -30,9 +31,10 @@ func setupAdminTestServer(t *testing.T) (*Server, storage.Store, func()) {
 
 	statsCache := NewStatsCache(store)
 	server := &Server{
-		store:      store,
-		statsCache: statsCache,
-		client:     newTestHTTPClient(),
+		store:             store,
+		statsCache:        statsCache,
+		client:            newTestHTTPClient(),
+		antigravityClient: newTestHTTPClient(),
 	}
 
 	cleanup := func() {
@@ -54,7 +56,7 @@ func TestHandleListChannels(t *testing.T) {
 	for i := 1; i <= 3; i++ {
 		cfg := &model.Config{
 			Name:     "Test-Channel-" + string(rune('A'-1+i)),
-			URL:      "https://api.example.com",
+			URLs:     model.ChannelURLs{{URL: "https://api.example.com"}},
 			Priority: i * 10,
 			ModelEntries: []model.ModelEntry{
 				{Model: "model-1", RedirectModel: ""},
@@ -101,6 +103,64 @@ func TestHandleListChannels(t *testing.T) {
 	}
 }
 
+func TestHandleListChannelsIncludesActiveModelCooldowns(t *testing.T) {
+	server, store, cleanup := setupAdminTestServer(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	created, err := store.CreateConfig(ctx, &model.Config{
+		Name:         "model-cooldown-list",
+		URLs:         model.ChannelURLs{{URL: "https://api.example.com"}},
+		Priority:     100,
+		ModelEntries: []model.ModelEntry{{Model: "external-model", RedirectModel: "upstream-model"}},
+		Enabled:      true,
+	})
+	if err != nil {
+		t.Fatalf("创建测试渠道失败: %v", err)
+	}
+
+	until := time.Now().Add(10 * time.Minute).Truncate(time.Second)
+	if err := store.SetModelCooldown(ctx, created.ID, "upstream-model", until); err != nil {
+		t.Fatalf("设置模型冷却失败: %v", err)
+	}
+
+	c, w := newTestContext(t, newRequest(http.MethodGet, "/admin/channels", nil))
+	server.handleListChannels(c)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status=%d, want %d body=%s", w.Code, http.StatusOK, w.Body.String())
+	}
+
+	var resp struct {
+		Success bool `json:"success"`
+		Data    []struct {
+			ID             int64               `json:"id"`
+			ModelCooldowns []ModelCooldownInfo `json:"model_cooldowns"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("解析响应失败: %v", err)
+	}
+	if !resp.Success || len(resp.Data) != 1 {
+		t.Fatalf("unexpected response: %s", w.Body.String())
+	}
+	if resp.Data[0].ID != created.ID {
+		t.Fatalf("id=%d, want %d", resp.Data[0].ID, created.ID)
+	}
+	if len(resp.Data[0].ModelCooldowns) != 1 {
+		t.Fatalf("model_cooldowns=%v, want one active cooldown", resp.Data[0].ModelCooldowns)
+	}
+	got := resp.Data[0].ModelCooldowns[0]
+	if got.Model != "upstream-model" {
+		t.Fatalf("model=%q, want upstream-model", got.Model)
+	}
+	if got.CooldownUntil == nil || !got.CooldownUntil.Equal(until) {
+		t.Fatalf("cooldown_until=%v, want %v", got.CooldownUntil, until)
+	}
+	if got.CooldownRemainingMS <= 0 {
+		t.Fatalf("cooldown_remaining_ms=%d, want > 0", got.CooldownRemainingMS)
+	}
+}
+
 func TestHandleListChannelsExactAndFuzzyFilters(t *testing.T) {
 	server, store, cleanup := setupAdminTestServer(t)
 	defer cleanup()
@@ -118,7 +178,7 @@ func TestHandleListChannelsExactAndFuzzyFilters(t *testing.T) {
 	for _, fixture := range fixtures {
 		_, err := store.CreateConfig(ctx, &model.Config{
 			Name:     fixture.name,
-			URL:      "https://api.example.com",
+			URLs:     model.ChannelURLs{{URL: "https://api.example.com"}},
 			Priority: 1,
 			ModelEntries: []model.ModelEntry{
 				{Model: fixture.model},
@@ -187,37 +247,23 @@ func TestHandleListChannelsExactAndFuzzyFilters(t *testing.T) {
 	}
 }
 
-func TestHandleListChannelsTypeFilterIncludesProtocolTransforms(t *testing.T) {
+func TestHandleListChannelsFiltersByAuthenticationType(t *testing.T) {
 	server, store, cleanup := setupAdminTestServer(t)
 	defer cleanup()
 
 	ctx := context.Background()
 	fixtures := []*model.Config{
 		{
-			Name:         "native-openai",
-			URL:          "https://openai.example.com",
-			Priority:     10,
-			ChannelType:  "openai",
-			ModelEntries: []model.ModelEntry{{Model: "native-model"}},
-			Enabled:      true,
+			Name: "api-auth", URLs: model.ChannelURLs{{URL: "https://api.example.com"}},
+			AuthType: model.AuthTypeAPIKey, Enabled: true,
 		},
 		{
-			Name:               "anthropic-openai-transform",
-			URL:                "https://anthropic.example.com",
-			Priority:           20,
-			ChannelType:        "anthropic",
-			ProtocolTransforms: []string{"openai"},
-			ModelEntries:       []model.ModelEntry{{Model: "bridge-model"}},
-			Enabled:            true,
+			Name: "codex-auth", URLs: model.ChannelURLs{{URL: "https://chatgpt.com/backend-api/codex/responses"}},
+			AuthType: model.AuthTypeCodexOAuth, OAuthCredential: `{}`, Enabled: true,
 		},
 		{
-			Name:               "codex-gemini-transform",
-			URL:                "https://codex.example.com",
-			Priority:           30,
-			ChannelType:        "codex",
-			ProtocolTransforms: []string{"gemini"},
-			ModelEntries:       []model.ModelEntry{{Model: "skip-model"}},
-			Enabled:            true,
+			Name: "antigravity-auth", URLs: model.ChannelURLs{{URL: "https://cloudcode-pa.googleapis.com"}},
+			AuthType: model.AuthTypeAntigravityOAuth, OAuthCredential: `{}`, Enabled: true,
 		},
 	}
 	for _, fixture := range fixtures {
@@ -226,7 +272,144 @@ func TestHandleListChannelsTypeFilterIncludesProtocolTransforms(t *testing.T) {
 		}
 	}
 
-	c, w := newTestContext(t, newRequest(http.MethodGet, "/admin/channels?type=openai&limit=20&offset=0", nil))
+	for _, tt := range []struct {
+		authType string
+		wantName string
+	}{
+		{authType: model.AuthTypeAPIKey, wantName: "api-auth"},
+		{authType: model.AuthTypeCodexOAuth, wantName: "codex-auth"},
+		{authType: model.AuthTypeAntigravityOAuth, wantName: "antigravity-auth"},
+	} {
+		t.Run(tt.authType, func(t *testing.T) {
+			path := "/admin/channels?auth_type=" + tt.authType + "&limit=20&offset=0"
+			c, w := newTestContext(t, newRequest(http.MethodGet, path, nil))
+			server.handleListChannels(c)
+
+			if w.Code != http.StatusOK {
+				t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
+			}
+			resp := mustParseAPIResponse[[]ChannelWithCooldown](t, w.Body.Bytes())
+			if resp.Count != 1 || len(resp.Data) != 1 || resp.Data[0].Name != tt.wantName {
+				t.Fatalf("response=%s, want only %q", w.Body.String(), tt.wantName)
+			}
+		})
+	}
+}
+
+func TestChannelCooldownFilterIncludesChannelKeyAndModelCooldowns(t *testing.T) {
+	server, store, cleanup := setupAdminTestServer(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	channelIDs := make(map[string]int64)
+	for _, fixture := range []struct {
+		name  string
+		model string
+	}{
+		{name: "channel-cooldown", model: "channel-model"},
+		{name: "key-cooldown", model: "key-model"},
+		{name: "model-cooldown", model: "model-target"},
+		{name: "healthy", model: "healthy-model"},
+	} {
+		created, err := store.CreateConfig(ctx, &model.Config{
+			Name:         fixture.name,
+			URLs:         model.ChannelURLs{{URL: "https://api.example.com"}},
+			Priority:     1,
+			ModelEntries: []model.ModelEntry{{Model: fixture.model}},
+			Enabled:      true,
+		})
+		if err != nil {
+			t.Fatalf("CreateConfig(%s) failed: %v", fixture.name, err)
+		}
+		channelIDs[fixture.name] = created.ID
+	}
+
+	if err := store.CreateAPIKeysBatch(ctx, []*model.APIKey{{
+		ChannelID:   channelIDs["key-cooldown"],
+		KeyIndex:    0,
+		APIKey:      "sk-key-cooldown",
+		KeyStrategy: model.KeyStrategySequential,
+	}}); err != nil {
+		t.Fatalf("CreateAPIKeysBatch failed: %v", err)
+	}
+
+	until := time.Now().Add(10 * time.Minute)
+	if err := store.SetChannelCooldown(ctx, channelIDs["channel-cooldown"], until); err != nil {
+		t.Fatalf("SetChannelCooldown failed: %v", err)
+	}
+	if err := store.SetKeyCooldown(ctx, channelIDs["key-cooldown"], 0, until); err != nil {
+		t.Fatalf("SetKeyCooldown failed: %v", err)
+	}
+	if err := store.SetModelCooldown(ctx, channelIDs["model-cooldown"], "model-target", until); err != nil {
+		t.Fatalf("SetModelCooldown failed: %v", err)
+	}
+
+	wantNames := []string{"channel-cooldown", "key-cooldown", "model-cooldown"}
+
+	c, w := newTestContext(t, newRequest(http.MethodGet, "/admin/channels?status=cooldown&limit=20&offset=0", nil))
+	server.handleListChannels(c)
+	if w.Code != http.StatusOK {
+		t.Fatalf("list status=%d, want %d body=%s", w.Code, http.StatusOK, w.Body.String())
+	}
+	resp := mustParseAPIResponse[[]ChannelWithCooldown](t, w.Body.Bytes())
+	gotNames := make([]string, 0, len(resp.Data))
+	for _, item := range resp.Data {
+		gotNames = append(gotNames, item.Name)
+	}
+	sort.Strings(gotNames)
+	if resp.Count != len(wantNames) || !slices.Equal(gotNames, wantNames) {
+		t.Fatalf("cooldown list count=%d names=%v, want count=%d names=%v", resp.Count, gotNames, len(wantNames), wantNames)
+	}
+
+	optionsContext, optionsWriter := newTestContext(t, newRequest(http.MethodGet, "/admin/channels/filter-options?status=cooldown", nil))
+	server.HandleChannelsFilterOptions(optionsContext)
+	if optionsWriter.Code != http.StatusOK {
+		t.Fatalf("filter options status=%d, want %d body=%s", optionsWriter.Code, http.StatusOK, optionsWriter.Body.String())
+	}
+	var options struct {
+		ChannelNames []string `json:"channel_names"`
+	}
+	mustUnmarshalAPIResponseData(t, optionsWriter.Body.Bytes(), &options)
+	if !slices.Equal(options.ChannelNames, wantNames) {
+		t.Fatalf("cooldown filter option names=%v, want %v", options.ChannelNames, wantNames)
+	}
+}
+
+func TestHandleListChannelsTypeFilterUsesUpstreamProtocolOnly(t *testing.T) {
+	server, store, cleanup := setupAdminTestServer(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	fixtures := []*model.Config{
+		{
+			Name:         "native-openai",
+			URLs:         model.ChannelURLs{{URL: "https://openai.example.com", Protocols: []string{"openai"}}},
+			Priority:     10,
+			ModelEntries: []model.ModelEntry{{Model: "native-model"}},
+			Enabled:      true,
+		},
+		{
+			Name:         "anthropic-channel",
+			URLs:         model.ChannelURLs{{URL: "https://anthropic.example.com", Protocols: []string{"anthropic", "openai"}}},
+			Priority:     20,
+			ModelEntries: []model.ModelEntry{{Model: "bridge-model"}},
+			Enabled:      true,
+		},
+		{
+			Name:         "codex-channel",
+			URLs:         model.ChannelURLs{{URL: "https://codex.example.com", Protocols: []string{"codex"}}},
+			Priority:     30,
+			ModelEntries: []model.ModelEntry{{Model: "skip-model"}},
+			Enabled:      true,
+		},
+	}
+	for _, fixture := range fixtures {
+		if _, err := store.CreateConfig(ctx, fixture); err != nil {
+			t.Fatalf("CreateConfig(%s) failed: %v", fixture.Name, err)
+		}
+	}
+
+	c, w := newTestContext(t, newRequest(http.MethodGet, "/admin/channels?protocol=openai&limit=20&offset=0", nil))
 
 	server.handleListChannels(c)
 
@@ -242,13 +425,13 @@ func TestHandleListChannelsTypeFilterIncludesProtocolTransforms(t *testing.T) {
 		gotNames = append(gotNames, item.Name)
 	}
 	sort.Strings(gotNames)
-	wantNames := []string{"anthropic-openai-transform", "native-openai"}
+	wantNames := []string{"anthropic-channel", "native-openai"}
 	if !slices.Equal(gotNames, wantNames) {
 		t.Fatalf("names=%v, want %v", gotNames, wantNames)
 	}
 }
 
-func TestHandleChannelsFilterOptionsTypeFilterIncludesProtocolTransforms(t *testing.T) {
+func TestHandleChannelsFilterOptionsTypeFilterUsesUpstreamProtocolOnly(t *testing.T) {
 	server, store, cleanup := setupAdminTestServer(t)
 	defer cleanup()
 
@@ -256,29 +439,24 @@ func TestHandleChannelsFilterOptionsTypeFilterIncludesProtocolTransforms(t *test
 	fixtures := []*model.Config{
 		{
 			Name:         "native-openai",
-			URL:          "https://openai.example.com",
+			URLs:         model.ChannelURLs{{URL: "https://openai.example.com", Protocols: []string{"openai"}}},
 			Priority:     10,
-			ChannelType:  "openai",
 			ModelEntries: []model.ModelEntry{{Model: "native-model"}},
 			Enabled:      true,
 		},
 		{
-			Name:               "anthropic-openai-transform",
-			URL:                "https://anthropic.example.com",
-			Priority:           20,
-			ChannelType:        "anthropic",
-			ProtocolTransforms: []string{"openai"},
-			ModelEntries:       []model.ModelEntry{{Model: "bridge-model"}},
-			Enabled:            true,
+			Name:         "anthropic-channel",
+			URLs:         model.ChannelURLs{{URL: "https://anthropic.example.com", Protocols: []string{"anthropic", "openai"}}},
+			Priority:     20,
+			ModelEntries: []model.ModelEntry{{Model: "bridge-model"}},
+			Enabled:      true,
 		},
 		{
-			Name:               "codex-gemini-transform",
-			URL:                "https://codex.example.com",
-			Priority:           30,
-			ChannelType:        "codex",
-			ProtocolTransforms: []string{"gemini"},
-			ModelEntries:       []model.ModelEntry{{Model: "skip-model"}},
-			Enabled:            true,
+			Name:         "codex-channel",
+			URLs:         model.ChannelURLs{{URL: "https://codex.example.com", Protocols: []string{"codex"}}},
+			Priority:     30,
+			ModelEntries: []model.ModelEntry{{Model: "skip-model"}},
+			Enabled:      true,
 		},
 	}
 	for _, fixture := range fixtures {
@@ -287,7 +465,7 @@ func TestHandleChannelsFilterOptionsTypeFilterIncludesProtocolTransforms(t *test
 		}
 	}
 
-	c, w := newTestContext(t, newRequest(http.MethodGet, "/admin/channels/filter-options?type=openai", nil))
+	c, w := newTestContext(t, newRequest(http.MethodGet, "/admin/channels/filter-options?protocol=openai", nil))
 
 	server.HandleChannelsFilterOptions(c)
 
@@ -299,7 +477,7 @@ func TestHandleChannelsFilterOptionsTypeFilterIncludesProtocolTransforms(t *test
 		Models       []string `json:"models"`
 	}
 	mustUnmarshalAPIResponseData(t, w.Body.Bytes(), &data)
-	wantNames := []string{"anthropic-openai-transform", "native-openai"}
+	wantNames := []string{"anthropic-channel", "native-openai"}
 	if !slices.Equal(data.ChannelNames, wantNames) {
 		t.Fatalf("channel_names=%v, want %v", data.ChannelNames, wantNames)
 	}
@@ -325,7 +503,7 @@ func TestHandleCreateChannel(t *testing.T) {
 			payload: ChannelRequest{
 				Name:                  "New-Channel",
 				APIKey:                "sk-test-key",
-				URL:                   "https://api.new.com",
+				URLs:                  model.ChannelURLs{{URL: "https://api.new.com"}},
 				Priority:              100,
 				Models:                []model.ModelEntry{{Model: "gpt-4", RedirectModel: ""}},
 				Enabled:               true,
@@ -339,7 +517,7 @@ func TestHandleCreateChannel(t *testing.T) {
 			payload: ChannelRequest{
 				Name:        "Multi-Key-Channel",
 				APIKey:      "sk-key1,sk-key2,sk-key3",
-				URL:         "https://api.multi.com",
+				URLs:        model.ChannelURLs{{URL: "https://api.multi.com"}},
 				Priority:    90,
 				Models:      []model.ModelEntry{{Model: "claude-3", RedirectModel: ""}},
 				KeyStrategy: model.KeyStrategyRoundRobin,
@@ -353,7 +531,7 @@ func TestHandleCreateChannel(t *testing.T) {
 			payload: ChannelRequest{
 				Name:     "Multi-URL-Channel",
 				APIKey:   "sk-test-key",
-				URL:      "https://us.api.com\nhttps://eu.api.com",
+				URLs:     channelURLsForTest("https://us.api.com", "https://eu.api.com"),
 				Priority: 80,
 				Models:   []model.ModelEntry{{Model: "gpt-4o-mini", RedirectModel: ""}},
 				Enabled:  true,
@@ -366,7 +544,7 @@ func TestHandleCreateChannel(t *testing.T) {
 			payload: ChannelRequest{
 				Name:     "",
 				APIKey:   "sk-test",
-				URL:      "https://api.com",
+				URLs:     model.ChannelURLs{{URL: "https://api.com"}},
 				Priority: 50,
 				Models:   []model.ModelEntry{{Model: "model", RedirectModel: ""}},
 			},
@@ -378,7 +556,7 @@ func TestHandleCreateChannel(t *testing.T) {
 			payload: ChannelRequest{
 				Name:     "Test",
 				APIKey:   "",
-				URL:      "https://api.com",
+				URLs:     model.ChannelURLs{{URL: "https://api.com"}},
 				Priority: 50,
 				Models:   []model.ModelEntry{{Model: "model", RedirectModel: ""}},
 			},
@@ -390,7 +568,7 @@ func TestHandleCreateChannel(t *testing.T) {
 			payload: ChannelRequest{
 				Name:     "Test",
 				APIKey:   "sk-test",
-				URL:      "https://api.com",
+				URLs:     model.ChannelURLs{{URL: "https://api.com"}},
 				Priority: 50,
 				Models:   []model.ModelEntry{},
 			},
@@ -438,21 +616,56 @@ func TestHandleCreateChannel(t *testing.T) {
 	}
 }
 
-func TestHandleCreateChannel_PersistsProtocolTransforms(t *testing.T) {
+func TestHandleCreateChannel_RejectsIncompleteCooldownRulesWithoutPersisting(t *testing.T) {
 	server, store, cleanup := setupAdminTestServer(t)
 	defer cleanup()
 
+	ctx := context.Background()
+	before, err := store.ListConfigs(ctx)
+	if err != nil {
+		t.Fatalf("ListConfigs() before create = %v", err)
+	}
+
 	payload := ChannelRequest{
-		Name:               "Transform-Channel",
-		APIKey:             "sk-transform",
-		URL:                "https://transform.example.com",
-		Priority:           42,
-		ChannelType:        "gemini",
-		ProtocolTransforms: []string{"openai", "anthropic"},
-		Models: []model.ModelEntry{
-			{Model: "gemini-2.5-pro", RedirectModel: ""},
+		Name:   "incomplete-cooldown-rule",
+		APIKey: "sk-test",
+		URLs:   model.ChannelURLs{{URL: "https://api.example.com"}},
+		Models: []model.ModelEntry{{Model: "test-model"}},
+		CooldownDetectionRules: &model.CooldownDetectionRules{Rules: []model.CooldownDetectionRule{{
+			Enabled: true, Priority: 0, StatusCodes: []int{200},
+			Scope: model.CooldownScopeKey, Mode: model.CooldownModeFixed, CooldownSeconds: 60,
+		}}},
+	}
+	c, w := newTestContext(t, newJSONRequest(t, http.MethodPost, "/admin/channels", payload))
+	server.handleCreateChannel(c)
+
+	if w.Code != http.StatusBadRequest || !strings.Contains(w.Body.String(), ".name: required") {
+		t.Fatalf("status=%d body=%s, want required cooldown rule name error", w.Code, w.Body.String())
+	}
+	after, err := store.ListConfigs(ctx)
+	if err != nil {
+		t.Fatalf("ListConfigs() after create = %v", err)
+	}
+	if len(after) != len(before) {
+		t.Fatalf("incomplete cooldown rule persisted a channel: before=%d after=%d", len(before), len(after))
+	}
+}
+
+func TestHandleCreateChannel_PersistsProtocolTransformModeAndIgnoresRemovedTransforms(t *testing.T) {
+	server, _, cleanup := setupAdminTestServer(t)
+	defer cleanup()
+
+	payload := map[string]any{
+		"name":                    "Transform-Channel",
+		"api_key":                 "sk-transform",
+		"urls":                    []map[string]any{{"url": "https://transform.example.com"}},
+		"priority":                42,
+		"protocol_transforms":     []string{"openai", "anthropic"},
+		"protocol_transform_mode": "local",
+		"models": []map[string]any{
+			{"model": "gemini-2.5-pro"},
 		},
-		Enabled: true,
+		"enabled": true,
 	}
 
 	c, w := newTestContext(t, newJSONRequest(t, http.MethodPost, "/admin/channels", payload))
@@ -461,37 +674,24 @@ func TestHandleCreateChannel_PersistsProtocolTransforms(t *testing.T) {
 		t.Fatalf("期望状态码 %d，实际 %d，响应体: %s", http.StatusCreated, w.Code, w.Body.String())
 	}
 
-	var resp struct {
-		Success bool          `json:"success"`
-		Data    *model.Config `json:"data"`
+	resp := mustParseAPIResponse[map[string]any](t, w.Body.Bytes())
+	if resp.Data["protocol_transform_mode"] != model.ProtocolTransformModeLocal {
+		t.Fatalf("protocol_transform_mode=%v, want local", resp.Data["protocol_transform_mode"])
 	}
-	mustUnmarshalJSON(t, w.Body.Bytes(), &resp)
-	if resp.Data == nil {
-		t.Fatalf("期望返回创建后的渠道数据")
-	}
-	if len(resp.Data.ProtocolTransforms) != 2 || resp.Data.ProtocolTransforms[0] != "anthropic" || resp.Data.ProtocolTransforms[1] != "openai" {
-		t.Fatalf("返回的 protocol transforms 不正确: %#v", resp.Data.ProtocolTransforms)
-	}
-
-	stored, err := store.GetConfig(context.Background(), resp.Data.ID)
-	if err != nil {
-		t.Fatalf("查询持久化渠道失败: %v", err)
-	}
-	if len(stored.ProtocolTransforms) != 2 || stored.ProtocolTransforms[0] != "anthropic" || stored.ProtocolTransforms[1] != "openai" {
-		t.Fatalf("持久化 protocol transforms 不正确: %#v", stored.ProtocolTransforms)
+	if _, exists := resp.Data["protocol_transforms"]; exists {
+		t.Fatalf("response must not expose removed protocol_transforms: %+v", resp.Data)
 	}
 }
 
-func TestHandleCreateChannel_AllowsUpstreamModeForExtraProtocols(t *testing.T) {
+func TestHandleCreateChannel_PersistsUpstreamProtocolTransformMode(t *testing.T) {
 	server, _, cleanup := setupAdminTestServer(t)
 	defer cleanup()
 
 	payload := map[string]any{
 		"name":                    "Upstream-Mode-Channel",
 		"api_key":                 "sk-upstream-mode",
-		"url":                     "https://upstream-mode.example.com",
+		"urls":                    []map[string]any{{"url": "https://upstream-mode.example.com"}},
 		"priority":                23,
-		"channel_type":            "anthropic",
 		"protocol_transforms":     []string{"gemini"},
 		"protocol_transform_mode": "upstream",
 		"models": []map[string]any{
@@ -506,8 +706,12 @@ func TestHandleCreateChannel_AllowsUpstreamModeForExtraProtocols(t *testing.T) {
 		t.Fatalf("期望 status=%d 允许 upstream 模式创建，实际=%d，响应体: %s", http.StatusCreated, w.Code, w.Body.String())
 	}
 
-	if !strings.Contains(w.Body.String(), `"protocol_transform_mode":"upstream"`) {
-		t.Fatalf("期望响应包含 protocol_transform_mode=upstream，实际响应: %s", w.Body.String())
+	resp := mustParseAPIResponse[map[string]any](t, w.Body.Bytes())
+	if resp.Data["protocol_transform_mode"] != model.ProtocolTransformModeUpstream {
+		t.Fatalf("protocol_transform_mode=%v, want upstream", resp.Data["protocol_transform_mode"])
+	}
+	if _, exists := resp.Data["protocol_transforms"]; exists {
+		t.Fatalf("response must not echo removed protocol_transforms: %+v", resp.Data)
 	}
 }
 
@@ -521,7 +725,7 @@ func TestHandleGetChannel(t *testing.T) {
 	// 创建测试渠道
 	cfg := &model.Config{
 		Name:         "Test-Get-Channel",
-		URL:          "https://api.example.com",
+		URLs:         model.ChannelURLs{{URL: "https://api.example.com"}},
 		Priority:     100,
 		ModelEntries: []model.ModelEntry{{Model: "model-1", RedirectModel: ""}},
 		Enabled:      true,
@@ -606,6 +810,246 @@ func TestHandleGetChannel(t *testing.T) {
 	}
 }
 
+func TestHandleGetChannelIncludesActiveModelCooldowns(t *testing.T) {
+	server, store, cleanup := setupAdminTestServer(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	created, err := store.CreateConfig(ctx, &model.Config{
+		Name:     "model-cooldown-detail",
+		URLs:     model.ChannelURLs{{URL: "https://api.example.com"}},
+		Priority: 100,
+		ModelEntries: []model.ModelEntry{
+			{Model: "external-model", RedirectModel: "upstream-model"},
+		},
+		Enabled: true,
+	})
+	if err != nil {
+		t.Fatalf("创建测试渠道失败: %v", err)
+	}
+
+	until := time.Now().Add(10 * time.Minute).Truncate(time.Second)
+	if err := store.SetModelCooldown(ctx, created.ID, "upstream-model", until); err != nil {
+		t.Fatalf("设置模型冷却失败: %v", err)
+	}
+
+	c, w := newTestContext(t, newRequest(http.MethodGet, "/admin/channels/"+strconv.FormatInt(created.ID, 10), nil))
+	server.handleGetChannel(c, created.ID)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status=%d, want %d body=%s", w.Code, http.StatusOK, w.Body.String())
+	}
+
+	var resp struct {
+		Success bool `json:"success"`
+		Data    struct {
+			ModelCooldowns []struct {
+				Model               string     `json:"model"`
+				CooldownUntil       *time.Time `json:"cooldown_until"`
+				CooldownRemainingMS int64      `json:"cooldown_remaining_ms"`
+			} `json:"model_cooldowns"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("解析响应失败: %v", err)
+	}
+	if !resp.Success {
+		t.Fatalf("success=false body=%s", w.Body.String())
+	}
+	if len(resp.Data.ModelCooldowns) != 1 {
+		t.Fatalf("model_cooldowns=%v, want one active cooldown", resp.Data.ModelCooldowns)
+	}
+	got := resp.Data.ModelCooldowns[0]
+	if got.Model != "upstream-model" {
+		t.Fatalf("model=%q, want upstream-model", got.Model)
+	}
+	if got.CooldownUntil == nil || !got.CooldownUntil.Equal(until) {
+		t.Fatalf("cooldown_until=%v, want %v", got.CooldownUntil, until)
+	}
+	if got.CooldownRemainingMS <= 0 {
+		t.Fatalf("cooldown_remaining_ms=%d, want > 0", got.CooldownRemainingMS)
+	}
+}
+
+func TestHandleChannelModelStatsReturnsTodayStatsForRequestedChannel(t *testing.T) {
+	server, store, cleanup := setupAdminTestServer(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	created, err := store.CreateConfig(ctx, &model.Config{
+		Name:         "model-stats-channel",
+		URLs:         model.ChannelURLs{{URL: "https://api.example.com"}},
+		ModelEntries: []model.ModelEntry{{Model: "external-model"}},
+		Enabled:      true,
+	})
+	if err != nil {
+		t.Fatalf("创建测试渠道失败: %v", err)
+	}
+	other, err := store.CreateConfig(ctx, &model.Config{
+		Name:         "other-model-stats-channel",
+		URLs:         model.ChannelURLs{{URL: "https://other.example.com"}},
+		ModelEntries: []model.ModelEntry{{Model: "external-model"}},
+		Enabled:      true,
+	})
+	if err != nil {
+		t.Fatalf("创建其他渠道失败: %v", err)
+	}
+
+	now := time.Now().Truncate(time.Second)
+	entries := []*model.LogEntry{
+		{
+			Time:          model.JSONTime{Time: now.Add(-3 * time.Minute)},
+			ChannelID:     created.ID,
+			Model:         "external-model",
+			StatusCode:    http.StatusOK,
+			Duration:      2,
+			IsStreaming:   true,
+			FirstByteTime: 1,
+		},
+		{
+			Time:          model.JSONTime{Time: now.Add(-2 * time.Minute)},
+			ChannelID:     created.ID,
+			Model:         "external-model",
+			StatusCode:    http.StatusOK,
+			Duration:      4,
+			IsStreaming:   true,
+			FirstByteTime: 3,
+		},
+		{
+			Time:       model.JSONTime{Time: now.Add(-time.Minute)},
+			ChannelID:  created.ID,
+			Model:      "external-model",
+			StatusCode: http.StatusServiceUnavailable,
+		},
+		{
+			Time:          model.JSONTime{Time: now.Add(-time.Minute)},
+			ChannelID:     other.ID,
+			Model:         "external-model",
+			StatusCode:    http.StatusOK,
+			Duration:      100,
+			IsStreaming:   true,
+			FirstByteTime: 100,
+		},
+		{
+			Time:          model.JSONTime{Time: now.AddDate(0, 0, -1)},
+			ChannelID:     created.ID,
+			Model:         "external-model",
+			StatusCode:    http.StatusOK,
+			Duration:      50,
+			IsStreaming:   true,
+			FirstByteTime: 50,
+		},
+	}
+	for _, entry := range entries {
+		if err := store.AddLog(ctx, entry); err != nil {
+			t.Fatalf("写入测试日志失败: %v", err)
+		}
+	}
+
+	path := "/admin/channels/" + strconv.FormatInt(created.ID, 10) + "/model-stats"
+	c, w := newTestContext(t, newRequest(http.MethodGet, path, nil))
+	c.Params = gin.Params{{Key: "id", Value: strconv.FormatInt(created.ID, 10)}}
+	server.HandleChannelModelStats(c)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status=%d, want %d body=%s", w.Code, http.StatusOK, w.Body.String())
+	}
+
+	resp := mustParseAPIResponse[[]ChannelModelStats](t, w.Body.Bytes())
+	if len(resp.Data) != 1 {
+		t.Fatalf("stats=%v, want one model", resp.Data)
+	}
+	got := resp.Data[0]
+	if got.Model != "external-model" || got.Success != 2 || got.Error != 1 || got.Total != 3 {
+		t.Fatalf("stats=%+v, want model=external-model success=2 error=1 total=3", got)
+	}
+	if got.AvgFirstByteTimeSeconds == nil || math.Abs(*got.AvgFirstByteTimeSeconds-2) > 1e-9 {
+		t.Fatalf("avg_first_byte_time_seconds=%v, want 2", got.AvgFirstByteTimeSeconds)
+	}
+	if got.AvgDurationSeconds == nil || math.Abs(*got.AvgDurationSeconds-3) > 1e-9 {
+		t.Fatalf("avg_duration_seconds=%v, want 3", got.AvgDurationSeconds)
+	}
+}
+
+func TestHandleChannelEditorAggregatesInitialState(t *testing.T) {
+	server, store, cleanup := setupAdminTestServer(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	server.urlSelector = NewURLSelector()
+	server.configService = NewConfigService(store)
+	if err := server.configService.LoadDefaults(ctx); err != nil {
+		t.Fatalf("加载系统设置失败: %v", err)
+	}
+
+	created, err := store.CreateConfig(ctx, &model.Config{
+		Name:         "channel-editor-bootstrap",
+		URLs:         model.ChannelURLs{{URL: "https://api.example.com"}},
+		ModelEntries: []model.ModelEntry{{Model: "external-model"}},
+		Enabled:      true,
+	})
+	if err != nil {
+		t.Fatalf("创建渠道失败: %v", err)
+	}
+	if err := store.CreateAPIKeysBatch(ctx, []*model.APIKey{{
+		ChannelID: created.ID,
+		KeyIndex:  0,
+		APIKey:    "sk-editor-test",
+		Note:      "primary",
+	}}); err != nil {
+		t.Fatalf("创建 API Key 失败: %v", err)
+	}
+	if err := store.AddLog(ctx, &model.LogEntry{
+		Time:       model.JSONTime{Time: time.Now()},
+		ChannelID:  created.ID,
+		Model:      "external-model",
+		StatusCode: http.StatusOK,
+		BaseURL:    "https://api.example.com",
+	}); err != nil {
+		t.Fatalf("写入模型统计日志失败: %v", err)
+	}
+	server.urlSelector.RecordLatency(created.ID, "https://api.example.com", 50*time.Millisecond)
+	server.urlSelector.RecordRequestResult(created.ID, "https://api.example.com", http.StatusOK)
+
+	path := "/admin/channels/" + strconv.FormatInt(created.ID, 10) + "/editor"
+	c, w := newTestContext(t, newRequest(http.MethodGet, path, nil))
+	c.Params = gin.Params{{Key: "id", Value: strconv.FormatInt(created.ID, 10)}}
+	server.HandleChannelEditor(c)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status=%d, want %d body=%s", w.Code, http.StatusOK, w.Body.String())
+	}
+
+	resp := mustParseAPIResponse[struct {
+		Channel    ChannelWithCooldown `json:"channel"`
+		Keys       []*model.APIKey     `json:"keys"`
+		ModelStats struct {
+			Available bool                `json:"available"`
+			Items     []ChannelModelStats `json:"items"`
+		} `json:"model_stats"`
+		URLStats struct {
+			Available bool      `json:"available"`
+			Items     []URLStat `json:"items"`
+		} `json:"url_stats"`
+		Features struct {
+			ScheduledCheckEnabled bool `json:"scheduled_check_enabled"`
+		} `json:"features"`
+	}](t, w.Body.Bytes())
+
+	if resp.Data.Channel.ID != created.ID || resp.Data.Channel.Name != created.Name {
+		t.Fatalf("channel=%+v, want id=%d name=%q", resp.Data.Channel, created.ID, created.Name)
+	}
+	if len(resp.Data.Keys) != 1 || resp.Data.Keys[0].APIKey != "sk-editor-test" {
+		t.Fatalf("keys=%+v, want configured key", resp.Data.Keys)
+	}
+	if !resp.Data.ModelStats.Available || len(resp.Data.ModelStats.Items) != 1 {
+		t.Fatalf("model_stats=%+v, want available stats", resp.Data.ModelStats)
+	}
+	if !resp.Data.URLStats.Available || len(resp.Data.URLStats.Items) != 1 || resp.Data.URLStats.Items[0].Requests != 1 {
+		t.Fatalf("url_stats=%+v, want available runtime stats", resp.Data.URLStats)
+	}
+	if !resp.Data.Features.ScheduledCheckEnabled {
+		t.Fatalf("features=%+v, want scheduled check enabled", resp.Data.Features)
+	}
+}
+
 // TestHandleUpdateChannel 测试更新渠道
 func TestHandleUpdateChannel(t *testing.T) {
 	server, store, cleanup := setupAdminTestServer(t)
@@ -616,7 +1060,7 @@ func TestHandleUpdateChannel(t *testing.T) {
 	// 创建测试渠道
 	cfg := &model.Config{
 		Name:         "Original-Name",
-		URL:          "https://api.original.com",
+		URLs:         model.ChannelURLs{{URL: "https://api.original.com"}},
 		Priority:     50,
 		ModelEntries: []model.ModelEntry{{Model: "model-1", RedirectModel: ""}},
 		Enabled:      true,
@@ -650,7 +1094,7 @@ func TestHandleUpdateChannel(t *testing.T) {
 			payload: ChannelRequest{
 				Name:     "Updated-Name",
 				APIKey:   "sk-updated-key",
-				URL:      "https://api.updated.com",
+				URLs:     model.ChannelURLs{{URL: "https://api.updated.com"}},
 				Priority: 100,
 				Models: []model.ModelEntry{
 					{Model: "model-1", RedirectModel: ""},
@@ -668,7 +1112,7 @@ func TestHandleUpdateChannel(t *testing.T) {
 			payload: ChannelRequest{
 				Name:     "Updated-Name",
 				APIKey:   "sk-updated-key",
-				URL:      "https://api.updated.com",
+				URLs:     model.ChannelURLs{{URL: "https://api.updated.com"}},
 				Priority: 100,
 				Models: []model.ModelEntry{
 					{Model: "gpt-5.2", RedirectModel: "gpt-5.2"},
@@ -685,7 +1129,7 @@ func TestHandleUpdateChannel(t *testing.T) {
 			payload: ChannelRequest{
 				Name:     "Test",
 				APIKey:   "sk-test",
-				URL:      "https://api.com",
+				URLs:     model.ChannelURLs{{URL: "https://api.com"}},
 				Priority: 50,
 				Models:   []model.ModelEntry{{Model: "model", RedirectModel: ""}},
 			},
@@ -698,7 +1142,7 @@ func TestHandleUpdateChannel(t *testing.T) {
 			payload: ChannelRequest{
 				Name:     "",
 				APIKey:   "sk-test",
-				URL:      "https://api.com",
+				URLs:     model.ChannelURLs{{URL: "https://api.com"}},
 				Priority: 50,
 				Models:   []model.ModelEntry{{Model: "model", RedirectModel: ""}},
 			},
@@ -746,18 +1190,16 @@ func TestHandleUpdateChannel(t *testing.T) {
 	}
 }
 
-func TestHandleUpdateChannel_UpdatesProtocolTransforms(t *testing.T) {
+func TestHandleUpdateChannel_IgnoresRemovedProtocolFields(t *testing.T) {
 	server, store, cleanup := setupAdminTestServer(t)
 	defer cleanup()
 
 	ctx := context.Background()
 	created, err := store.CreateConfig(ctx, &model.Config{
-		Name:               "Update-Transform-Channel",
-		URL:                "https://update-transform.example.com",
-		Priority:           10,
-		Enabled:            true,
-		ChannelType:        "gemini",
-		ProtocolTransforms: []string{"openai"},
+		Name:     "Update-Transform-Channel",
+		URLs:     model.ChannelURLs{{URL: "https://update-transform.example.com"}},
+		Priority: 10,
+		Enabled:  true,
 		ModelEntries: []model.ModelEntry{
 			{Model: "gemini-2.5-pro", RedirectModel: ""},
 		},
@@ -771,17 +1213,17 @@ func TestHandleUpdateChannel_UpdatesProtocolTransforms(t *testing.T) {
 		t.Fatalf("创建测试 API Key 失败: %v", err)
 	}
 
-	payload := ChannelRequest{
-		Name:               "Update-Transform-Channel",
-		APIKey:             "sk-update-transform",
-		URL:                "https://update-transform.example.com",
-		Priority:           10,
-		ChannelType:        "gemini",
-		ProtocolTransforms: []string{"codex", "anthropic"},
-		Models: []model.ModelEntry{
-			{Model: "gemini-2.5-pro", RedirectModel: ""},
+	payload := map[string]any{
+		"name":                    "Update-Transform-Channel",
+		"api_key":                 "sk-update-transform",
+		"urls":                    []map[string]any{{"url": "https://update-transform.example.com"}},
+		"priority":                10,
+		"protocol_transforms":     []string{"codex", "anthropic"},
+		"protocol_transform_mode": "upstream",
+		"models": []map[string]any{
+			{"model": "gemini-2.5-pro"},
 		},
-		Enabled: true,
+		"enabled": true,
 	}
 
 	c, w := newTestContext(t, newJSONRequest(t, http.MethodPut, "/admin/channels/"+strconv.FormatInt(created.ID, 10), payload))
@@ -791,16 +1233,16 @@ func TestHandleUpdateChannel_UpdatesProtocolTransforms(t *testing.T) {
 		t.Fatalf("期望状态码 %d，实际 %d，响应体: %s", http.StatusOK, w.Code, w.Body.String())
 	}
 
-	updated, err := store.GetConfig(ctx, created.ID)
-	if err != nil {
-		t.Fatalf("查询更新后渠道失败: %v", err)
+	resp := mustParseAPIResponse[map[string]any](t, w.Body.Bytes())
+	if resp.Data["protocol_transform_mode"] != model.ProtocolTransformModeUpstream {
+		t.Fatalf("protocol_transform_mode=%v, want upstream", resp.Data["protocol_transform_mode"])
 	}
-	if len(updated.ProtocolTransforms) != 2 || updated.ProtocolTransforms[0] != "anthropic" || updated.ProtocolTransforms[1] != "codex" {
-		t.Fatalf("更新后的 protocol transforms 不正确: %#v", updated.ProtocolTransforms)
+	if _, exists := resp.Data["protocol_transforms"]; exists {
+		t.Fatalf("response must not echo removed protocol_transforms: %+v", resp.Data)
 	}
 }
 
-func TestHandleUpdateChannel_ClearCooldownShouldTakeEffectImmediately(t *testing.T) {
+func TestHandleUpdateChannel_ClearAllCooldownsShouldTakeEffectImmediately(t *testing.T) {
 	server, store, cleanup := setupAdminTestServer(t)
 	defer cleanup()
 
@@ -811,7 +1253,7 @@ func TestHandleUpdateChannel_ClearCooldownShouldTakeEffectImmediately(t *testing
 
 	created, err := store.CreateConfig(ctx, &model.Config{
 		Name:         "Cooldown-Channel",
-		URL:          "https://api.example.com",
+		URLs:         model.ChannelURLs{{URL: "https://api.example.com"}},
 		Priority:     10,
 		ModelEntries: []model.ModelEntry{{Model: "model-1", RedirectModel: ""}},
 		Enabled:      true,
@@ -831,6 +1273,12 @@ func TestHandleUpdateChannel_ClearCooldownShouldTakeEffectImmediately(t *testing
 	if err := store.SetChannelCooldown(ctx, created.ID, time.Now().Add(2*time.Minute)); err != nil {
 		t.Fatalf("设置渠道冷却失败: %v", err)
 	}
+	if err := store.SetKeyCooldown(ctx, created.ID, 0, time.Now().Add(2*time.Minute)); err != nil {
+		t.Fatalf("设置 Key 冷却失败: %v", err)
+	}
+	if err := store.SetModelCooldown(ctx, created.ID, "model-1", time.Now().Add(2*time.Minute)); err != nil {
+		t.Fatalf("设置模型冷却失败: %v", err)
+	}
 
 	// 先查询一次，预热冷却缓存（复现“更新后仍显示旧冷却”问题）
 	c1, w1 := newTestContext(t, newRequest(http.MethodGet, "/admin/channels", nil))
@@ -842,11 +1290,26 @@ func TestHandleUpdateChannel_ClearCooldownShouldTakeEffectImmediately(t *testing
 	if len(before.Data) != 1 || before.Data[0].CooldownRemainingMS <= 0 {
 		t.Fatalf("预期渠道处于冷却中，实际 cooldown_remaining_ms=%d", before.Data[0].CooldownRemainingMS)
 	}
+	if len(before.Data[0].KeyCooldowns) != 1 || before.Data[0].KeyCooldowns[0].CooldownRemainingMS <= 0 {
+		t.Fatalf("预期 Key 处于冷却中，实际 key_cooldowns=%+v", before.Data[0].KeyCooldowns)
+	}
+
+	// 预热模型冷却缓存，确保保存后返回的是最新状态。
+	channelPath := "/admin/channels/" + strconv.FormatInt(created.ID, 10)
+	cModelBefore, wModelBefore := newTestContext(t, newRequest(http.MethodGet, channelPath, nil))
+	server.handleGetChannel(cModelBefore, created.ID)
+	if wModelBefore.Code != http.StatusOK {
+		t.Fatalf("预热模型冷却缓存失败: %d", wModelBefore.Code)
+	}
+	modelBefore := mustParseAPIResponse[ChannelWithCooldown](t, wModelBefore.Body.Bytes())
+	if len(modelBefore.Data.ModelCooldowns) != 1 {
+		t.Fatalf("预期模型处于冷却中，实际 model_cooldowns=%+v", modelBefore.Data.ModelCooldowns)
+	}
 
 	updatePayload := ChannelRequest{
 		Name:     "Cooldown-Channel-Updated",
 		APIKey:   "sk-test-key",
-		URL:      "https://api.updated.com",
+		URLs:     model.ChannelURLs{{URL: "https://api.updated.com"}},
 		Priority: 20,
 		Models: []model.ModelEntry{
 			{Model: "model-1", RedirectModel: ""},
@@ -874,6 +1337,211 @@ func TestHandleUpdateChannel_ClearCooldownShouldTakeEffectImmediately(t *testing
 	if after.Data[0].CooldownUntil != nil || after.Data[0].CooldownRemainingMS > 0 {
 		t.Fatalf("预期冷却已清除，实际 cooldown_until=%v cooldown_remaining_ms=%d", after.Data[0].CooldownUntil, after.Data[0].CooldownRemainingMS)
 	}
+	if len(after.Data[0].KeyCooldowns) != 1 || after.Data[0].KeyCooldowns[0].CooldownUntil != nil || after.Data[0].KeyCooldowns[0].CooldownRemainingMS > 0 {
+		t.Fatalf("预期 Key 冷却已清除，实际 key_cooldowns=%+v", after.Data[0].KeyCooldowns)
+	}
+
+	cKeys, wKeys := newTestContext(t, newRequest(http.MethodGet, channelPath+"/keys", nil))
+	server.handleGetChannelKeys(cKeys, created.ID)
+	if wKeys.Code != http.StatusOK {
+		t.Fatalf("更新后查询 Key 失败: %d", wKeys.Code)
+	}
+	keysAfter := mustParseAPIResponse[[]*model.APIKey](t, wKeys.Body.Bytes())
+	if len(keysAfter.Data) != 1 || keysAfter.Data[0].CooldownUntil != 0 || keysAfter.Data[0].CooldownDurationMs != 0 {
+		t.Fatalf("预期 Key 完整冷却状态已清除，实际 keys=%+v", keysAfter.Data)
+	}
+
+	cModelAfter, wModelAfter := newTestContext(t, newRequest(http.MethodGet, channelPath, nil))
+	server.handleGetChannel(cModelAfter, created.ID)
+	if wModelAfter.Code != http.StatusOK {
+		t.Fatalf("更新后查询模型冷却失败: %d", wModelAfter.Code)
+	}
+	modelAfter := mustParseAPIResponse[ChannelWithCooldown](t, wModelAfter.Body.Bytes())
+	if len(modelAfter.Data.ModelCooldowns) != 0 {
+		t.Fatalf("预期模型冷却已清除，实际 model_cooldowns=%+v", modelAfter.Data.ModelCooldowns)
+	}
+}
+
+func TestHandleUpdateChannel_EnableClearsAllCooldownsImmediately(t *testing.T) {
+	server, store, cleanup := setupAdminTestServer(t)
+	defer cleanup()
+
+	server.channelCache = storage.NewChannelCache(store, time.Minute)
+	server.cooldownManager = cooldown.NewManager(store, server)
+
+	ctx := context.Background()
+	created, err := store.CreateConfig(ctx, &model.Config{
+		Name:         "Enable-Cooldown-Channel",
+		URLs:         model.ChannelURLs{{URL: "https://api.example.com"}},
+		Priority:     10,
+		ModelEntries: []model.ModelEntry{{Model: "model-1", RedirectModel: ""}},
+		Enabled:      false,
+	})
+	if err != nil {
+		t.Fatalf("创建测试渠道失败: %v", err)
+	}
+	if err := store.CreateAPIKeysBatch(ctx, []*model.APIKey{{
+		ChannelID:   created.ID,
+		KeyIndex:    0,
+		APIKey:      "sk-enable-test-key",
+		KeyStrategy: model.KeyStrategySequential,
+	}}); err != nil {
+		t.Fatalf("创建测试 API Key 失败: %v", err)
+	}
+
+	cooldownUntil := time.Now().Add(2 * time.Minute)
+	if err := store.SetChannelCooldown(ctx, created.ID, cooldownUntil); err != nil {
+		t.Fatalf("设置渠道冷却失败: %v", err)
+	}
+	if err := store.SetKeyCooldown(ctx, created.ID, 0, cooldownUntil); err != nil {
+		t.Fatalf("设置 Key 冷却失败: %v", err)
+	}
+	if err := store.SetModelCooldown(ctx, created.ID, "model-1", cooldownUntil); err != nil {
+		t.Fatalf("设置模型冷却失败: %v", err)
+	}
+	storedBefore, err := store.GetConfig(ctx, created.ID)
+	if err != nil {
+		t.Fatalf("查询启用前渠道失败: %v", err)
+	}
+	keysBefore, err := store.GetAPIKeys(ctx, created.ID)
+	if err != nil {
+		t.Fatalf("查询启用前 Key 失败: %v", err)
+	}
+	modelCooldownsBefore, err := store.GetAllModelCooldowns(ctx)
+	if err != nil {
+		t.Fatalf("查询启用前模型冷却失败: %v", err)
+	}
+	if storedBefore.CooldownUntil <= time.Now().Unix() || len(keysBefore) != 1 ||
+		keysBefore[0].CooldownUntil <= time.Now().Unix() || len(modelCooldownsBefore[created.ID]) != 1 {
+		t.Fatalf("预期启用前存在三层冷却，实际 channel=%+v keys=%+v models=%+v",
+			storedBefore, keysBefore, modelCooldownsBefore[created.ID])
+	}
+
+	channelPath := "/admin/channels/" + strconv.FormatInt(created.ID, 10)
+	beforeCtx, beforeWriter := newTestContext(t, newRequest(http.MethodGet, channelPath, nil))
+	server.handleGetChannel(beforeCtx, created.ID)
+	if beforeWriter.Code != http.StatusOK {
+		t.Fatalf("预热渠道冷却缓存失败: %d body=%s", beforeWriter.Code, beforeWriter.Body.String())
+	}
+
+	updateCtx, updateWriter := newTestContext(t, newJSONRequest(t, http.MethodPut, channelPath, map[string]any{
+		"enabled": true,
+	}))
+	updateCtx.Params = gin.Params{{Key: "id", Value: strconv.FormatInt(created.ID, 10)}}
+	server.handleUpdateChannel(updateCtx, created.ID)
+	if updateWriter.Code != http.StatusOK {
+		t.Fatalf("启用渠道失败: %d body=%s", updateWriter.Code, updateWriter.Body.String())
+	}
+
+	updated := mustParseAPIResponse[*model.Config](t, updateWriter.Body.Bytes())
+	if updated.Data == nil || !updated.Data.Enabled {
+		t.Fatalf("预期渠道已启用，实际 data=%+v", updated.Data)
+	}
+
+	afterCtx, afterWriter := newTestContext(t, newRequest(http.MethodGet, channelPath, nil))
+	server.handleGetChannel(afterCtx, created.ID)
+	if afterWriter.Code != http.StatusOK {
+		t.Fatalf("启用后查询渠道失败: %d body=%s", afterWriter.Code, afterWriter.Body.String())
+	}
+	after := mustParseAPIResponse[ChannelWithCooldown](t, afterWriter.Body.Bytes())
+	if after.Data.CooldownUntil != nil || after.Data.CooldownRemainingMS > 0 {
+		t.Fatalf("预期渠道冷却已清除，实际 cooldown_until=%v cooldown_remaining_ms=%d", after.Data.CooldownUntil, after.Data.CooldownRemainingMS)
+	}
+	for _, keyCooldown := range after.Data.KeyCooldowns {
+		if keyCooldown.CooldownUntil != nil || keyCooldown.CooldownRemainingMS > 0 {
+			t.Fatalf("预期 Key 冷却已清除，实际 key_cooldowns=%+v", after.Data.KeyCooldowns)
+		}
+	}
+	if len(after.Data.ModelCooldowns) != 0 {
+		t.Fatalf("预期模型冷却已清除，实际 model_cooldowns=%+v", after.Data.ModelCooldowns)
+	}
+
+	stored, err := store.GetConfig(ctx, created.ID)
+	if err != nil {
+		t.Fatalf("查询启用后渠道失败: %v", err)
+	}
+	if stored.CooldownUntil != 0 || stored.CooldownDurationMs != 0 {
+		t.Fatalf("预期渠道完整冷却状态已清除，实际 cooldown_until=%d duration_ms=%d", stored.CooldownUntil, stored.CooldownDurationMs)
+	}
+	keys, err := store.GetAPIKeys(ctx, created.ID)
+	if err != nil {
+		t.Fatalf("查询启用后 Key 失败: %v", err)
+	}
+	if len(keys) != 1 || keys[0].CooldownUntil != 0 || keys[0].CooldownDurationMs != 0 {
+		t.Fatalf("预期 Key 完整冷却状态已清除，实际 keys=%+v", keys)
+	}
+}
+
+func TestHandleUpdateChannel_TogglesModelDisabledWithoutChangingChannel(t *testing.T) {
+	server, store, cleanup := setupAdminTestServer(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	created, err := store.CreateConfig(ctx, &model.Config{
+		Name:     "model-toggle",
+		URLs:     model.ChannelURLs{{URL: "https://api.example.com"}},
+		Priority: 10,
+		ModelEntries: []model.ModelEntry{
+			{Model: "keep-on", RedirectModel: "keep-on"},
+			{Model: "toggle-me", RedirectModel: "toggle-me"},
+		},
+		Enabled: true,
+	})
+	if err != nil {
+		t.Fatalf("创建测试渠道失败: %v", err)
+	}
+
+	channelPath := "/admin/channels/" + strconv.FormatInt(created.ID, 10)
+	disableCtx, disableWriter := newTestContext(t, newJSONRequest(t, http.MethodPut, channelPath, map[string]any{
+		"model":    "toggle-me",
+		"disabled": true,
+	}))
+	server.handleUpdateChannel(disableCtx, created.ID)
+	if disableWriter.Code != http.StatusOK {
+		t.Fatalf("禁用模型失败: %d body=%s", disableWriter.Code, disableWriter.Body.String())
+	}
+
+	stored, err := store.GetConfig(ctx, created.ID)
+	if err != nil {
+		t.Fatalf("查询渠道失败: %v", err)
+	}
+	if !stored.Enabled {
+		t.Fatal("禁用模型不应关闭渠道")
+	}
+	disabledByName := map[string]bool{}
+	for _, entry := range stored.ModelEntries {
+		disabledByName[entry.Model] = entry.Disabled
+	}
+	if disabledByName["toggle-me"] != true || disabledByName["keep-on"] {
+		t.Fatalf("模型禁用状态=%v, want toggle-me=true keep-on=false", disabledByName)
+	}
+
+	enableCtx, enableWriter := newTestContext(t, newJSONRequest(t, http.MethodPut, channelPath, map[string]any{
+		"model":    "TOGGLE-ME",
+		"disabled": false,
+	}))
+	server.handleUpdateChannel(enableCtx, created.ID)
+	if enableWriter.Code != http.StatusOK {
+		t.Fatalf("启用模型失败: %d body=%s", enableWriter.Code, enableWriter.Body.String())
+	}
+	stored, err = store.GetConfig(ctx, created.ID)
+	if err != nil {
+		t.Fatalf("再次查询渠道失败: %v", err)
+	}
+	for _, entry := range stored.ModelEntries {
+		if entry.Disabled {
+			t.Fatalf("预期模型已全部启用，实际 %+v", stored.ModelEntries)
+		}
+	}
+
+	missingCtx, missingWriter := newTestContext(t, newJSONRequest(t, http.MethodPut, channelPath, map[string]any{
+		"model":    "not-on-channel",
+		"disabled": true,
+	}))
+	server.handleUpdateChannel(missingCtx, created.ID)
+	if missingWriter.Code != http.StatusNotFound {
+		t.Fatalf("缺失模型期望 404，实际 %d body=%s", missingWriter.Code, missingWriter.Body.String())
+	}
 }
 
 func TestHandleAPIKeyToggleRejectsMissingOrNegativeKeyIndex(t *testing.T) {
@@ -883,7 +1551,7 @@ func TestHandleAPIKeyToggleRejectsMissingOrNegativeKeyIndex(t *testing.T) {
 	ctx := context.Background()
 	created, err := store.CreateConfig(ctx, &model.Config{
 		Name:         "toggle-validation",
-		URL:          "https://api.example.com",
+		URLs:         model.ChannelURLs{{URL: "https://api.example.com"}},
 		Priority:     10,
 		ModelEntries: []model.ModelEntry{{Model: "model-1", RedirectModel: ""}},
 		Enabled:      true,
@@ -937,7 +1605,7 @@ func TestHandleAPIKeyToggleInvalidatesKeyCooldownCache(t *testing.T) {
 	ctx := context.Background()
 	created, err := store.CreateConfig(ctx, &model.Config{
 		Name:         "toggle-cache",
-		URL:          "https://api.example.com",
+		URLs:         model.ChannelURLs{{URL: "https://api.example.com"}},
 		Priority:     10,
 		ModelEntries: []model.ModelEntry{{Model: "model-1", RedirectModel: ""}},
 		Enabled:      true,
@@ -988,7 +1656,7 @@ func TestHandleUpdateChannelPreservesDisabledKeysWhenRebuilding(t *testing.T) {
 	ctx := context.Background()
 	created, err := store.CreateConfig(ctx, &model.Config{
 		Name:         "preserve-disabled",
-		URL:          "https://api.example.com",
+		URLs:         model.ChannelURLs{{URL: "https://api.example.com"}},
 		Priority:     10,
 		ModelEntries: []model.ModelEntry{{Model: "model-1", RedirectModel: ""}},
 		Enabled:      true,
@@ -1009,7 +1677,7 @@ func TestHandleUpdateChannelPreservesDisabledKeysWhenRebuilding(t *testing.T) {
 	payload := ChannelRequest{
 		Name:     "preserve-disabled",
 		APIKey:   "sk-live,sk-disabled,sk-new",
-		URL:      "https://api.example.com",
+		URLs:     model.ChannelURLs{{URL: "https://api.example.com"}},
 		Priority: 10,
 		Models:   []model.ModelEntry{{Model: "model-1", RedirectModel: ""}},
 		Enabled:  true,
@@ -1048,7 +1716,7 @@ func TestHandleChannelAPIKeyNotesCreateReadAndUpdate(t *testing.T) {
 	ctx := context.Background()
 	createPayload := ChannelRequest{
 		Name: "key-notes",
-		URL:  "https://api.example.com",
+		URLs: model.ChannelURLs{{URL: "https://api.example.com"}},
 		APIKeys: []ChannelAPIKeyRequest{
 			{APIKey: "sk-primary", Note: "primary"},
 			{APIKey: "sk-backup", Note: "backup"},
@@ -1086,7 +1754,7 @@ func TestHandleChannelAPIKeyNotesCreateReadAndUpdate(t *testing.T) {
 
 	updatePayload := ChannelRequest{
 		Name: "key-notes",
-		URL:  "https://api.example.com",
+		URLs: model.ChannelURLs{{URL: "https://api.example.com"}},
 		APIKeys: []ChannelAPIKeyRequest{
 			{APIKey: "sk-primary", Note: "primary-renamed"},
 			{APIKey: "sk-backup", Note: "backup-renamed"},
@@ -1128,7 +1796,7 @@ func TestHandleUpdateChannel_PrunesURLSelectorState(t *testing.T) {
 	ctx := context.Background()
 	cfg, err := store.CreateConfig(ctx, &model.Config{
 		Name:         "update-prune",
-		URL:          "https://old-1.example.com\nhttps://keep.example.com",
+		URLs:         channelURLsForTest("https://old-1.example.com", "https://keep.example.com"),
 		Priority:     10,
 		ModelEntries: []model.ModelEntry{{Model: "m1", RedirectModel: ""}},
 		Enabled:      true,
@@ -1148,7 +1816,7 @@ func TestHandleUpdateChannel_PrunesURLSelectorState(t *testing.T) {
 	// 另一渠道状态，用于验证不会被误删
 	otherCfg, err := store.CreateConfig(ctx, &model.Config{
 		Name:         "other-channel",
-		URL:          "https://other.example.com",
+		URLs:         model.ChannelURLs{{URL: "https://other.example.com"}},
 		Priority:     10,
 		ModelEntries: []model.ModelEntry{{Model: "m1", RedirectModel: ""}},
 		Enabled:      true,
@@ -1165,7 +1833,7 @@ func TestHandleUpdateChannel_PrunesURLSelectorState(t *testing.T) {
 	payload := ChannelRequest{
 		Name:     "update-prune",
 		APIKey:   "sk-update-prune",
-		URL:      "https://keep.example.com\nhttps://new.example.com",
+		URLs:     channelURLsForTest("https://keep.example.com", "https://new.example.com"),
 		Priority: 11,
 		Models:   []model.ModelEntry{{Model: "m1", RedirectModel: ""}},
 		Enabled:  true,
@@ -1199,7 +1867,7 @@ func TestHandleUpdateChannel_CleansOrphanedURLDisabledState(t *testing.T) {
 	ctx := context.Background()
 	cfg, err := store.CreateConfig(ctx, &model.Config{
 		Name:         "update-url-state",
-		URL:          "https://old-state.example.com\nhttps://keep-state.example.com",
+		URLs:         channelURLsForTest("https://old-state.example.com", "https://keep-state.example.com"),
 		Priority:     10,
 		ModelEntries: []model.ModelEntry{{Model: "m1", RedirectModel: ""}},
 		Enabled:      true,
@@ -1218,7 +1886,7 @@ func TestHandleUpdateChannel_CleansOrphanedURLDisabledState(t *testing.T) {
 
 	otherCfg, err := store.CreateConfig(ctx, &model.Config{
 		Name:         "other-url-state",
-		URL:          "https://other-state.example.com",
+		URLs:         model.ChannelURLs{{URL: "https://other-state.example.com"}},
 		Priority:     10,
 		ModelEntries: []model.ModelEntry{{Model: "m1", RedirectModel: ""}},
 		Enabled:      true,
@@ -1240,7 +1908,7 @@ func TestHandleUpdateChannel_CleansOrphanedURLDisabledState(t *testing.T) {
 	payload := ChannelRequest{
 		Name:     "update-url-state",
 		APIKey:   "sk-update-url-state",
-		URL:      "https://keep-state.example.com\nhttps://new-state.example.com",
+		URLs:     channelURLsForTest("https://keep-state.example.com", "https://new-state.example.com"),
 		Priority: 11,
 		Models:   []model.ModelEntry{{Model: "m1", RedirectModel: ""}},
 		Enabled:  true,
@@ -1277,7 +1945,7 @@ func TestHandleDeleteChannel(t *testing.T) {
 	// 创建测试渠道
 	cfg := &model.Config{
 		Name:         "To-Be-Deleted",
-		URL:          "https://api.example.com",
+		URLs:         model.ChannelURLs{{URL: "https://api.example.com"}},
 		Priority:     50,
 		ModelEntries: []model.ModelEntry{{Model: "model-1", RedirectModel: ""}},
 		Enabled:      true,
@@ -1285,6 +1953,33 @@ func TestHandleDeleteChannel(t *testing.T) {
 	created, err := store.CreateConfig(ctx, cfg)
 	if err != nil {
 		t.Fatalf("创建测试渠道失败: %v", err)
+	}
+	other, err := store.CreateConfig(ctx, &model.Config{
+		Name:    "Still-Available",
+		URLs:    model.ChannelURLs{{URL: "https://other.example.com"}},
+		Enabled: true,
+	})
+	if err != nil {
+		t.Fatalf("创建其他渠道失败: %v", err)
+	}
+	const tokenHash = "delete-channel-token-hash"
+	authToken := &model.AuthToken{
+		Token:                  tokenHash,
+		Description:            "delete channel restriction reload",
+		IsActive:               true,
+		AllowedChannelIDs:      []int64{created.ID},
+		ChannelRestrictionMode: model.ChannelRestrictionModeAllow,
+	}
+	if err := store.CreateAuthToken(ctx, authToken); err != nil {
+		t.Fatalf("创建 API 令牌失败: %v", err)
+	}
+	server.authService = newTestAuthService(t)
+	server.authService.store = store
+	if err := server.authService.ReloadAuthTokens(); err != nil {
+		t.Fatalf("加载 API 令牌失败: %v", err)
+	}
+	if server.authService.IsChannelAllowed(tokenHash, other.ID) {
+		t.Fatal("删除前令牌不应允许其他渠道")
 	}
 
 	tests := []struct {
@@ -1295,7 +1990,7 @@ func TestHandleDeleteChannel(t *testing.T) {
 	}{
 		{
 			name:           "成功删除渠道",
-			channelID:      "1",
+			channelID:      strconv.FormatInt(created.ID, 10),
 			expectedStatus: http.StatusOK, // Gin测试: c.Status()未写入响应时默认200
 			checkSuccess:   true,
 		},
@@ -1327,13 +2022,22 @@ func TestHandleDeleteChannel(t *testing.T) {
 			}
 
 			if tt.checkSuccess {
-				// 删除成功，无响应体
-				// 验证渠道是否真的被删除（仅对首个测试）
-				if tt.channelID == "1" {
-					_, err := store.GetConfig(ctx, created.ID)
-					if err == nil {
-						t.Error("渠道应该已被删除")
-					}
+				_, err := store.GetConfig(ctx, created.ID)
+				if err == nil {
+					t.Error("渠道应该已被删除")
+				}
+				storedToken, err := store.GetAuthToken(ctx, authToken.ID)
+				if err != nil {
+					t.Fatalf("读取 API 令牌失败: %v", err)
+				}
+				if len(storedToken.AllowedChannelIDs) != 0 {
+					t.Fatalf("删除后 allowed_channel_ids=%v，期望为空", storedToken.AllowedChannelIDs)
+				}
+				if storedToken.IsActive {
+					t.Fatal("删除唯一白名单渠道后令牌应被禁用")
+				}
+				if server.authService.IsTokenActive(tokenHash) {
+					t.Fatal("删除后热更新未生效：被禁用令牌仍在鉴权缓存中")
 				}
 			}
 		})
@@ -1348,7 +2052,7 @@ func TestHandleDeleteChannel_RemovesURLSelectorState(t *testing.T) {
 	ctx := context.Background()
 	targetCfg, err := store.CreateConfig(ctx, &model.Config{
 		Name:         "delete-prune-target",
-		URL:          "https://target-1.example.com\nhttps://target-2.example.com",
+		URLs:         channelURLsForTest("https://target-1.example.com", "https://target-2.example.com"),
 		Priority:     10,
 		ModelEntries: []model.ModelEntry{{Model: "m1", RedirectModel: ""}},
 		Enabled:      true,
@@ -1358,7 +2062,7 @@ func TestHandleDeleteChannel_RemovesURLSelectorState(t *testing.T) {
 	}
 	otherCfg, err := store.CreateConfig(ctx, &model.Config{
 		Name:         "delete-prune-other",
-		URL:          "https://other.example.com",
+		URLs:         model.ChannelURLs{{URL: "https://other.example.com"}},
 		Priority:     10,
 		ModelEntries: []model.ModelEntry{{Model: "m1", RedirectModel: ""}},
 		Enabled:      true,
@@ -1404,7 +2108,7 @@ func TestHandleGetChannelKeys(t *testing.T) {
 	// 创建测试渠道
 	cfg := &model.Config{
 		Name:         "Test-Keys-Channel",
-		URL:          "https://api.example.com",
+		URLs:         model.ChannelURLs{{URL: "https://api.example.com"}},
 		Priority:     100,
 		ModelEntries: []model.ModelEntry{{Model: "model-1", RedirectModel: ""}},
 		Enabled:      true,
@@ -1476,7 +2180,7 @@ func TestChannelRequestValidate(t *testing.T) {
 			req: ChannelRequest{
 				Name:     "Valid-Channel",
 				APIKey:   "sk-test",
-				URL:      "https://api.com",
+				URLs:     model.ChannelURLs{{URL: "https://api.com"}},
 				Priority: 100,
 				Models:   []model.ModelEntry{{Model: "model-1", RedirectModel: ""}},
 			},
@@ -1487,82 +2191,81 @@ func TestChannelRequestValidate(t *testing.T) {
 			req: ChannelRequest{
 				Name:     "Test",
 				APIKey:   "sk-test",
-				URL:      "  ",
+				URLs:     model.ChannelURLs{{URL: "  "}},
 				Priority: 100,
 				Models:   []model.ModelEntry{{Model: "model-1", RedirectModel: ""}},
 			},
 			wantError: true,
-			errorMsg:  "url cannot be empty",
+			errorMsg:  "urls[0].url cannot be empty",
 		},
 		{
 			name: "URL缺少scheme",
 			req: ChannelRequest{
 				Name:     "Test",
 				APIKey:   "sk-test",
-				URL:      "api.com",
+				URLs:     model.ChannelURLs{{URL: "api.com"}},
 				Priority: 100,
 				Models:   []model.ModelEntry{{Model: "model-1", RedirectModel: ""}},
 			},
 			wantError: true,
-			errorMsg:  "invalid url: \"api.com\"",
+			errorMsg:  "urls[0]: invalid url: \"api.com\"",
 		},
 		{
 			name: "URL scheme非法",
 			req: ChannelRequest{
 				Name:     "Test",
 				APIKey:   "sk-test",
-				URL:      "ftp://api.com",
+				URLs:     model.ChannelURLs{{URL: "ftp://api.com"}},
 				Priority: 100,
 				Models:   []model.ModelEntry{{Model: "model-1", RedirectModel: ""}},
 			},
 			wantError: true,
-			errorMsg:  "invalid url scheme: \"ftp\" (allowed: http, https)",
+			errorMsg:  "urls[0]: invalid url scheme: \"ftp\" (allowed: http, https)",
 		},
 		{
 			name: "URL包含userinfo",
 			req: ChannelRequest{
 				Name:     "Test",
 				APIKey:   "sk-test",
-				URL:      "https://user:pass@api.com",
+				URLs:     model.ChannelURLs{{URL: "https://user:pass@api.com"}},
 				Priority: 100,
 				Models:   []model.ModelEntry{{Model: "model-1", RedirectModel: ""}},
 			},
 			wantError: true,
-			errorMsg:  "url must not contain user info",
+			errorMsg:  "urls[0]: url must not contain user info",
 		},
 		{
 			name: "URL包含query",
 			req: ChannelRequest{
 				Name:     "Test",
 				APIKey:   "sk-test",
-				URL:      "https://api.com?x=1",
+				URLs:     model.ChannelURLs{{URL: "https://api.com?x=1"}},
 				Priority: 100,
 				Models:   []model.ModelEntry{{Model: "model-1", RedirectModel: ""}},
 			},
 			wantError: true,
-			errorMsg:  "url must not contain query or fragment",
+			errorMsg:  "urls[0]: url must not contain query or fragment",
 		},
 		{
 			name: "URL包含fragment",
 			req: ChannelRequest{
 				Name:     "Test",
 				APIKey:   "sk-test",
-				URL:      "https://api.com#x",
+				URLs:     model.ChannelURLs{{URL: "https://api.com#x"}},
 				Priority: 100,
 				Models:   []model.ModelEntry{{Model: "model-1", RedirectModel: ""}},
 			},
 			wantError: true,
-			errorMsg:  "url must not contain query or fragment",
+			errorMsg:  "urls[0]: url must not contain query or fragment",
 		},
 		{
 			name: "URL以#结尾保留完整地址标记",
 			req: ChannelRequest{
-				Name:                  "Test",
-				APIKey:                "sk-test",
-				URL:                   "https://api.com#",
-				ProtocolTransformMode: "local",
-				Priority:              100,
-				Models:                []model.ModelEntry{{Model: "model-1", RedirectModel: ""}},
+				Name:     "Test",
+				APIKey:   "sk-test",
+				URLs:     model.ChannelURLs{{URL: "https://api.com", Exact: true}},
+				Priority: 100,
+				Models:   []model.ModelEntry{{Model: "model-1", RedirectModel: ""}},
 			},
 			wantError:       false,
 			expectNormalize: "https://api.com#",
@@ -1572,57 +2275,55 @@ func TestChannelRequestValidate(t *testing.T) {
 			req: ChannelRequest{
 				Name:     "Test",
 				APIKey:   "sk-test",
-				URL:      "https://api.com/v1",
+				URLs:     model.ChannelURLs{{URL: "https://api.com/v1"}},
 				Priority: 100,
 				Models:   []model.ModelEntry{{Model: "model-1", RedirectModel: ""}},
 			},
 			wantError: true,
-			errorMsg:  "url should not contain API endpoint path like /v1 (current path: \"/v1\")",
+			errorMsg:  "urls[0]: url should not contain API endpoint path like /v1 (current path: \"/v1\")",
 		},
 		{
 			name: "URL包含/v1/messages路径（禁止）",
 			req: ChannelRequest{
 				Name:     "Test",
 				APIKey:   "sk-test",
-				URL:      "https://api.com/v1/messages",
+				URLs:     model.ChannelURLs{{URL: "https://api.com/v1/messages"}},
 				Priority: 100,
 				Models:   []model.ModelEntry{{Model: "model-1", RedirectModel: ""}},
 			},
 			wantError: true,
-			errorMsg:  "url should not contain API endpoint path like /v1 (current path: \"/v1/messages\")",
+			errorMsg:  "urls[0]: url should not contain API endpoint path like /v1 (current path: \"/v1/messages\")",
 		},
 		{
 			name: "URL以#结尾允许显式/v1完整地址",
 			req: ChannelRequest{
-				Name:                  "Test",
-				APIKey:                "sk-test",
-				URL:                   "https://api.com/v1/messages#",
-				ProtocolTransformMode: "local",
-				Priority:              100,
-				Models:                []model.ModelEntry{{Model: "model-1", RedirectModel: ""}},
+				Name:     "Test",
+				APIKey:   "sk-test",
+				URLs:     model.ChannelURLs{{URL: "https://api.com/v1/messages", Exact: true}},
+				Priority: 100,
+				Models:   []model.ModelEntry{{Model: "model-1", RedirectModel: ""}},
 			},
 			wantError:       false,
 			expectNormalize: "https://api.com/v1/messages#",
 		},
 		{
-			name: "URL以#结尾禁止上游转换方式",
+			name: "URL以#结尾不再依赖协议处理配置",
 			req: ChannelRequest{
-				Name:                  "Test",
-				APIKey:                "sk-test",
-				URL:                   "https://api.com/v1/messages#",
-				ProtocolTransformMode: "upstream",
-				Priority:              100,
-				Models:                []model.ModelEntry{{Model: "model-1", RedirectModel: ""}},
+				Name:     "Test",
+				APIKey:   "sk-test",
+				URLs:     model.ChannelURLs{{URL: "https://api.com/v1/messages", Exact: true}},
+				Priority: 100,
+				Models:   []model.ModelEntry{{Model: "model-1", RedirectModel: ""}},
 			},
-			wantError: true,
-			errorMsg:  "protocol_transform_mode upstream is not allowed when url uses exact upstream marker #",
+			wantError:       false,
+			expectNormalize: "https://api.com/v1/messages#",
 		},
 		{
 			name: "URL包含/api路径（允许）",
 			req: ChannelRequest{
 				Name:     "Test",
 				APIKey:   "sk-test",
-				URL:      "https://example.com/api",
+				URLs:     model.ChannelURLs{{URL: "https://example.com/api"}},
 				Priority: 100,
 				Models:   []model.ModelEntry{{Model: "model-1", RedirectModel: ""}},
 			},
@@ -1634,7 +2335,7 @@ func TestChannelRequestValidate(t *testing.T) {
 			req: ChannelRequest{
 				Name:     "Test",
 				APIKey:   "sk-test",
-				URL:      "https://example.com/openai/",
+				URLs:     model.ChannelURLs{{URL: "https://example.com/openai/"}},
 				Priority: 100,
 				Models:   []model.ModelEntry{{Model: "model-1", RedirectModel: ""}},
 			},
@@ -1646,7 +2347,7 @@ func TestChannelRequestValidate(t *testing.T) {
 			req: ChannelRequest{
 				Name:     "Test",
 				APIKey:   "sk-test",
-				URL:      "https://api.com/",
+				URLs:     model.ChannelURLs{{URL: "https://api.com/"}},
 				Priority: 100,
 				Models:   []model.ModelEntry{{Model: "model-1", RedirectModel: ""}},
 			},
@@ -1658,7 +2359,7 @@ func TestChannelRequestValidate(t *testing.T) {
 			req: ChannelRequest{
 				Name:     "Test",
 				APIKey:   "sk-test",
-				URL:      "https://api.com:8080/",
+				URLs:     model.ChannelURLs{{URL: "https://api.com:8080/"}},
 				Priority: 100,
 				Models:   []model.ModelEntry{{Model: "model-1", RedirectModel: ""}},
 			},
@@ -1670,7 +2371,7 @@ func TestChannelRequestValidate(t *testing.T) {
 			req: ChannelRequest{
 				Name:     "Test",
 				APIKey:   "sk-test",
-				URL:      "http://api.example.com:8080/",
+				URLs:     model.ChannelURLs{{URL: "http://api.example.com:8080/"}},
 				Priority: 100,
 				Models:   []model.ModelEntry{{Model: "model-1", RedirectModel: ""}},
 			},
@@ -1682,7 +2383,7 @@ func TestChannelRequestValidate(t *testing.T) {
 			req: ChannelRequest{
 				Name:     "",
 				APIKey:   "sk-test",
-				URL:      "https://api.com",
+				URLs:     model.ChannelURLs{{URL: "https://api.com"}},
 				Priority: 100,
 				Models:   []model.ModelEntry{{Model: "model-1", RedirectModel: ""}},
 			},
@@ -1694,7 +2395,7 @@ func TestChannelRequestValidate(t *testing.T) {
 			req: ChannelRequest{
 				Name:     "Test",
 				APIKey:   "",
-				URL:      "https://api.com",
+				URLs:     model.ChannelURLs{{URL: "https://api.com"}},
 				Priority: 100,
 				Models:   []model.ModelEntry{{Model: "model-1", RedirectModel: ""}},
 			},
@@ -1706,7 +2407,7 @@ func TestChannelRequestValidate(t *testing.T) {
 			req: ChannelRequest{
 				Name:     "Test",
 				APIKey:   "sk-test",
-				URL:      "https://api.com",
+				URLs:     model.ChannelURLs{{URL: "https://api.com"}},
 				Priority: 100,
 				Models:   []model.ModelEntry{},
 			},
@@ -1730,8 +2431,8 @@ func TestChannelRequestValidate(t *testing.T) {
 					t.Errorf("期望成功，但返回错误: %v", err)
 				} else {
 					// 验证 URL 标准化
-					if tt.expectNormalize != "" && tt.req.URL != tt.expectNormalize {
-						t.Errorf("URL标准化失败：期望 %q，实际 %q", tt.expectNormalize, tt.req.URL)
+					if tt.expectNormalize != "" && tt.req.URLs[0].RuntimeURL() != tt.expectNormalize {
+						t.Errorf("URL标准化失败：期望 %q，实际 %q", tt.expectNormalize, tt.req.URLs[0].RuntimeURL())
 					}
 				}
 			}

@@ -1,10 +1,85 @@
 package app
 
 import (
-	"sort"
+	"net/http"
 	"strings"
 	"testing"
+
+	"ccLoad/internal/util"
 )
+
+func TestMarkSSEErrorForwardResultPreservesWebsocketStatusAndHeaders(t *testing.T) {
+	res := &fwResult{SSEErrorEvent: []byte(`{
+		"type":"error",
+		"status_code":429,
+		"headers":{"Retry-After":"17","X-Request-Id":"req-ws-error","Set-Cookie":"unsafe=1"},
+		"error":{"type":"rate_limit_error","code":"rate_limit_exceeded","message":"slow down"}
+	}`)}
+
+	markSSEErrorForwardResult(res)
+
+	if res.Status != http.StatusTooManyRequests || res.UpstreamStatus != http.StatusTooManyRequests {
+		t.Fatalf("status=%d upstream=%d, want 429/429", res.Status, res.UpstreamStatus)
+	}
+	if got := res.Header.Get("Retry-After"); got != "17" {
+		t.Fatalf("Retry-After=%q, want 17", got)
+	}
+	if got := res.Header.Get("X-Request-Id"); got != "req-ws-error" {
+		t.Fatalf("X-Request-Id=%q, want req-ws-error", got)
+	}
+	if got := res.Header.Get("Set-Cookie"); got != "" {
+		t.Fatalf("Set-Cookie=%q, want embedded unsafe header to be ignored", got)
+	}
+}
+
+func TestMarkSSEErrorForwardResultClassifiesInterruptedStream(t *testing.T) {
+	res := &fwResult{SSEErrorEvent: []byte(`{
+		"type":"error",
+		"status":502,
+		"headers":{"X-Request-Id":"req-interrupted"},
+		"error":{
+			"type":"server_error",
+			"code":"upstream_stream_interrupted",
+			"message":"upstream response was interrupted; reconnect and replay the full conversation state"
+		}
+	}`)}
+
+	markSSEErrorForwardResult(res)
+
+	if res.Status != util.StatusStreamIncomplete {
+		t.Fatalf("status=%d, want internal stream incomplete status %d", res.Status, util.StatusStreamIncomplete)
+	}
+	if res.UpstreamStatus != http.StatusBadGateway {
+		t.Fatalf("upstream status=%d, want original status %d", res.UpstreamStatus, http.StatusBadGateway)
+	}
+	if got := res.Header.Get("X-Request-Id"); got != "req-interrupted" {
+		t.Fatalf("X-Request-Id=%q, want req-interrupted", got)
+	}
+}
+
+func TestMarkSSEErrorForwardResultRejectsNonErrorWebsocketStatus(t *testing.T) {
+	res := &fwResult{SSEErrorEvent: []byte(`{
+		"type":"error",
+		"status":200,
+		"error":{"type":"server_error","message":"failed despite bogus status"}
+	}`)}
+
+	markSSEErrorForwardResult(res)
+
+	if res.Status != util.StatusSSEError {
+		t.Fatalf("status=%d, want internal SSE error status %d", res.Status, util.StatusSSEError)
+	}
+	if res.UpstreamStatus != 0 {
+		t.Fatalf("upstream status=%d, want invalid non-error status ignored", res.UpstreamStatus)
+	}
+}
+
+func TestClassifySSEErrorStatusTreatsWebsocketConnectionLimitAsRateLimit(t *testing.T) {
+	body := []byte(`{"type":"error","error":{"code":"websocket_connection_limit_reached"}}`)
+	if got := classifySSEErrorStatus(body); got != http.StatusTooManyRequests {
+		t.Fatalf("status=%d, want 429", got)
+	}
+}
 
 func feedAndAssertUsage(t *testing.T, parser usageParser, data string, wantInput, wantOutput, wantCacheRead, wantCacheCreation int) {
 	t.Helper()
@@ -47,19 +122,6 @@ func TestHasGeminiUsageFields(t *testing.T) {
 
 	if hasGeminiUsageFields(map[string]any{}) {
 		t.Fatal("expected empty map to not be detected as gemini usage")
-	}
-}
-
-func TestGetUsageKeys(t *testing.T) {
-	t.Parallel()
-
-	keys := getUsageKeys(map[string]any{
-		"b": float64(2),
-		"a": float64(1),
-	})
-	sort.Strings(keys)
-	if strings.Join(keys, ",") != "a,b" {
-		t.Fatalf("unexpected keys: %v", keys)
 	}
 }
 
@@ -176,6 +238,43 @@ func TestSSEUsageParser_NormalContentNotMisflaggedAsError(t *testing.T) {
 	}
 	if !parser.HasStreamOutput() {
 		t.Fatalf("normal content delta must count as stream output")
+	}
+}
+
+// [PATCH] OpenAI Responses API 的失败终态：event/type 都是 response.failed，
+// error 嵌在 response.error 下。漏判会把限流当 HTTP 200 成功。
+func TestSSEUsageParser_ResponseFailedEvent(t *testing.T) {
+	parser := newSSEUsageParser("codex")
+	stream := "event: response.failed\n" +
+		`data: {"type":"response.failed","response":{"id":"resp_5ca0fb7943504d6a93576c7fb7e3a760","object":"response","model":"gpt-5.6-sol","status":"failed","output":[],"error":{"code":"rate_limit_exceeded","message":"Upstream rate limit exceeded, please retry later"}}}` +
+		"\n\n"
+	if err := parser.Feed([]byte(stream)); err != nil {
+		t.Fatalf("Feed失败: %v", err)
+	}
+	if parser.HasStreamOutput() {
+		t.Fatalf("response.failed must not count as stream output")
+	}
+	lastErr := parser.GetLastError()
+	if lastErr == nil {
+		t.Fatalf("response.failed must be captured as lastError")
+	}
+	if !strings.Contains(string(lastErr), "rate_limit_exceeded") {
+		t.Fatalf("lastError should preserve nested rate_limit payload, got: %s", lastErr)
+	}
+}
+
+// [PATCH] 仅 data 行、无 event 行的 response.failed（与 JSON-only error 对称）。
+func TestSSEUsageParser_ResponseFailedJSONOnly(t *testing.T) {
+	parser := newSSEUsageParser("openai")
+	stream := `data: {"type":"response.failed","response":{"status":"failed","error":{"code":"rate_limit_exceeded","message":"Upstream rate limit exceeded, please retry later"}}}` + "\n\n"
+	if err := parser.Feed([]byte(stream)); err != nil {
+		t.Fatalf("Feed失败: %v", err)
+	}
+	if parser.GetLastError() == nil {
+		t.Fatalf("JSON-only response.failed must be captured as lastError")
+	}
+	if parser.HasStreamOutput() {
+		t.Fatalf("JSON-only response.failed must not count as stream output")
 	}
 }
 
@@ -372,6 +471,56 @@ data: {"type":"response.completed","sequence_number":28,"response":{"id":"resp_0
 	feedAndAssertUsage(t, newSSEUsageParser("codex"), sseData, 4293, 17, 6016, 0)
 }
 
+func TestSSEUsageParser_CodexResponseFailedRetainsUsage(t *testing.T) {
+	sseData := `event: response.failed
+data: {"type":"response.failed","response":{"status":"failed","error":{"code":"server_error","message":"failed after work"},"usage":{"input_tokens":120,"input_tokens_details":{"cached_tokens":20},"output_tokens":7,"total_tokens":127}}}
+
+`
+	parser := newSSEUsageParser("codex")
+	if err := parser.Feed([]byte(sseData)); err != nil {
+		t.Fatalf("Feed response.failed: %v", err)
+	}
+	input, output, cacheRead, _ := parser.GetUsage()
+	if input != 100 || output != 7 || cacheRead != 20 {
+		t.Fatalf("failed response usage input=%d output=%d cache=%d, want 100/7/20", input, output, cacheRead)
+	}
+	if parser.GetLastError() == nil {
+		t.Fatal("response.failed must still be classified as an upstream error")
+	}
+}
+
+func TestSSEUsageParser_CodexCacheWriteTokens(t *testing.T) {
+	// OpenAI Responses / Codex: input_tokens_details.cache_write_tokens 是缓存建立字段
+	// input_tokens 包含 cached_tokens 与 cache_write_tokens，需全部扣除避免双计
+	// billable = 121114 - 119936 - 640 = 538
+	sseData := `event: response.completed
+data: {"type":"response.completed","response":{"usage":{"input_tokens":121114,"input_tokens_details":{"cached_tokens":119936,"cache_write_tokens":640},"output_tokens":15247,"output_tokens_details":{"reasoning_tokens":0},"total_tokens":136361}}}
+
+`
+
+	parser := newSSEUsageParser("codex")
+	feedAndAssertUsage(t, parser, sseData, 538, 15247, 119936, 640)
+	if parser.Cache5mInputTokens != 640 {
+		t.Errorf("Cache5mInputTokens = %d, 期望 640（OpenAI cache write 按 5m 写价计费）", parser.Cache5mInputTokens)
+	}
+}
+
+func TestJSONUsageParser_CodexCacheWriteTokens(t *testing.T) {
+	jsonData := `{"id":"resp_1","object":"response","status":"completed","usage":{"input_tokens":121114,"input_tokens_details":{"cached_tokens":119936,"cache_write_tokens":640},"output_tokens":15247,"output_tokens_details":{"reasoning_tokens":0},"total_tokens":136361}}`
+
+	parser := newJSONUsageParser("codex")
+	if err := parser.Feed([]byte(jsonData)); err != nil {
+		t.Fatalf("Feed失败: %v", err)
+	}
+	input, output, cacheRead, cacheCreation := parser.GetUsage()
+	if input != 538 || output != 15247 || cacheRead != 119936 || cacheCreation != 640 {
+		t.Fatalf("GetUsage() = (%d,%d,%d,%d), want (538,15247,119936,640)", input, output, cacheRead, cacheCreation)
+	}
+	if parser.Cache5mInputTokens != 640 {
+		t.Errorf("Cache5mInputTokens = %d, 期望 640", parser.Cache5mInputTokens)
+	}
+}
+
 func TestSSEUsageParser_CodexReasoningTokens(t *testing.T) {
 	sseData := `event: response.completed
 data: {"type":"response.completed","response":{"usage":{"input_tokens":10309,"input_tokens_details":{"cached_tokens":6016},"output_tokens":1234,"output_tokens_details":{"reasoning_tokens":987},"total_tokens":11543}}}
@@ -444,7 +593,7 @@ func TestJSONUsageParser_ExtractsImageGenerationToolCost(t *testing.T) {
 	parser.GetUsage()
 
 	expected := (10*5.00 + 20*8.00 + 30*30.00) / 1_000_000
-	if got := parser.GetToolCostUSD(); !floatEquals(got, expected, 0.000001) {
+	if got := parser.GetToolCostUSD(); !floatEquals(got, expected) {
 		t.Fatalf("image generation tool cost = %.6f, 期望 %.6f", got, expected)
 	}
 }
@@ -462,7 +611,7 @@ data: {"type":"response.completed","response":{"tools":[{"type":"image_generatio
 	parser.GetUsage()
 
 	expected := (54*8.00 + 1372*30.00) / 1_000_000
-	if got := parser.GetToolCostUSD(); !floatEquals(got, expected, 0.000001) {
+	if got := parser.GetToolCostUSD(); !floatEquals(got, expected) {
 		t.Fatalf("image generation tool cost = %.6f, 期望 %.6f", got, expected)
 	}
 }
@@ -490,7 +639,7 @@ func TestSSEUsageParser_ChargesCompletedImageGenerationWithoutUsage(t *testing.T
 	}
 
 	const expected = 0.165
-	if got := parser.GetToolCostUSD(); !floatEquals(got, expected, 0.000001) {
+	if got := parser.GetToolCostUSD(); !floatEquals(got, expected) {
 		t.Fatalf("image generation fallback cost = %.6f, 期望 %.6f", got, expected)
 	}
 }
@@ -513,7 +662,7 @@ func TestSSEUsageParser_PreservesImageFallbackWhenLaterUsageArrives(t *testing.T
 	}
 
 	const expected = 0.165
-	if got := parser.GetToolCostUSD(); !floatEquals(got, expected, 0.000001) {
+	if got := parser.GetToolCostUSD(); !floatEquals(got, expected) {
 		t.Fatalf("later usage覆盖了图片兜底成本: got=%.6f, 期望 %.6f", got, expected)
 	}
 }
@@ -531,7 +680,7 @@ data: {"type":"response.completed","response":{"tools":[{"type":"image_generatio
 	parser.GetUsage()
 
 	expected := (54*8.00 + 1372*30.00) / 1_000_000
-	if got := parser.GetToolCostUSD(); !floatEquals(got, expected, 0.000001) {
+	if got := parser.GetToolCostUSD(); !floatEquals(got, expected) {
 		t.Fatalf("tool_usage成本未优先: got=%.6f, 期望 %.6f", got, expected)
 	}
 }
@@ -540,31 +689,88 @@ func TestSSEUsageParser_StreamComplete(t *testing.T) {
 	// 测试各种流结束标志是否正确设置 streamComplete
 	// [FIX] 2026-01: 添加 response.completed 检测，修复客户端取消时费用丢失问题
 	tests := []struct {
-		name    string
-		sseData string
+		name             string
+		upstreamProtocol string
+		sseData          string
+		want             bool
 	}{
 		{
-			name:    "OpenAI Chat [DONE]",
-			sseData: "data: {\"choices\":[]}\n\ndata: [DONE]\n\n",
+			name:             "OpenAI Chat [DONE]",
+			upstreamProtocol: "openai",
+			sseData:          "data: {\"choices\":[]}\n\ndata: [DONE]\n\n",
+			want:             true,
 		},
 		{
-			name:    "Anthropic message_stop",
-			sseData: "event: message_stop\ndata: {}\n\n",
+			name:             "Anthropic message_stop event fallback",
+			upstreamProtocol: "anthropic",
+			sseData:          "event: message_stop\ndata: {}\n\n",
+			want:             true,
 		},
 		{
-			name:    "OpenAI Responses API response.completed",
-			sseData: "event: response.completed\ndata: {\"type\":\"response.completed\"}\n\n",
+			name:             "Anthropic message_stop payload without event",
+			upstreamProtocol: "anthropic",
+			sseData:          "data: {\"type\":\"message_stop\"}\n\n",
+			want:             true,
+		},
+		{
+			name:             "Anthropic mismatched payload wins",
+			upstreamProtocol: "anthropic",
+			sseData:          "event: message_stop\ndata: {\"type\":\"message_delta\"}\n\n",
+		},
+		{
+			name:             "OpenAI Responses API response.completed",
+			upstreamProtocol: "codex",
+			sseData:          "event: response.completed\ndata: {\"type\":\"response.completed\"}\n\n",
+			want:             true,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			parser := newSSEUsageParser("openai")
+			parser := newSSEUsageParser(tt.upstreamProtocol)
 			if err := parser.Feed([]byte(tt.sseData)); err != nil {
 				t.Fatalf("Feed 失败: %v", err)
 			}
-			if !parser.IsStreamComplete() {
-				t.Errorf("期望 streamComplete=true，实际为 false")
+			if got := parser.IsStreamComplete(); got != tt.want {
+				t.Fatalf("IsStreamComplete()=%v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestSSEUsageParser_ResponseCompletedRequiresCompleteMatchingEvent(t *testing.T) {
+	tests := []struct {
+		name string
+		data string
+		want bool
+	}{
+		{
+			name: "event line only",
+			data: "event: response.completed\n",
+		},
+		{
+			name: "missing data",
+			data: "event: response.completed\n\n",
+		},
+		{
+			name: "mismatched payload type",
+			data: "event: response.completed\ndata: {\"type\":\"response.failed\"}\n\n",
+		},
+		{
+			name: "complete matching event",
+			data: "event: response.completed\ndata: {\"type\":\"response.completed\"}\n\n",
+			want: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			parser := newSSEUsageParser("codex")
+			if err := parser.Feed([]byte(tt.data)); err != nil {
+				t.Fatalf("Feed failed: %v", err)
+			}
+			if got := parser.IsStreamComplete(); got != tt.want {
+				t.Fatalf("IsStreamComplete()=%v, want %v", got, tt.want)
 			}
 		})
 	}
@@ -789,6 +995,44 @@ data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"outpu
 
 	if got := parser.GetReasoningTokens(); got != 222 {
 		t.Fatalf("reasoning tokens=%d, want 222", got)
+	}
+}
+
+// NewAPI 等中间层在 message_delta.usage 里塞了一套 Claude 风格字段
+// （input_tokens/output_tokens 常为 0），真正的 OpenAI 用量在
+// usage.billing_usage.openai_usage.completion_tokens_details.reasoning_tokens。
+func TestSSEUsageParser_AnthropicBillingUsageOpenAIReasoningTokens(t *testing.T) {
+	sseData := `event: message_start
+data: {"type":"message_start","message":{"type":"message","model":"grok-4.5","usage":{"input_tokens":400,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":0,"claude_cache_creation_5_m_tokens":0,"claude_cache_creation_1_h_tokens":0},"role":"assistant","id":"6ff8d925-9e59-90e9-b929-adbf825b714a","content":[]}}
+
+event: message_delta
+data: {"type":"message_delta","usage":{"input_tokens":1984,"cache_creation_input_tokens":0,"cache_read_input_tokens":1536,"output_tokens":312,"claude_cache_creation_5_m_tokens":0,"claude_cache_creation_1_h_tokens":0,"billing_usage":{"source":"oai_chat","semantic":"openai","openai_usage":{"prompt_tokens":1984,"completion_tokens":312,"total_tokens":2296,"prompt_tokens_details":{"cached_tokens":1536,"text_tokens":0,"audio_tokens":0,"image_tokens":0},"completion_tokens_details":{"text_tokens":0,"audio_tokens":0,"image_tokens":0,"reasoning_tokens":289},"input_tokens":0,"output_tokens":0,"input_tokens_details":null,"claude_cache_creation_5_m_tokens":0,"claude_cache_creation_1_h_tokens":0}}},"delta":{"stop_reason":"end_turn"}}
+
+event: message_stop
+data: {"type":"message_stop"}
+
+`
+
+	parser := newSSEUsageParser("anthropic")
+	if err := parser.Feed([]byte(sseData)); err != nil {
+		t.Fatalf("Feed失败: %v", err)
+	}
+
+	input, output, cacheRead, cacheCreation := parser.GetUsage()
+	if input != 1984 {
+		t.Fatalf("input_tokens=%d, want 1984", input)
+	}
+	if output != 312 {
+		t.Fatalf("output_tokens=%d, want 312", output)
+	}
+	if cacheRead != 1536 {
+		t.Fatalf("cache_read_input_tokens=%d, want 1536", cacheRead)
+	}
+	if cacheCreation != 0 {
+		t.Fatalf("cache_creation_input_tokens=%d, want 0", cacheCreation)
+	}
+	if got := parser.GetReasoningTokens(); got != 289 {
+		t.Fatalf("reasoning_tokens=%d, want 289 (from billing_usage.openai_usage.completion_tokens_details)", got)
 	}
 }
 
@@ -1142,5 +1386,98 @@ func TestSSEUsageParser_SpeedInMessageUsage(t *testing.T) {
 	}
 	if parser.ServiceTier != "fast" {
 		t.Errorf("ServiceTier = %q, 期望 %q", parser.ServiceTier, "fast")
+	}
+}
+
+// TestSSEUsageParser_ResponsesMetadataDoesNotCommitStreamOutput 验证 Responses 元数据事件
+// （response.created/queued/in_progress）不设 hasStreamOutput，确保后续 error 到来时
+// deferredWriter 仍可阻止 commit 并允许切换渠道重试。语义事件仍正常标记。
+func TestSSEUsageParser_ResponsesMetadataDoesNotCommitStreamOutput(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name          string
+		payloadType   string
+		wantStreamOut bool
+		wantMetadata  bool
+	}{
+		{"response.created", "response.created", false, true},
+		{"response.queued", "response.queued", false, true},
+		{"response.in_progress", "response.in_progress", false, true},
+		{"codex.rate_limits", "codex.rate_limits", false, true},
+		{"codex.response.metadata", "codex.response.metadata", false, true},
+		{"response.output_item.added", "response.output_item.added", true, false},
+		{"response.output_text.delta", "response.output_text.delta", true, false},
+		{"response.content_part.added", "response.content_part.added", true, false},
+		{"message_start", "message_start", true, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			parser := newSSEUsageParser("codex")
+			data := `data: {"type":"` + tt.payloadType + `"}` + "\n\n"
+			if err := parser.Feed([]byte(data)); err != nil {
+				t.Fatalf("Feed failed: %v", err)
+			}
+			if parser.HasStreamOutput() != tt.wantStreamOut {
+				t.Errorf("HasStreamOutput() = %v after %q, want %v",
+					parser.HasStreamOutput(), tt.payloadType, tt.wantStreamOut)
+			}
+			if parser.HasResponsesMetadata() != tt.wantMetadata {
+				t.Errorf("HasResponsesMetadata() = %v after %q, want %v",
+					parser.HasResponsesMetadata(), tt.payloadType, tt.wantMetadata)
+			}
+		})
+	}
+}
+
+// TestSSEUsageParser_ErrorAfterMetadataAllowsRetry 验证整个序列：
+// 元数据事件 → error 事件 → hasStreamOutput 仍为 false，允许切换。
+func TestSSEUsageParser_ErrorAfterMetadataAllowsRetry(t *testing.T) {
+	t.Parallel()
+	parser := newSSEUsageParser("codex")
+
+	created := "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-1\"}}\n\n"
+	if err := parser.Feed([]byte(created)); err != nil {
+		t.Fatalf("Feed response.created: %v", err)
+	}
+	if parser.HasStreamOutput() {
+		t.Fatal("HasStreamOutput() should be false after response.created")
+	}
+	if !parser.HasResponsesMetadata() {
+		t.Fatal("HasResponsesMetadata() should be true after response.created")
+	}
+
+	errEvent := `data: {"type":"error","error":{"type":"service_unavailable_error","code":"server_is_overloaded","message":"overloaded"}}` + "\n\n"
+	if err := parser.Feed([]byte(errEvent)); err != nil {
+		t.Fatalf("Feed error: %v", err)
+	}
+	if parser.HasStreamOutput() {
+		t.Fatal("HasStreamOutput() should be false after error following metadata-only events")
+	}
+	if parser.GetLastError() == nil {
+		t.Fatal("GetLastError() should capture the error event")
+	}
+}
+
+func TestSSEUsageParser_ResponsesMetadataEventLineWithoutPayloadType(t *testing.T) {
+	t.Parallel()
+	parser := newSSEUsageParser("codex")
+	frame := "event: response.created\ndata: {\"response\":{\"id\":\"resp-1\"}}\n\n"
+	if err := parser.Feed([]byte(frame)); err != nil {
+		t.Fatalf("Feed failed: %v", err)
+	}
+	if parser.HasStreamOutput() {
+		t.Fatal("HasStreamOutput() should be false when only the SSE event line names response.created")
+	}
+	if !parser.HasResponsesMetadata() {
+		t.Fatal("HasResponsesMetadata() should be true when only the SSE event line names response.created")
+	}
+
+	delta := `data: {"type":"response.output_text.delta","delta":"partial"}` + "\n\n"
+	if err := parser.Feed([]byte(delta)); err != nil {
+		t.Fatalf("Feed delta: %v", err)
+	}
+	if !parser.HasStreamOutput() {
+		t.Fatal("HasStreamOutput() should be true after a semantic event following metadata")
 	}
 }

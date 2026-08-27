@@ -6,11 +6,15 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"time"
 
 	"ccLoad/internal/util"
 )
+
+// ErrAuthTokenNotFound distinguishes a missing token from a storage failure.
+var ErrAuthTokenNotFound = errors.New("auth token not found")
 
 // AuthToken 表示一个API访问令牌
 // 用于代理API (/v1/*) 的认证授权
@@ -43,7 +47,15 @@ type AuthToken struct {
 	// 使用微美元整数存储，避免浮点误差。JSON序列化时自动转换为USD浮点数。
 	// 1 USD = 1,000,000 微美元
 	CostUsedMicroUSD  int64 `json:"-"` // 已消耗费用（微美元）
-	CostLimitMicroUSD int64 `json:"-"` // 费用上限（微美元；0=无限制）
+	CostLimitMicroUSD int64 `json:"-"` // 总限额（微美元；0=无限制）
+
+	// 日/月限额（2026-08新增）。周期起点是服务器本地日历日/自然月 0 点的 Unix 毫秒。
+	CostDailyUsedMicroUSD    int64 `json:"-"`
+	CostDailyLimitMicroUSD   int64 `json:"-"`
+	CostDailyPeriodStart     int64 `json:"-"`
+	CostMonthlyUsedMicroUSD  int64 `json:"-"`
+	CostMonthlyLimitMicroUSD int64 `json:"-"`
+	CostMonthlyPeriodStart   int64 `json:"-"`
 
 	// RPM统计（2025-12新增，用于tokens.html显示）
 	PeakRPM   float64 `json:"peak_rpm,omitempty"`   // 峰值RPM
@@ -54,10 +66,84 @@ type AuthToken struct {
 	AllowedModels []string `json:"allowed_models,omitempty"` // 允许的模型列表，空表示无限制
 
 	// 渠道限制（2026-04新增）
-	AllowedChannelIDs []int64 `json:"allowed_channel_ids,omitempty"` // 允许的渠道ID列表，空表示无限制
+	// AllowedChannelIDs 为限制列表：空表示无限制。
+	// ChannelRestrictionMode 决定列表语义：allow=白名单，deny=黑名单。
+	AllowedChannelIDs      []int64 `json:"allowed_channel_ids,omitempty"`
+	ChannelRestrictionMode string  `json:"channel_restriction_mode,omitempty"` // allow|deny，空视为 allow
 
 	// 并发限制（2026-04新增）
 	MaxConcurrency int `json:"max_concurrency"` // 最大并发请求数，0表示无限制
+}
+
+// 渠道限制模式常量
+const (
+	ChannelRestrictionModeAllow = "allow"
+	ChannelRestrictionModeDeny  = "deny"
+)
+
+// NormalizeChannelRestrictionMode 规范化渠道限制模式。
+// 空值用于兼容未显式配置的令牌，默认 allow；其他值必须是规范的 allow 或 deny。
+func NormalizeChannelRestrictionMode(mode string) (string, error) {
+	switch mode {
+	case "", ChannelRestrictionModeAllow:
+		return ChannelRestrictionModeAllow, nil
+	case ChannelRestrictionModeDeny:
+		return ChannelRestrictionModeDeny, nil
+	default:
+		return "", fmt.Errorf(
+			"channel_restriction_mode must be %q or %q, got %q",
+			ChannelRestrictionModeAllow,
+			ChannelRestrictionModeDeny,
+			mode,
+		)
+	}
+}
+
+// ChannelRestriction 是经过校验的渠道访问策略。
+// ids 不导出，构造后只能通过 Allows 查询，避免调用方各自实现 allow/deny 极性。
+type ChannelRestriction struct {
+	deny bool
+	ids  map[int64]struct{}
+}
+
+// NewChannelRestriction 构造经过校验的渠道访问策略。
+func NewChannelRestriction(mode string, channelIDs []int64) (ChannelRestriction, error) {
+	normalizedMode, err := NormalizeChannelRestrictionMode(mode)
+	if err != nil {
+		return ChannelRestriction{}, err
+	}
+
+	ids := make(map[int64]struct{}, len(channelIDs))
+	for _, channelID := range channelIDs {
+		ids[channelID] = struct{}{}
+	}
+
+	return ChannelRestriction{
+		deny: normalizedMode == ChannelRestrictionModeDeny,
+		ids:  ids,
+	}, nil
+}
+
+// Restricted 报告该策略是否配置了渠道列表。空列表始终表示无限制。
+func (r ChannelRestriction) Restricted() bool {
+	return len(r.ids) > 0
+}
+
+// Allows 判断渠道是否符合该策略。
+func (r ChannelRestriction) Allows(channelID int64) bool {
+	if !r.Restricted() {
+		return true
+	}
+	_, listed := r.ids[channelID]
+	if r.deny {
+		return !listed
+	}
+	return listed
+}
+
+// ChannelRestriction 返回令牌的经过校验的渠道访问策略。
+func (t *AuthToken) ChannelRestriction() (ChannelRestriction, error) {
+	return NewChannelRestriction(t.ChannelRestrictionMode, t.AllowedChannelIDs)
 }
 
 // AuthTokenRangeStats 某个时间范围内的token统计（从logs表聚合，2025-12新增）
@@ -132,18 +218,19 @@ func (t *AuthToken) IsModelAllowed(model string) bool {
 	return false
 }
 
-// IsChannelAllowed 检查渠道是否被令牌允许访问
-// 如果 AllowedChannelIDs 为空，表示无限制，允许所有渠道
-func (t *AuthToken) IsChannelAllowed(channelID int64) bool {
-	if len(t.AllowedChannelIDs) == 0 {
-		return true
+// AuthTokenCostPeriodStarts 返回服务器本地日历日/自然月的周期起点（Unix 毫秒）。
+func AuthTokenCostPeriodStarts(now time.Time) (dayStartMs, monthStartMs int64) {
+	loc := now.Location()
+	dayStart := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, loc)
+	monthStart := time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, loc)
+	return dayStart.UnixMilli(), monthStart.UnixMilli()
+}
+
+func usdToLimitMicroUSD(usd float64) int64 {
+	if usd <= 0 {
+		return 0
 	}
-	for _, id := range t.AllowedChannelIDs {
-		if id == channelID {
-			return true
-		}
-	}
-	return false
+	return util.USDToMicroUSD(usd)
 }
 
 // CostUsedUSD 返回已消耗费用（美元）
@@ -151,18 +238,61 @@ func (t *AuthToken) CostUsedUSD() float64 {
 	return util.MicroUSDToUSD(t.CostUsedMicroUSD)
 }
 
-// CostLimitUSD 返回费用上限（美元）
+// CostLimitUSD 返回总限额（美元）
 func (t *AuthToken) CostLimitUSD() float64 {
 	return util.MicroUSDToUSD(t.CostLimitMicroUSD)
 }
 
-// SetCostLimitUSD 设置费用上限（从美元转换为微美元）
+// CostDailyUsedUSD 返回当日已消耗费用（美元，未按当前周期校正）
+func (t *AuthToken) CostDailyUsedUSD() float64 {
+	return util.MicroUSDToUSD(t.CostDailyUsedMicroUSD)
+}
+
+// CostDailyLimitUSD 返回日限额（美元）
+func (t *AuthToken) CostDailyLimitUSD() float64 {
+	return util.MicroUSDToUSD(t.CostDailyLimitMicroUSD)
+}
+
+// CostMonthlyUsedUSD 返回当月已消耗费用（美元，未按当前周期校正）
+func (t *AuthToken) CostMonthlyUsedUSD() float64 {
+	return util.MicroUSDToUSD(t.CostMonthlyUsedMicroUSD)
+}
+
+// CostMonthlyLimitUSD 返回月限额（美元）
+func (t *AuthToken) CostMonthlyLimitUSD() float64 {
+	return util.MicroUSDToUSD(t.CostMonthlyLimitMicroUSD)
+}
+
+// SetCostLimitUSD 设置总限额（从美元转换为微美元）
 func (t *AuthToken) SetCostLimitUSD(usd float64) {
-	if usd <= 0 {
-		t.CostLimitMicroUSD = 0
-		return
+	t.CostLimitMicroUSD = usdToLimitMicroUSD(usd)
+}
+
+// SetCostDailyLimitUSD 设置日限额（从美元转换为微美元）
+func (t *AuthToken) SetCostDailyLimitUSD(usd float64) {
+	t.CostDailyLimitMicroUSD = usdToLimitMicroUSD(usd)
+}
+
+// SetCostMonthlyLimitUSD 设置月限额（从美元转换为微美元）
+func (t *AuthToken) SetCostMonthlyLimitUSD(usd float64) {
+	t.CostMonthlyLimitMicroUSD = usdToLimitMicroUSD(usd)
+}
+
+// HasCostLimit 报告令牌是否启用了任一费用限额。
+func (t *AuthToken) HasCostLimit() bool {
+	return t.CostLimitMicroUSD > 0 || t.CostDailyLimitMicroUSD > 0 || t.CostMonthlyLimitMicroUSD > 0
+}
+
+// CurrentPeriodCostUsed 返回按当前本地日/月校正后的窗口用量；周期不一致视为 0。
+func (t *AuthToken) CurrentPeriodCostUsed(now time.Time) (dailyUsed, monthlyUsed int64) {
+	dayStart, monthStart := AuthTokenCostPeriodStarts(now)
+	if t.CostDailyPeriodStart == dayStart {
+		dailyUsed = t.CostDailyUsedMicroUSD
 	}
-	t.CostLimitMicroUSD = util.USDToMicroUSD(usd)
+	if t.CostMonthlyPeriodStart == monthStart {
+		monthlyUsed = t.CostMonthlyUsedMicroUSD
+	}
+	return dailyUsed, monthlyUsed
 }
 
 // ValidateUsageLimits enforces invariants that keep limit checks bounded.
@@ -170,10 +300,16 @@ func (t *AuthToken) ValidateUsageLimits() error {
 	if t.CostLimitMicroUSD < 0 {
 		return errors.New("cost_limit_usd must be >= 0")
 	}
+	if t.CostDailyLimitMicroUSD < 0 {
+		return errors.New("cost_daily_limit_usd must be >= 0")
+	}
+	if t.CostMonthlyLimitMicroUSD < 0 {
+		return errors.New("cost_monthly_limit_usd must be >= 0")
+	}
 	if t.MaxConcurrency < 0 {
 		return errors.New("max_concurrency must be >= 0")
 	}
-	if t.CostLimitMicroUSD > 0 && t.MaxConcurrency <= 0 {
+	if t.HasCostLimit() && t.MaxConcurrency <= 0 {
 		return errors.New("cost-limited auth token requires max_concurrency > 0")
 	}
 	return nil
@@ -202,16 +338,27 @@ type authTokenJSON struct {
 	EffectiveCostUSD         float64   `json:"effective_cost_usd"`
 	CostUsedUSD              float64   `json:"cost_used_usd"`
 	CostLimitUSD             float64   `json:"cost_limit_usd"`
+	CostDailyUsedUSD         float64   `json:"cost_daily_used_usd"`
+	CostDailyLimitUSD        float64   `json:"cost_daily_limit_usd"`
+	CostMonthlyUsedUSD       float64   `json:"cost_monthly_used_usd"`
+	CostMonthlyLimitUSD      float64   `json:"cost_monthly_limit_usd"`
 	PeakRPM                  float64   `json:"peak_rpm,omitempty"`
 	AvgRPM                   float64   `json:"avg_rpm,omitempty"`
 	RecentRPM                float64   `json:"recent_rpm,omitempty"`
 	AllowedModels            []string  `json:"allowed_models,omitempty"`
 	AllowedChannelIDs        []int64   `json:"allowed_channel_ids,omitempty"`
+	ChannelRestrictionMode   string    `json:"channel_restriction_mode,omitempty"`
 	MaxConcurrency           int       `json:"max_concurrency"`
 }
 
 // MarshalJSON 自定义JSON序列化，将MicroUSD转换为USD浮点数
 func (t AuthToken) MarshalJSON() ([]byte, error) {
+	channelRestrictionMode, err := NormalizeChannelRestrictionMode(t.ChannelRestrictionMode)
+	if err != nil {
+		return nil, err
+	}
+
+	dailyUsed, monthlyUsed := t.CurrentPeriodCostUsed(time.Now())
 	return json.Marshal(authTokenJSON{
 		ID:                       t.ID,
 		Token:                    t.Token,
@@ -234,11 +381,16 @@ func (t AuthToken) MarshalJSON() ([]byte, error) {
 		EffectiveCostUSD:         t.EffectiveCostUSD,
 		CostUsedUSD:              t.CostUsedUSD(),
 		CostLimitUSD:             t.CostLimitUSD(),
+		CostDailyUsedUSD:         util.MicroUSDToUSD(dailyUsed),
+		CostDailyLimitUSD:        t.CostDailyLimitUSD(),
+		CostMonthlyUsedUSD:       util.MicroUSDToUSD(monthlyUsed),
+		CostMonthlyLimitUSD:      t.CostMonthlyLimitUSD(),
 		PeakRPM:                  t.PeakRPM,
 		AvgRPM:                   t.AvgRPM,
 		RecentRPM:                t.RecentRPM,
 		AllowedModels:            t.AllowedModels,
 		AllowedChannelIDs:        t.AllowedChannelIDs,
+		ChannelRestrictionMode:   channelRestrictionMode,
 		MaxConcurrency:           t.MaxConcurrency,
 	})
 }

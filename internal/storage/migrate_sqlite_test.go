@@ -5,9 +5,14 @@ package storage
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
+	"strings"
 	"testing"
+	"time"
 
+	"ccLoad/internal/model"
 	"ccLoad/internal/storage/schema"
+	sqlstore "ccLoad/internal/storage/sql"
 
 	_ "modernc.org/sqlite"
 )
@@ -23,6 +28,135 @@ func openTestDB(t *testing.T) *sql.DB {
 	return db
 }
 
+func TestMigrate_SQLite_AddsProtocolTransformModeWithAutoDefault(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+	if _, err := db.ExecContext(ctx, `
+		CREATE TABLE channels (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			name TEXT NOT NULL UNIQUE,
+			url TEXT NOT NULL,
+			priority INTEGER NOT NULL DEFAULT 0,
+			channel_type TEXT NOT NULL DEFAULT 'anthropic',
+			enabled INTEGER NOT NULL DEFAULT 1,
+			cooldown_until INTEGER NOT NULL DEFAULT 0,
+			cooldown_duration_ms INTEGER NOT NULL DEFAULT 0,
+			created_at INTEGER NOT NULL,
+			updated_at INTEGER NOT NULL
+		);
+		INSERT INTO channels(name, url, channel_type, created_at, updated_at)
+		VALUES('legacy', 'https://example.com
+https://example.com/v1/messages#', 'codex', 1, 1)
+	`); err != nil {
+		t.Fatalf("create legacy channels: %v", err)
+	}
+
+	if err := migrate(ctx, db, DialectSQLite); err != nil {
+		t.Fatalf("migrate legacy channels: %v", err)
+	}
+	columns, err := sqliteExistingColumns(ctx, db, "channels")
+	if err != nil {
+		t.Fatalf("list channels columns: %v", err)
+	}
+	if !columns["protocol_transform_mode"] {
+		t.Fatalf("channels missing protocol_transform_mode: %v", columns)
+	}
+	if !columns["auth_type"] || !columns["oauth_credential"] {
+		t.Fatalf("channels missing Codex auth columns: %v", columns)
+	}
+	var mode string
+	if err := db.QueryRowContext(ctx, "SELECT protocol_transform_mode FROM channels WHERE name='legacy'").Scan(&mode); err != nil {
+		t.Fatalf("read migrated mode: %v", err)
+	}
+	if mode != "auto" {
+		t.Fatalf("migrated mode=%q, want auto", mode)
+	}
+	var channelID int64
+	var legacyChannelType, authType string
+	var credential sql.NullString
+	if err := db.QueryRowContext(ctx, "SELECT id, channel_type, auth_type, oauth_credential FROM channels WHERE name='legacy'").Scan(&channelID, &legacyChannelType, &authType, &credential); err != nil {
+		t.Fatalf("read migrated auth fields: %v", err)
+	}
+	if legacyChannelType != "codex" {
+		t.Fatalf("migration changed historical channel_type=%q, want codex", legacyChannelType)
+	}
+	if authType != model.AuthTypeAPIKey || credential.Valid {
+		t.Fatalf("migrated auth fields=(%q, %v), want (%q, NULL)", authType, credential, model.AuthTypeAPIKey)
+	}
+	store := sqlstore.NewSQLStore(db, "sqlite")
+	loaded, err := store.GetConfig(ctx, channelID)
+	if err != nil {
+		t.Fatalf("load migrated channel through store: %v", err)
+	}
+	if loaded.OAuthCredential != "" {
+		t.Fatalf("store OAuthCredential=%q, want empty", loaded.OAuthCredential)
+	}
+	var rawURLs string
+	if err := db.QueryRowContext(ctx, "SELECT url FROM channels WHERE name='legacy'").Scan(&rawURLs); err != nil {
+		t.Fatalf("read migrated URLs: %v", err)
+	}
+	var urls model.ChannelURLs
+	if err := json.Unmarshal([]byte(rawURLs), &urls); err != nil {
+		t.Fatalf("migrated URLs are not structured JSON: %v (%q)", err, rawURLs)
+	}
+	if len(urls) != 2 || urls[0].URL != "https://example.com" || urls[0].Exact ||
+		urls[1].URL != "https://example.com/v1/messages" || !urls[1].Exact {
+		t.Fatalf("migrated URLs=%+v", urls)
+	}
+	if err := migrate(ctx, db, DialectSQLite); err != nil {
+		t.Fatalf("second migrate must be idempotent: %v", err)
+	}
+}
+
+func TestMigrate_SQLite_RenamesLegacyCodexCredentialToOAuthCredential(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+	if _, err := db.ExecContext(ctx, `
+		CREATE TABLE channels (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			name TEXT NOT NULL UNIQUE,
+			url TEXT NOT NULL,
+			priority INTEGER NOT NULL DEFAULT 0,
+			channel_type TEXT NOT NULL DEFAULT 'anthropic',
+			auth_type TEXT NOT NULL DEFAULT 'api_key',
+			codex_credential TEXT NOT NULL DEFAULT '',
+			enabled INTEGER NOT NULL DEFAULT 1,
+			cooldown_until INTEGER NOT NULL DEFAULT 0,
+			cooldown_duration_ms INTEGER NOT NULL DEFAULT 0,
+			created_at INTEGER NOT NULL,
+			updated_at INTEGER NOT NULL
+		);
+		INSERT INTO channels(name, url, auth_type, codex_credential, created_at, updated_at)
+		VALUES('codex-user', 'https://example.com', 'codex_oauth', '{"access_token":"at-secret"}', 1, 1)
+	`); err != nil {
+		t.Fatalf("create legacy Codex channel: %v", err)
+	}
+
+	if err := migrate(ctx, db, DialectSQLite); err != nil {
+		t.Fatalf("migrate legacy Codex channel: %v", err)
+	}
+	var authType, credential string
+	if err := db.QueryRowContext(ctx,
+		"SELECT auth_type, oauth_credential FROM channels WHERE name='codex-user'",
+	).Scan(&authType, &credential); err != nil {
+		t.Fatalf("read migrated OAuth credential: %v", err)
+	}
+	if authType != model.AuthTypeCodexOAuth || credential != `{"access_token":"at-secret"}` {
+		t.Fatalf("migrated auth=(%q, %q)", authType, credential)
+	}
+	columns, err := sqliteExistingColumns(ctx, db, "channels")
+	if err != nil {
+		t.Fatalf("list migrated channel columns: %v", err)
+	}
+	if columns["codex_credential"] || !columns["oauth_credential"] {
+		t.Fatalf("credential column was not renamed: %v", columns)
+	}
+
+	if err := migrate(ctx, db, DialectSQLite); err != nil {
+		t.Fatalf("second migrate: %v", err)
+	}
+}
+
 func TestMigrate_SQLite_FullFlow(t *testing.T) {
 	db := openTestDB(t)
 	ctx := context.Background()
@@ -34,7 +168,7 @@ func TestMigrate_SQLite_FullFlow(t *testing.T) {
 
 	// 验证核心表存在
 	tables := []string{"channels", "api_keys", "channel_models", "auth_tokens",
-		"system_settings", "admin_sessions", "logs", "schema_migrations"}
+		"system_settings", "web_sessions", "logs", "schema_migrations"}
 	for _, tbl := range tables {
 		var name string
 		err := db.QueryRowContext(ctx,
@@ -64,19 +198,484 @@ func TestMigrate_SQLite_FullFlow(t *testing.T) {
 	if val != "7" {
 		t.Errorf("log_retention_days=%q, want %q", val, "7")
 	}
+
+	var valueType, defaultValue string
+	if err := db.QueryRowContext(ctx, `
+		SELECT value, value_type, default_value
+		FROM system_settings
+		WHERE key = 'global_cooldown_detection_rules'
+	`).Scan(&val, &valueType, &defaultValue); err != nil {
+		t.Fatalf("get global_cooldown_detection_rules: %v", err)
+	}
+	if val != "{}" || valueType != "json" || defaultValue != "{}" {
+		t.Fatalf("global_cooldown_detection_rules=%q/%q/%q, want {}/json/{}", val, valueType, defaultValue)
+	}
 }
 
-func TestMigrate_SQLite_Idempotent(t *testing.T) {
+func TestMigrate_SQLite_AntigravitySensitiveWordsDefault(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+	const wantDefault = `["API","proxy","Claude","Anthropic"]`
+
+	if err := migrate(ctx, db, DialectSQLite); err != nil {
+		t.Fatalf("migrate new database: %v", err)
+	}
+
+	assertSetting := func(wantValue, wantDefaultValue string) {
+		t.Helper()
+		var value, defaultValue string
+		if err := db.QueryRowContext(ctx, `
+			SELECT value, default_value
+			FROM system_settings
+			WHERE key = 'antigravity_sensitive_words'
+		`).Scan(&value, &defaultValue); err != nil {
+			t.Fatalf("query antigravity_sensitive_words: %v", err)
+		}
+		if value != wantValue || defaultValue != wantDefaultValue {
+			t.Fatalf("antigravity_sensitive_words value/default=%q/%q, want %q/%q", value, defaultValue, wantValue, wantDefaultValue)
+		}
+	}
+
+	assertSetting(wantDefault, wantDefault)
+
+	if _, err := db.ExecContext(ctx, `
+		UPDATE system_settings
+		SET value = '[]', default_value = '[]'
+		WHERE key = 'antigravity_sensitive_words'
+	`); err != nil {
+		t.Fatalf("restore legacy default: %v", err)
+	}
+	if err := migrate(ctx, db, DialectSQLite); err != nil {
+		t.Fatalf("migrate legacy default: %v", err)
+	}
+	assertSetting(wantDefault, wantDefault)
+
+	const previousDefault = `["API","proxy"]`
+	if _, err := db.ExecContext(ctx, `
+		UPDATE system_settings
+		SET value = ?, default_value = ?
+		WHERE key = 'antigravity_sensitive_words'
+	`, previousDefault, previousDefault); err != nil {
+		t.Fatalf("restore previous default: %v", err)
+	}
+	if err := migrate(ctx, db, DialectSQLite); err != nil {
+		t.Fatalf("migrate previous default: %v", err)
+	}
+	assertSetting(wantDefault, wantDefault)
+
+	const customValue = `["custom"]`
+	if _, err := db.ExecContext(ctx, `
+		UPDATE system_settings
+		SET value = ?, default_value = ?
+		WHERE key = 'antigravity_sensitive_words'
+	`, customValue, previousDefault); err != nil {
+		t.Fatalf("set custom value: %v", err)
+	}
+	if err := migrate(ctx, db, DialectSQLite); err != nil {
+		t.Fatalf("refresh custom value metadata: %v", err)
+	}
+	assertSetting(customValue, wantDefault)
+}
+
+func TestMigrateSQLite_BackfillsClientProtocolFromHistoricalModels(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+	if err := migrate(ctx, db, DialectSQLite); err != nil {
+		t.Fatalf("initial migrate: %v", err)
+	}
+	verifyClientProtocolBackfill(t, ctx, db, DialectSQLite, func(ctx context.Context, db *sql.DB) error {
+		return migrate(ctx, db, DialectSQLite)
+	})
+}
+
+func TestBackfillLogsClientProtocolBatches_ProcessesAllRowsAcrossBatches(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+	if err := migrate(ctx, db, DialectSQLite); err != nil {
+		t.Fatalf("initial migrate: %v", err)
+	}
+
+	const rowCount = 5
+	for i := 1; i <= rowCount; i++ {
+		if _, err := db.ExecContext(ctx, `
+			INSERT INTO logs (time, model, log_source, status_code, message)
+			VALUES (?, 'claude-sonnet-5', 'proxy', 200, 'ok')
+		`, i); err != nil {
+			t.Fatalf("insert log %d: %v", i, err)
+		}
+	}
+
+	// batchSize=2 强制多批循环，验证批间推进直到清零
+	if err := backfillLogsClientProtocolBatches(ctx, db, DialectSQLite, 2); err != nil {
+		t.Fatalf("backfill batches: %v", err)
+	}
+
+	var filled int
+	if err := db.QueryRowContext(ctx,
+		"SELECT COUNT(*) FROM logs WHERE log_source = 'proxy' AND client_protocol = 'anthropic'",
+	).Scan(&filled); err != nil {
+		t.Fatalf("count filled rows: %v", err)
+	}
+	if filled != rowCount {
+		t.Fatalf("filled rows = %d, want %d", filled, rowCount)
+	}
+}
+
+func verifyClientProtocolBackfill(
+	t *testing.T,
+	ctx context.Context,
+	db *sql.DB,
+	dialect Dialect,
+	migrateDB func(context.Context, *sql.DB) error,
+) {
+	t.Helper()
+	testCases := []struct {
+		time           int64
+		model          string
+		logSource      string
+		clientProtocol string
+		wantProtocol   string
+	}{
+		{1, "gpt-5.6-sol", "proxy", "", "codex"},
+		{2, "OpenAI/GPT-5.4", "proxy", "", "codex"},
+		{3, "codex-mini-latest", "proxy", "", "codex"},
+		{4, "claude-sonnet-5", "proxy", "", "anthropic"},
+		{5, "anthropic/opus-4-8", "proxy", "", "anthropic"},
+		{6, "google/gemini-3.6-flash", "proxy", "", "gemini"},
+		{7, "grok-4.5", "proxy", "", "openai"},
+		{8, "", "proxy", "", "openai"},
+		{9, "gpt-5.6-sol", "scheduled_check", "", ""},
+		{10, "gpt-5.6-sol", "proxy", "gemini", "gemini"},
+	}
+	for _, tc := range testCases {
+		if _, err := db.ExecContext(ctx, rebindIfPostgres(dialect, `
+			INSERT INTO logs (time, model, log_source, client_protocol, status_code, message)
+			VALUES (?, ?, ?, ?, 200, 'ok')
+		`), tc.time, tc.model, tc.logSource, tc.clientProtocol); err != nil {
+			t.Fatalf("insert log time=%d: %v", tc.time, err)
+		}
+	}
+	if _, err := db.ExecContext(ctx, rebindIfPostgres(dialect, "DELETE FROM schema_migrations WHERE version = ?"), clientProtocolBackfillMigrationVersion); err != nil {
+		t.Fatalf("reset client protocol migration: %v", err)
+	}
+
+	if err := migrateDB(ctx, db); err != nil {
+		t.Fatalf("backfill client protocol: %v", err)
+	}
+	for _, tc := range testCases {
+		var got string
+		if err := db.QueryRowContext(ctx, rebindIfPostgres(dialect, "SELECT client_protocol FROM logs WHERE time = ?"), tc.time).Scan(&got); err != nil {
+			t.Fatalf("query log time=%d: %v", tc.time, err)
+		}
+		if got != tc.wantProtocol {
+			t.Errorf("model=%q source=%q protocol=%q, want %q", tc.model, tc.logSource, got, tc.wantProtocol)
+		}
+	}
+	if _, err := db.ExecContext(ctx, rebindIfPostgres(dialect, `
+		INSERT INTO logs (time, model, log_source, status_code, message)
+		VALUES (11, 'gpt-5.6-terra', 'proxy', 200, 'after migration')
+	`)); err != nil {
+		t.Fatalf("insert post-migration log: %v", err)
+	}
+	if err := migrateDB(ctx, db); err != nil {
+		t.Fatalf("idempotent migrate: %v", err)
+	}
+	var postMigrationProtocol string
+	if err := db.QueryRowContext(ctx, "SELECT client_protocol FROM logs WHERE time = 11").Scan(&postMigrationProtocol); err != nil {
+		t.Fatalf("query post-migration log: %v", err)
+	}
+	if postMigrationProtocol != "" {
+		t.Fatalf("post-migration protocol=%q, want empty", postMigrationProtocol)
+	}
+}
+
+func TestMigrate_SQLite_AddsModelCooldownDuration(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+	if err := migrate(ctx, db, DialectSQLite); err != nil {
+		t.Fatalf("initial migrate: %v", err)
+	}
+
+	if _, err := db.ExecContext(ctx, "DROP TABLE channel_model_cooldowns"); err != nil {
+		t.Fatalf("drop current model cooldown table: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, `
+		CREATE TABLE channel_model_cooldowns (
+			channel_id INTEGER NOT NULL,
+			model TEXT NOT NULL,
+			cooldown_until INTEGER NOT NULL,
+			updated_at INTEGER NOT NULL,
+			PRIMARY KEY (channel_id, model),
+			FOREIGN KEY (channel_id) REFERENCES channels(id) ON DELETE CASCADE
+		)
+	`); err != nil {
+		t.Fatalf("create legacy model cooldown table: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, `
+		INSERT INTO channels (name, url, oauth_credential, created_at, updated_at)
+		VALUES ('legacy-model-cooldown', 'https://api.example.com', '', 700, 700)
+	`); err != nil {
+		t.Fatalf("create legacy cooldown channel: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, `
+		INSERT INTO channel_model_cooldowns (channel_id, model, cooldown_until, updated_at)
+		VALUES (1, 'legacy-model', 1000, 700)
+	`); err != nil {
+		t.Fatalf("insert legacy model cooldown: %v", err)
+	}
+
+	if err := migrate(ctx, db, DialectSQLite); err != nil {
+		t.Fatalf("upgrade migrate: %v", err)
+	}
+
+	columns, err := sqliteExistingColumns(ctx, db, "channel_model_cooldowns")
+	if err != nil {
+		t.Fatalf("read model cooldown columns: %v", err)
+	}
+	if !columns["cooldown_duration_ms"] {
+		t.Fatal("channel_model_cooldowns.cooldown_duration_ms was not migrated")
+	}
+
+	var durationMs int64
+	if err := db.QueryRowContext(ctx, `
+		SELECT cooldown_duration_ms
+		FROM channel_model_cooldowns
+		WHERE channel_id = 1 AND model = 'legacy-model'
+	`).Scan(&durationMs); err != nil {
+		t.Fatalf("read migrated model cooldown duration: %v", err)
+	}
+	if durationMs != int64(5*time.Minute/time.Millisecond) {
+		t.Fatalf("migrated model cooldown duration=%dms, want %dms", durationMs, 5*time.Minute/time.Millisecond)
+	}
+}
+
+func TestMigrate_SQLite_RebuildsOnlyDebugLogsForProtocolPayloads(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+	if err := migrate(ctx, db, DialectSQLite); err != nil {
+		t.Fatalf("initial migrate: %v", err)
+	}
+
+	result, err := db.ExecContext(ctx, "INSERT INTO logs (time, status_code, message) VALUES (1, 200, 'keep me')")
+	if err != nil {
+		t.Fatalf("insert ordinary log: %v", err)
+	}
+	logID, err := result.LastInsertId()
+	if err != nil {
+		t.Fatalf("ordinary log id: %v", err)
+	}
+
+	if _, err := db.ExecContext(ctx, "DELETE FROM schema_migrations WHERE version = ?", debugLogsProtocolPayloadsVersion); err != nil {
+		t.Fatalf("reset protocol payload migration: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, "DROP TABLE debug_logs"); err != nil {
+		t.Fatalf("drop current debug_logs: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, `
+		CREATE TABLE debug_logs (
+			log_id INTEGER PRIMARY KEY,
+			created_at INTEGER NOT NULL,
+			req_method TEXT NOT NULL DEFAULT '',
+			req_url TEXT NOT NULL,
+			req_headers TEXT NOT NULL,
+			req_body BLOB NOT NULL,
+			resp_status INTEGER NOT NULL DEFAULT 0,
+			resp_headers TEXT NOT NULL,
+			resp_body BLOB
+		)`); err != nil {
+		t.Fatalf("create pre-protocol debug_logs: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, `
+		INSERT INTO debug_logs (log_id, created_at, req_method, req_url, req_headers, req_body, resp_status, resp_headers, resp_body)
+		VALUES (?, 1, 'POST', '/v1/messages', '{}', '{}', 200, '{}', '{}')`, logID); err != nil {
+		t.Fatalf("insert old debug log: %v", err)
+	}
+
+	if err := migrate(ctx, db, DialectSQLite); err != nil {
+		t.Fatalf("upgrade migrate: %v", err)
+	}
+
+	var ordinaryLogCount int
+	if err := db.QueryRowContext(ctx, "SELECT COUNT(*) FROM logs WHERE id = ?", logID).Scan(&ordinaryLogCount); err != nil {
+		t.Fatalf("count ordinary logs: %v", err)
+	}
+	if ordinaryLogCount != 1 {
+		t.Fatalf("ordinary logs changed during debug migration: count=%d", ordinaryLogCount)
+	}
+	var debugLogCount int
+	if err := db.QueryRowContext(ctx, "SELECT COUNT(*) FROM debug_logs").Scan(&debugLogCount); err != nil {
+		t.Fatalf("count rebuilt debug logs: %v", err)
+	}
+	if debugLogCount != 0 {
+		t.Fatalf("rebuilt debug_logs should discard short-lived rows, count=%d", debugLogCount)
+	}
+	columns, err := sqliteExistingColumns(ctx, db, "debug_logs")
+	if err != nil {
+		t.Fatalf("list rebuilt debug columns: %v", err)
+	}
+	for _, column := range []string{
+		"upstream_error",
+		"protocol_transformed", "original_req_url", "original_req_headers", "original_req_body",
+		"translated_resp_status", "translated_resp_headers", "translated_resp_body",
+	} {
+		if !columns[column] {
+			t.Fatalf("rebuilt debug_logs missing column %q: %v", column, columns)
+		}
+	}
+}
+
+func TestMigrate_SQLite_AddsDebugProtocolMetadataWithoutDroppingRows(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+	if err := migrate(ctx, db, DialectSQLite); err != nil {
+		t.Fatalf("initial migrate: %v", err)
+	}
+
+	if _, err := db.ExecContext(ctx, "DROP TABLE debug_logs"); err != nil {
+		t.Fatalf("drop current debug_logs: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, `
+		CREATE TABLE debug_logs (
+			log_id INTEGER PRIMARY KEY,
+			created_at INTEGER NOT NULL,
+			req_method TEXT NOT NULL DEFAULT '',
+			req_url TEXT NOT NULL,
+			req_headers TEXT NOT NULL,
+			req_body BLOB NOT NULL,
+			resp_status INTEGER NOT NULL DEFAULT 0,
+			resp_headers TEXT NOT NULL,
+			resp_body BLOB,
+			protocol_transformed INTEGER NOT NULL DEFAULT 0,
+			original_req_body BLOB,
+			translated_resp_body BLOB
+		)`); err != nil {
+		t.Fatalf("create v3 debug_logs: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, `
+		INSERT INTO debug_logs (
+			log_id, created_at, req_method, req_url, req_headers, req_body,
+			resp_status, resp_headers, resp_body, protocol_transformed,
+			original_req_body, translated_resp_body
+		) VALUES (42, 1, 'POST', '/upstream', '{}', '{}', 200, '{}', '{}', 1, '{}', '{}')`); err != nil {
+		t.Fatalf("insert v3 debug log: %v", err)
+	}
+
+	if err := migrate(ctx, db, DialectSQLite); err != nil {
+		t.Fatalf("upgrade migrate: %v", err)
+	}
+
+	var count int
+	if err := db.QueryRowContext(ctx, "SELECT COUNT(*) FROM debug_logs WHERE log_id = 42").Scan(&count); err != nil {
+		t.Fatalf("count preserved debug row: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("debug row count=%d, want 1", count)
+	}
+	columns, err := sqliteExistingColumns(ctx, db, "debug_logs")
+	if err != nil {
+		t.Fatalf("list debug columns: %v", err)
+	}
+	for _, column := range []string{"upstream_error", "original_req_url", "original_req_headers", "translated_resp_status", "translated_resp_headers"} {
+		if !columns[column] {
+			t.Fatalf("debug_logs missing column %q: %v", column, columns)
+		}
+	}
+}
+
+func TestMigrateSQLite_SeedsModelCatalogSyncIntervalSetting(t *testing.T) {
 	db := openTestDB(t)
 	ctx := context.Background()
 
-	// 迁移两次应该不报错
 	if err := migrate(ctx, db, DialectSQLite); err != nil {
-		t.Fatalf("first migrate: %v", err)
+		t.Fatalf("migrate failed: %v", err)
 	}
-	if err := migrate(ctx, db, DialectSQLite); err != nil {
-		t.Fatalf("second migrate: %v", err)
+
+	var value, valueType, defaultValue string
+	if err := db.QueryRowContext(ctx, `
+		SELECT value, value_type, default_value
+		FROM system_settings
+		WHERE "key" = ?
+	`, "model_catalog_sync_interval_hours").Scan(&value, &valueType, &defaultValue); err != nil {
+		t.Fatalf("get model_catalog_sync_interval_hours: %v", err)
 	}
+	if value != "6" || valueType != "float" || defaultValue != "6" {
+		t.Fatalf("setting = value:%q type:%q default:%q, want value:6 type:float default:6", value, valueType, defaultValue)
+	}
+}
+
+func TestMigrateSQLiteLeavesRemovedFingerprintTablesAlone(t *testing.T) {
+	t.Run("fresh database", func(t *testing.T) {
+		db := openTestDB(t)
+		ctx := context.Background()
+		if err := migrate(ctx, db, DialectSQLite); err != nil {
+			t.Fatalf("migrate fresh database: %v", err)
+		}
+
+		for _, table := range []string{"model_fingerprints", "fingerprint_test_results"} {
+			var count int
+			if err := db.QueryRowContext(ctx,
+				"SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?", table,
+			).Scan(&count); err != nil {
+				t.Fatalf("check fresh table %s: %v", table, err)
+			}
+			if count != 0 {
+				t.Fatalf("fresh migration created removed table %s", table)
+			}
+		}
+	})
+
+	t.Run("legacy database", func(t *testing.T) {
+		db := openTestDB(t)
+		ctx := context.Background()
+		if _, err := db.ExecContext(ctx, `
+			CREATE TABLE model_fingerprints (id INTEGER PRIMARY KEY, payload TEXT NOT NULL);
+			CREATE UNIQUE INDEX legacy_model_fingerprints_payload ON model_fingerprints(payload);
+			CREATE TRIGGER preserve_model_fingerprints
+				BEFORE UPDATE ON model_fingerprints
+				BEGIN SELECT RAISE(ABORT, 'model_fingerprints must not be modified'); END;
+			CREATE TABLE fingerprint_test_results (id INTEGER PRIMARY KEY, payload TEXT NOT NULL);
+			CREATE UNIQUE INDEX legacy_fingerprint_test_results_payload ON fingerprint_test_results(payload);
+			CREATE TRIGGER preserve_fingerprint_test_results
+				BEFORE UPDATE ON fingerprint_test_results
+				BEGIN SELECT RAISE(ABORT, 'fingerprint_test_results must not be modified'); END;
+			INSERT INTO model_fingerprints (id, payload) VALUES (1, 'baseline');
+			INSERT INTO fingerprint_test_results (id, payload) VALUES (1, 'result');
+		`); err != nil {
+			t.Fatalf("create legacy fingerprint tables: %v", err)
+		}
+		if err := migrate(ctx, db, DialectSQLite); err != nil {
+			t.Fatalf("first migration of legacy database: %v", err)
+		}
+
+		for table, want := range map[string]string{
+			"model_fingerprints":       "baseline",
+			"fingerprint_test_results": "result",
+		} {
+			var columnCount int
+			if err := db.QueryRowContext(ctx, "SELECT COUNT(*) FROM pragma_table_info(?)", table).Scan(&columnCount); err != nil {
+				t.Fatalf("inspect preserved table %s: %v", table, err)
+			}
+			if columnCount != 2 {
+				t.Fatalf("preserved table %s columns=%d, want 2", table, columnCount)
+			}
+			var objectCount int
+			if err := db.QueryRowContext(ctx,
+				"SELECT COUNT(*) FROM sqlite_master WHERE tbl_name = ? AND type IN ('table', 'index', 'trigger')", table,
+			).Scan(&objectCount); err != nil {
+				t.Fatalf("inspect preserved objects for %s: %v", table, err)
+			}
+			if objectCount != 3 {
+				t.Fatalf("preserved table %s objects=%d, want table, index and trigger", table, objectCount)
+			}
+			var payload string
+			if err := db.QueryRowContext(ctx, "SELECT payload FROM "+table+" WHERE id = 1").Scan(&payload); err != nil {
+				t.Fatalf("read preserved table %s: %v", table, err)
+			}
+			if payload != want {
+				t.Fatalf("preserved table %s payload=%q, want %q", table, payload, want)
+			}
+		}
+	})
 }
 
 func TestMigrate_SQLite_FailsOnInvalidAllowedModelsJSON(t *testing.T) {
@@ -131,6 +730,26 @@ func TestEnsureChannelsDailyCostLimit_SQLite(t *testing.T) {
 	}
 }
 
+func TestEnsureChannelsCooldownDetectionRules_SQLite(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+
+	if err := migrate(ctx, db, DialectSQLite); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	if err := ensureChannelsCooldownDetectionRules(ctx, db, DialectSQLite); err != nil {
+		t.Fatalf("ensureChannelsCooldownDetectionRules: %v", err)
+	}
+
+	cols, err := sqliteExistingColumns(ctx, db, "channels")
+	if err != nil {
+		t.Fatalf("sqliteExistingColumns: %v", err)
+	}
+	if !cols["cooldown_detection_rules"] {
+		t.Fatal("cooldown_detection_rules column not found in channels")
+	}
+}
+
 func TestEnsureAuthTokensAllowedModels_SQLite(t *testing.T) {
 	db := openTestDB(t)
 	ctx := context.Background()
@@ -163,12 +782,19 @@ func TestEnsureAuthTokensCostLimit_SQLite(t *testing.T) {
 	if err := ensureAuthTokensCostLimit(ctx, db, DialectSQLite); err != nil {
 		t.Fatalf("ensureAuthTokensCostLimit: %v", err)
 	}
+	if err := ensureAuthTokensPeriodCostLimits(ctx, db, DialectSQLite); err != nil {
+		t.Fatalf("ensureAuthTokensPeriodCostLimits: %v", err)
+	}
 
 	cols, err := sqliteExistingColumns(ctx, db, "auth_tokens")
 	if err != nil {
 		t.Fatalf("sqliteExistingColumns: %v", err)
 	}
-	for _, col := range []string{"cost_used_microusd", "cost_limit_microusd"} {
+	for _, col := range []string{
+		"cost_used_microusd", "cost_limit_microusd",
+		"cost_daily_used_microusd", "cost_daily_limit_microusd", "cost_daily_period_start",
+		"cost_monthly_used_microusd", "cost_monthly_limit_microusd", "cost_monthly_period_start",
+	} {
 		if !cols[col] {
 			t.Errorf("column %s not found in auth_tokens", col)
 		}
@@ -239,6 +865,19 @@ func TestMigrateSQLite_LegacyCostLimitedAuthTokenGetsDefaultMaxConcurrency(t *te
 	}
 	if unlimitedMaxConcurrency != 0 {
 		t.Fatalf("unlimited max_concurrency=%d, want 0", unlimitedMaxConcurrency)
+	}
+
+	cols, err := sqliteExistingColumns(ctx, db, "auth_tokens")
+	if err != nil {
+		t.Fatalf("sqliteExistingColumns: %v", err)
+	}
+	for _, col := range []string{
+		"cost_daily_used_microusd", "cost_daily_limit_microusd", "cost_daily_period_start",
+		"cost_monthly_used_microusd", "cost_monthly_limit_microusd", "cost_monthly_period_start",
+	} {
+		if !cols[col] {
+			t.Errorf("legacy migrate missing column %s", col)
+		}
 	}
 }
 
@@ -341,6 +980,23 @@ func TestMigrateSQLite_BackfillsAuthTokenEffectiveCostFromLegacyLogs(t *testing.
 	if !cols["cost_multiplier"] {
 		t.Fatal("cost_multiplier column not found in logs")
 	}
+	if !cols["upstream_websocket"] {
+		t.Fatal("upstream_websocket column not found in logs")
+	}
+	if !cols["client_protocol"] {
+		t.Fatal("client_protocol column not found in logs")
+	}
+	var upstreamWebsocket int
+	var clientProtocol string
+	if err := db.QueryRowContext(ctx, `SELECT upstream_websocket, client_protocol FROM logs WHERE time = 60000`).Scan(&upstreamWebsocket, &clientProtocol); err != nil {
+		t.Fatalf("query legacy upstream_websocket: %v", err)
+	}
+	if upstreamWebsocket != 0 {
+		t.Fatalf("legacy upstream_websocket=%d, want 0", upstreamWebsocket)
+	}
+	if clientProtocol != "openai" {
+		t.Fatalf("legacy client_protocol=%q, want openai", clientProtocol)
+	}
 
 	var effectiveCost float64
 	if err := db.QueryRowContext(ctx, `
@@ -375,17 +1031,46 @@ func TestEnsureChannelModelsRedirectField_SQLite(t *testing.T) {
 	}
 }
 
-func TestRelaxDeprecatedChannelFields_SQLite(t *testing.T) {
+func TestMigrateSQLite_AddsChannelModelsDisabled(t *testing.T) {
 	db := openTestDB(t)
 	ctx := context.Background()
 
-	if err := migrate(ctx, db, DialectSQLite); err != nil {
-		t.Fatalf("migrate: %v", err)
+	if _, err := db.ExecContext(ctx, `
+		CREATE TABLE channel_models (
+			channel_id INTEGER NOT NULL,
+			model TEXT NOT NULL,
+			redirect_model TEXT NOT NULL DEFAULT '',
+			created_at INTEGER NOT NULL DEFAULT 0,
+			PRIMARY KEY (channel_id, model)
+		)
+	`); err != nil {
+		t.Fatalf("create legacy channel_models: %v", err)
 	}
 
-	// SQLite 不需要实际操作，应该直接返回 nil
-	if err := relaxDeprecatedChannelFields(ctx, db, DialectSQLite); err != nil {
-		t.Fatalf("relaxDeprecatedChannelFields: %v", err)
+	if err := migrate(ctx, db, DialectSQLite); err != nil {
+		t.Fatalf("migrate legacy channel_models: %v", err)
+	}
+
+	cols, err := sqliteExistingColumns(ctx, db, "channel_models")
+	if err != nil {
+		t.Fatalf("sqliteExistingColumns: %v", err)
+	}
+	if !cols["disabled"] {
+		t.Fatal("disabled column not added to legacy channel_models")
+	}
+
+	if _, err := db.ExecContext(ctx, `
+		INSERT INTO channel_models (channel_id, model, redirect_model, created_at)
+		VALUES (1, 'legacy-model', '', 1)
+	`); err != nil {
+		t.Fatalf("insert legacy-shaped model: %v", err)
+	}
+	var disabled int
+	if err := db.QueryRowContext(ctx, `SELECT disabled FROM channel_models WHERE model = 'legacy-model'`).Scan(&disabled); err != nil {
+		t.Fatalf("query migrated disabled default: %v", err)
+	}
+	if disabled != 0 {
+		t.Fatalf("legacy model disabled=%d, want 0", disabled)
 	}
 }
 
@@ -417,20 +1102,6 @@ func TestNeedChannelModelsMigration_SQLite(t *testing.T) {
 	}
 }
 
-func TestMigrateModelRedirectsData_SQLite(t *testing.T) {
-	db := openTestDB(t)
-	ctx := context.Background()
-
-	if err := migrate(ctx, db, DialectSQLite); err != nil {
-		t.Fatalf("migrate: %v", err)
-	}
-
-	// 对于新数据库（没有旧 models 列），迁移应直接返回
-	if err := migrateModelRedirectsData(ctx, db, DialectSQLite); err != nil {
-		t.Fatalf("migrateModelRedirectsData: %v", err)
-	}
-}
-
 func TestMigrateModelRedirectsData_WithLegacyData(t *testing.T) {
 	db := openTestDB(t)
 	ctx := context.Background()
@@ -451,8 +1122,8 @@ func TestMigrateModelRedirectsData_WithLegacyData(t *testing.T) {
 
 	// 插入带旧格式数据的渠道
 	_, err = db.ExecContext(ctx, `
-		INSERT INTO channels (name, channel_type, url, priority, enabled, models, model_redirects, created_at, updated_at)
-		VALUES ('test-ch', 'openai', 'https://api.example.com', 10, 1, '["gpt-4o","gpt-3.5-turbo"]', '{"gpt-3.5-turbo":"gpt-4o-mini"}', unixepoch(), unixepoch())
+		INSERT INTO channels (name, url, priority, enabled, oauth_credential, models, model_redirects, created_at, updated_at)
+		VALUES ('test-ch', 'https://api.example.com', 10, 1, '', '["gpt-4o","gpt-3.5-turbo"]', '{"gpt-3.5-turbo":"gpt-4o-mini"}', unixepoch(), unixepoch())
 	`)
 	if err != nil {
 		t.Fatalf("insert channel: %v", err)
@@ -552,8 +1223,8 @@ func TestRepairLegacyChannelModelOrder_SQLite(t *testing.T) {
 	}
 
 	_, err = db.ExecContext(ctx, `
-		INSERT INTO channels (id, name, channel_type, url, priority, enabled, models, model_redirects, created_at, updated_at)
-		VALUES (1, 'repair-order', 'openai', 'https://api.example.com', 10, 1, '["z-model","a-model"]', '{}', 100, 100)
+		INSERT INTO channels (id, name, url, priority, enabled, oauth_credential, models, model_redirects, created_at, updated_at)
+		VALUES (1, 'repair-order', 'https://api.example.com', 10, 1, '', '["z-model","a-model"]', '{}', 100, 100)
 	`)
 	if err != nil {
 		t.Fatalf("insert legacy channel: %v", err)
@@ -608,11 +1279,7 @@ func TestRepairLegacyChannelModelOrder_SQLite(t *testing.T) {
 		}
 	}
 
-	applied, err := isMigrationApplied(ctx, db, channelModelsOrderRepairVersion)
-	if err != nil {
-		t.Fatalf("isMigrationApplied repair version: %v", err)
-	}
-	if !applied {
+	if !hasMigration(ctx, db, channelModelsOrderRepairVersion, DialectSQLite) {
 		t.Fatal("expected repair migration to be recorded")
 	}
 }
@@ -631,11 +1298,7 @@ func TestMigrateChannelModelsSchema_SQLite(t *testing.T) {
 	}
 
 	// 验证迁移记录存在
-	applied, err := isMigrationApplied(ctx, db, "v1_channel_models_redirect")
-	if err != nil {
-		t.Fatalf("isMigrationApplied: %v", err)
-	}
-	if !applied {
+	if !hasMigration(ctx, db, "v1_channel_models_redirect", DialectSQLite) {
 		t.Fatal("expected migration to be recorded")
 	}
 }
@@ -650,9 +1313,15 @@ func TestInitDefaultSettings_SQLite(t *testing.T) {
 
 	// 验证所有预期的设置项
 	expectedKeys := []string{
+		"CODEX_BASE_URL",
+		"XAI_BASE_URL",
+		"ANTIGRAVITY_URL",
+		"ANTHROPIC_BASE_URL",
 		"log_retention_days",
 		"max_key_retries",
 		"upstream_first_byte_timeout",
+		"upstream_connection_reuse_limit_seconds",
+		"stream_timeout",
 		"non_stream_timeout",
 		"anthropic_first_byte_timeout",
 		"anthropic_non_stream_timeout",
@@ -666,6 +1335,7 @@ func TestInitDefaultSettings_SQLite(t *testing.T) {
 		"channel_test_content",
 		"channel_check_interval_hours",
 		"auto_update_interval_hours",
+		"auto_update_channel",
 		"channel_stats_range",
 		"enable_health_score",
 		"success_rate_penalty_weight",
@@ -673,13 +1343,19 @@ func TestInitDefaultSettings_SQLite(t *testing.T) {
 		"health_score_update_interval",
 		"health_min_confident_sample",
 		"cooldown_fallback_enabled",
+		"active_request_title_enabled",
+		"responses_ws_max_sessions",
+		"responses_ws_session_ttl_minutes",
+		"responses_ws_max_transcript_bytes",
+		"responses_ws_max_connections",
+		"responses_ws_max_connections_per_token",
 	}
 
 	for _, key := range expectedKeys {
-		var val string
+		var val, defaultValue string
 		err := db.QueryRowContext(ctx,
-			"SELECT value FROM system_settings WHERE key=?", key,
-		).Scan(&val)
+			"SELECT value, default_value FROM system_settings WHERE key=?", key,
+		).Scan(&val, &defaultValue)
 		if err != nil {
 			t.Errorf("setting %q not found: %v", key, err)
 		}
@@ -688,6 +1364,24 @@ func TestInitDefaultSettings_SQLite(t *testing.T) {
 		}
 		if key == "auto_update_interval_hours" && val != "12" {
 			t.Errorf("setting %q default = %q, want 12", key, val)
+		}
+		if key == "auto_update_channel" && val != "stable" {
+			t.Errorf("setting %q default = %q, want stable", key, val)
+		}
+		if key == "stream_timeout" && val != "0" {
+			t.Errorf("setting %q default = %q, want 0", key, val)
+		}
+		if key == "upstream_connection_reuse_limit_seconds" && val != "0" {
+			t.Errorf("setting %q default = %q, want 0", key, val)
+		}
+		if strings.HasPrefix(key, "responses_ws_") && (val != "0" || defaultValue != "0") {
+			t.Errorf("setting %q initial/default value = %q/%q, want 0/0", key, val, defaultValue)
+		}
+		if key == "active_request_title_enabled" && (val != "false" || defaultValue != "false") {
+			t.Errorf("setting %q initial/default value = %q/%q, want false/false", key, val, defaultValue)
+		}
+		if (key == "CODEX_BASE_URL" || key == "XAI_BASE_URL" || key == "ANTIGRAVITY_URL" || key == "ANTHROPIC_BASE_URL") && val != "" {
+			t.Errorf("setting %q default = %q, want empty", key, val)
 		}
 	}
 	var valueType string
@@ -699,10 +1393,117 @@ func TestInitDefaultSettings_SQLite(t *testing.T) {
 	if valueType != "int" {
 		t.Fatalf("auto_update_interval_hours value_type = %q, want int", valueType)
 	}
+	if err := db.QueryRowContext(ctx,
+		"SELECT value_type FROM system_settings WHERE key='auto_update_channel'",
+	).Scan(&valueType); err != nil {
+		t.Fatalf("query auto_update_channel value_type: %v", err)
+	}
+	if valueType != "string" {
+		t.Fatalf("auto_update_channel value_type = %q, want string", valueType)
+	}
 
 	// 验证 idempotent：再次 init 不应报错
 	if err := initDefaultSettings(ctx, db, DialectSQLite); err != nil {
 		t.Fatalf("initDefaultSettings (second call): %v", err)
+	}
+}
+
+func TestInitDefaultSettings_PreservesExistingResponsesSessionTTLValue(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+	if err := migrate(ctx, db, DialectSQLite); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+
+	if _, err := db.ExecContext(ctx, `
+		UPDATE system_settings
+		SET value = '60', default_value = '60', description = 'old default'
+		WHERE key = 'responses_ws_session_ttl_minutes'
+	`); err != nil {
+		t.Fatalf("restore old default: %v", err)
+	}
+	if err := initDefaultSettings(ctx, db, DialectSQLite); err != nil {
+		t.Fatalf("migrate old default: %v", err)
+	}
+
+	var value, defaultValue, valueType, description string
+	if err := db.QueryRowContext(ctx, `
+		SELECT value, default_value, value_type, description
+		FROM system_settings
+		WHERE key = 'responses_ws_session_ttl_minutes'
+	`).Scan(&value, &defaultValue, &valueType, &description); err != nil {
+		t.Fatalf("query migrated TTL: %v", err)
+	}
+	if value != "60" || defaultValue != "0" {
+		t.Fatalf("existing TTL value/default=%q/%q, want 60/0", value, defaultValue)
+	}
+	if valueType != "int" || description == "" || description == "old default" {
+		t.Fatalf("existing TTL metadata type/description=%q/%q was not refreshed", valueType, description)
+	}
+
+	if _, err := db.ExecContext(ctx, `
+		UPDATE system_settings
+		SET value = '10', default_value = '60'
+		WHERE key = 'responses_ws_session_ttl_minutes'
+	`); err != nil {
+		t.Fatalf("set custom TTL: %v", err)
+	}
+	if err := initDefaultSettings(ctx, db, DialectSQLite); err != nil {
+		t.Fatalf("refresh custom TTL metadata: %v", err)
+	}
+	if err := db.QueryRowContext(ctx, `
+		SELECT value, default_value, value_type, description
+		FROM system_settings
+		WHERE key = 'responses_ws_session_ttl_minutes'
+	`).Scan(&value, &defaultValue, &valueType, &description); err != nil {
+		t.Fatalf("query custom TTL: %v", err)
+	}
+	if value != "10" || defaultValue != "0" {
+		t.Fatalf("custom TTL value/default=%q/%q, want 10/0", value, defaultValue)
+	}
+}
+
+func TestInitDefaultSettings_PreservesExistingResponsesWebsocketValues(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+	if err := migrate(ctx, db, DialectSQLite); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+
+	oldDefaults := map[string]string{
+		"responses_ws_max_sessions":              "32",
+		"responses_ws_max_transcript_bytes":      "134217728",
+		"responses_ws_max_connections":           "64",
+		"responses_ws_max_connections_per_token": "16",
+	}
+	for key, value := range oldDefaults {
+		if _, err := db.ExecContext(ctx, `
+			UPDATE system_settings
+			SET value = ?, default_value = ?, value_type = 'string', description = 'legacy'
+			WHERE key = ?
+		`, value, value, key); err != nil {
+			t.Fatalf("restore old default %s: %v", key, err)
+		}
+	}
+
+	if err := initDefaultSettings(ctx, db, DialectSQLite); err != nil {
+		t.Fatalf("reinitialize defaults: %v", err)
+	}
+	for key, want := range oldDefaults {
+		var value, defaultValue, valueType, description string
+		if err := db.QueryRowContext(ctx, `
+			SELECT value, default_value, value_type, description
+			FROM system_settings
+			WHERE key = ?
+		`, key).Scan(&value, &defaultValue, &valueType, &description); err != nil {
+			t.Fatalf("query preserved setting %s: %v", key, err)
+		}
+		if value != want || defaultValue != "0" {
+			t.Errorf("existing setting %s value/default=%q/%q, want %q/0", key, value, defaultValue, want)
+		}
+		if valueType != "int" || description == "" || description == "legacy" {
+			t.Errorf("existing setting %s metadata type/description=%q/%q was not refreshed", key, valueType, description)
+		}
 	}
 }
 
@@ -1061,27 +1862,6 @@ func TestEnsureAuthTokensCacheFields_SQLite(t *testing.T) {
 	}
 }
 
-func TestCreateIndex_MySQL_Syntax(t *testing.T) {
-	db := openTestDB(t)
-	ctx := context.Background()
-
-	// 创建表
-	_, err := db.ExecContext(ctx, `CREATE TABLE idx_test (id INTEGER PRIMARY KEY, val TEXT)`)
-	if err != nil {
-		t.Fatalf("create table: %v", err)
-	}
-
-	// MySQL 索引格式（包含 INDEX ... 而不是 CREATE INDEX）
-	idx := schema.IndexDef{
-		Name: "idx_test_val",
-		SQL:  "INDEX idx_test_val (val)",
-	}
-
-	// SQLite 不支持这种格式，应该报错或跳过
-	// 但 createIndex 会尝试创建，我们主要测试它不会 panic
-	_ = createIndex(ctx, db, idx, DialectMySQL)
-}
-
 func TestDeleteSystemSetting_NotExists(t *testing.T) {
 	db := openTestDB(t)
 	ctx := context.Background()
@@ -1134,16 +1914,12 @@ func TestRecordMigration_Idempotent(t *testing.T) {
 	}
 
 	// 验证迁移已记录
-	applied, err := isMigrationApplied(ctx, db, "test_migration")
-	if err != nil {
-		t.Fatalf("isMigrationApplied: %v", err)
-	}
-	if !applied {
+	if !hasMigration(ctx, db, "test_migration", DialectSQLite) {
 		t.Fatal("test_migration should be applied")
 	}
 }
 
-func TestIsMigrationApplied_NotApplied(t *testing.T) {
+func TestHasMigration_NotApplied(t *testing.T) {
 	db := openTestDB(t)
 	ctx := context.Background()
 
@@ -1151,11 +1927,7 @@ func TestIsMigrationApplied_NotApplied(t *testing.T) {
 		t.Fatalf("migrate: %v", err)
 	}
 
-	applied, err := isMigrationApplied(ctx, db, "never_applied_migration")
-	if err != nil {
-		t.Fatalf("isMigrationApplied: %v", err)
-	}
-	if applied {
+	if hasMigration(ctx, db, "never_applied_migration", DialectSQLite) {
 		t.Fatal("never_applied_migration should not be applied")
 	}
 }

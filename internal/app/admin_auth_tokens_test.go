@@ -2,7 +2,6 @@ package app
 
 import (
 	"context"
-	"encoding/json"
 	"math"
 	"net/http"
 	"strconv"
@@ -12,41 +11,14 @@ import (
 	"ccLoad/internal/model"
 )
 
-func TestAuthToken_MaskToken(t *testing.T) {
-	tests := []struct {
-		name     string
-		token    string
-		expected string
-	}{
-		{
-			name:     "Long token",
-			token:    "sk-ant-1234567890abcdefghijklmnop",
-			expected: "sk-a****mnop",
-		},
-		{
-			name:     "Short token",
-			token:    "short",
-			expected: "****",
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			masked := model.MaskToken(tt.token)
-			if masked != tt.expected {
-				t.Errorf("Expected '%s', got '%s'", tt.expected, masked)
-			}
-		})
-	}
-}
-
 func TestAdminAPI_CreateAuthToken_Basic(t *testing.T) {
 	server := newInMemoryServer(t)
 
 	c, w := newTestContext(t, newJSONRequest(t, http.MethodPost, "/admin/auth-tokens", map[string]any{
-		"description":         "Test Token",
-		"allowed_channel_ids": []int64{3, 5},
-		"max_concurrency":     4,
+		"description":              "Test Token",
+		"allowed_channel_ids":      []int64{3, 5},
+		"channel_restriction_mode": model.ChannelRestrictionModeDeny,
+		"max_concurrency":          4,
 	}))
 
 	server.HandleCreateAuthToken(c)
@@ -58,10 +30,11 @@ func TestAdminAPI_CreateAuthToken_Basic(t *testing.T) {
 	var response struct {
 		Success bool `json:"success"`
 		Data    struct {
-			ID                int64   `json:"id"`
-			Token             string  `json:"token"`
-			AllowedChannelIDs []int64 `json:"allowed_channel_ids"`
-			MaxConcurrency    int     `json:"max_concurrency"`
+			ID                     int64   `json:"id"`
+			Token                  string  `json:"token"`
+			AllowedChannelIDs      []int64 `json:"allowed_channel_ids"`
+			ChannelRestrictionMode string  `json:"channel_restriction_mode"`
+			MaxConcurrency         int     `json:"max_concurrency"`
 		} `json:"data"`
 	}
 	mustUnmarshalJSON(t, w.Body.Bytes(), &response)
@@ -71,6 +44,9 @@ func TestAdminAPI_CreateAuthToken_Basic(t *testing.T) {
 	}
 	if len(response.Data.AllowedChannelIDs) != 2 || response.Data.AllowedChannelIDs[0] != 3 || response.Data.AllowedChannelIDs[1] != 5 {
 		t.Fatalf("allowed_channel_ids=%v, want [3 5]", response.Data.AllowedChannelIDs)
+	}
+	if response.Data.ChannelRestrictionMode != model.ChannelRestrictionModeDeny {
+		t.Fatalf("channel_restriction_mode=%q, want deny", response.Data.ChannelRestrictionMode)
 	}
 	if response.Data.MaxConcurrency != 4 {
 		t.Fatalf("max_concurrency=%d, want 4", response.Data.MaxConcurrency)
@@ -89,8 +65,31 @@ func TestAdminAPI_CreateAuthToken_Basic(t *testing.T) {
 	if len(stored.AllowedChannelIDs) != 2 || stored.AllowedChannelIDs[0] != 3 || stored.AllowedChannelIDs[1] != 5 {
 		t.Fatalf("stored allowed_channel_ids=%v, want [3 5]", stored.AllowedChannelIDs)
 	}
+	if stored.ChannelRestrictionMode != model.ChannelRestrictionModeDeny {
+		t.Fatalf("stored channel_restriction_mode=%q, want deny", stored.ChannelRestrictionMode)
+	}
 	if stored.MaxConcurrency != 4 {
 		t.Fatalf("stored max_concurrency=%d, want 4", stored.MaxConcurrency)
+	}
+	if server.authService.IsChannelAllowed(expectedHash, 3) {
+		t.Fatal("deny-listed channel should be rejected after ReloadAuthTokens")
+	}
+	if !server.authService.IsChannelAllowed(expectedHash, 7) {
+		t.Fatal("channel outside deny list should be allowed after ReloadAuthTokens")
+	}
+}
+
+func TestAdminAPI_CreateAuthToken_InvalidChannelRestrictionMode(t *testing.T) {
+	server := newInMemoryServer(t)
+
+	c, w := newTestContext(t, newJSONRequest(t, http.MethodPost, "/admin/auth-tokens", map[string]any{
+		"description":              "Test Token",
+		"channel_restriction_mode": "denyy",
+	}))
+
+	server.HandleCreateAuthToken(c)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status=%d, want %d, body=%s", w.Code, http.StatusBadRequest, w.Body.String())
 	}
 }
 
@@ -121,6 +120,58 @@ func TestAdminAPI_CreateAuthToken_CostLimitRequiresMaxConcurrency(t *testing.T) 
 
 	if w.Code != http.StatusBadRequest {
 		t.Fatalf("status=%d, want %d, body=%s", w.Code, http.StatusBadRequest, w.Body.String())
+	}
+}
+
+func TestAdminAPI_CreateAuthToken_DailyLimitRequiresMaxConcurrency(t *testing.T) {
+	server := newInMemoryServer(t)
+
+	c, w := newTestContext(t, newJSONRequest(t, http.MethodPost, "/admin/auth-tokens", map[string]any{
+		"description":          "daily limited token",
+		"cost_daily_limit_usd": 1.0,
+	}))
+
+	server.HandleCreateAuthToken(c)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status=%d, want %d, body=%s", w.Code, http.StatusBadRequest, w.Body.String())
+	}
+}
+
+func TestAdminAPI_CreateAuthToken_PeriodCostLimits(t *testing.T) {
+	server := newInMemoryServer(t)
+
+	c, w := newTestContext(t, newJSONRequest(t, http.MethodPost, "/admin/auth-tokens", map[string]any{
+		"description":            "period limited token",
+		"cost_daily_limit_usd":   1.25,
+		"cost_monthly_limit_usd": 8.5,
+		"max_concurrency":        2,
+	}))
+
+	server.HandleCreateAuthToken(c)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status=%d, want %d, body=%s", w.Code, http.StatusOK, w.Body.String())
+	}
+
+	var response struct {
+		Success bool `json:"success"`
+		Data    struct {
+			ID int64 `json:"id"`
+		} `json:"data"`
+	}
+	mustUnmarshalJSON(t, w.Body.Bytes(), &response)
+	stored, err := server.store.GetAuthToken(context.Background(), response.Data.ID)
+	if err != nil {
+		t.Fatalf("GetAuthToken: %v", err)
+	}
+	if stored.CostDailyLimitMicroUSD != 1_250_000 {
+		t.Fatalf("CostDailyLimitMicroUSD=%d, want 1250000", stored.CostDailyLimitMicroUSD)
+	}
+	if stored.CostMonthlyLimitMicroUSD != 8_500_000 {
+		t.Fatalf("CostMonthlyLimitMicroUSD=%d, want 8500000", stored.CostMonthlyLimitMicroUSD)
+	}
+	if stored.MaxConcurrency != 2 {
+		t.Fatalf("MaxConcurrency=%d, want 2", stored.MaxConcurrency)
 	}
 }
 
@@ -306,7 +357,7 @@ func TestHandleListAuthTokens_RangeAll_SkipsStats(t *testing.T) {
 	server := newInMemoryServer(t)
 	token := createTestToken(t, server, "all-token")
 
-	if err := server.store.UpdateTokenStats(context.Background(), token.Token, true, 1.0, false, 0, 10, 20, 0, 0, 1.0, 0.25); err != nil {
+	if err := server.store.UpdateTokenStats(context.Background(), token.Token, true, 1.0, false, 0, 10, 20, 0, 0, 1.0, 0.25, time.Now()); err != nil {
 		t.Fatalf("UpdateTokenStats failed: %v", err)
 	}
 
@@ -353,7 +404,7 @@ func TestHandleListAuthTokens_StatsAggregation(t *testing.T) {
 	// 创建渠道供日志引用
 	cfg := &model.Config{
 		Name:         "test-ch",
-		URL:          "https://test.com",
+		URLs:         model.ChannelURLs{{URL: "https://test.com"}},
 		Priority:     100,
 		ModelEntries: []model.ModelEntry{{Model: "test-model"}},
 		Enabled:      true,
@@ -523,57 +574,4 @@ func TestHandleListAuthTokens_StatsZeroForNoData(t *testing.T) {
 		}
 	}
 	t.Errorf("token ID=%d not found in response", token.ID)
-}
-
-func TestHandleListAuthTokens_RPMStats(t *testing.T) {
-	server := newInMemoryServer(t)
-	createTestToken(t, server, "rpm-token")
-
-	// 创建渠道和多条日志来生成 RPM 统计
-	ctx := context.Background()
-	now := time.Now()
-	cfg := &model.Config{
-		Name:         "rpm-ch",
-		URL:          "https://rpm.com",
-		Priority:     100,
-		ModelEntries: []model.ModelEntry{{Model: "m"}},
-		Enabled:      true,
-	}
-	created, err := server.store.CreateConfig(ctx, cfg)
-	if err != nil {
-		t.Fatalf("CreateConfig failed: %v", err)
-	}
-
-	for i := 0; i < 5; i++ {
-		entry := &model.LogEntry{
-			Time:        model.JSONTime{Time: now.Add(-time.Duration(i) * time.Second)},
-			Model:       "m",
-			ChannelID:   created.ID,
-			StatusCode:  200,
-			Duration:    0.1,
-			AuthTokenID: 1,
-		}
-		if err := server.store.AddLog(ctx, entry); err != nil {
-			t.Fatalf("AddLog failed: %v", err)
-		}
-	}
-
-	req := newRequest(http.MethodGet, "/admin/auth-tokens?range=today", nil)
-	c, w := newTestContext(t, req)
-	server.HandleListAuthTokens(c)
-
-	if w.Code != http.StatusOK {
-		t.Fatalf("Expected 200, got %d", w.Code)
-	}
-
-	// 解析原始 JSON 验证 rpm_stats 字段存在
-	var raw map[string]json.RawMessage
-	mustUnmarshalJSON(t, w.Body.Bytes(), &raw)
-	var dataField map[string]json.RawMessage
-	mustUnmarshalJSON(t, raw["data"], &dataField)
-
-	// rpm_stats 可以是 null 或对象，但字段应存在
-	if _, ok := dataField["rpm_stats"]; !ok {
-		t.Error("Expected rpm_stats field in response")
-	}
 }

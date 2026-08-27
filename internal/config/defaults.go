@@ -3,6 +3,18 @@ package config
 
 import "time"
 
+// OAuth 上游地址设置键。键名是用户可见配置契约，保持既有大小写。
+const (
+	CodexBaseURLSettingKey              = "CODEX_BASE_URL"
+	XAIBaseURLSettingKey                = "XAI_BASE_URL"
+	AntigravityURLSettingKey            = "ANTIGRAVITY_URL"
+	AnthropicBaseURLSettingKey          = "ANTHROPIC_BASE_URL"
+	ActiveRequestTitleEnabledSettingKey = "active_request_title_enabled"
+	// HTTPReadTimeoutSettingKey 控制下游请求读取超时（0 = 内建默认值）。
+	HTTPReadTimeoutSettingKey  = "http_read_timeout_seconds"
+	CodexMap429To503SettingKey = "codex_map_429_to_503"
+)
+
 // HTTP服务器配置常量
 const (
 	// DefaultMaxConcurrency 默认最大并发请求数
@@ -11,11 +23,54 @@ const (
 	// DefaultMaxKeyRetries 单个渠道内最大Key重试次数
 	DefaultMaxKeyRetries = 3
 
+	// DefaultHTTPReadTimeout 默认下游请求读取超时（HTTP Server ReadTimeout）。
+	// 覆盖请求头与请求体的整段读取：上传慢或客户端中途停顿超过它，读取即失败。
+	DefaultHTTPReadTimeout = 120 * time.Second
+
 	// DefaultMaxBodyBytes 默认最大请求体字节数（用于代理入口的解析）
 	DefaultMaxBodyBytes = 10 * 1024 * 1024 // 10MB
 
 	// DefaultMaxImageBodyBytes Images API 默认最大请求体字节数（支持图片上传）
 	DefaultMaxImageBodyBytes = 20 * 1024 * 1024 // 20MB
+
+	// DefaultCooldownAuthSeconds 认证错误（401/402/403）初始冷却秒数
+	DefaultCooldownAuthSeconds = 300
+
+	// DefaultCooldownServerSeconds 服务器错误（5xx）初始冷却秒数
+	DefaultCooldownServerSeconds = 120
+
+	// DefaultCooldownTimeoutSeconds 超时错误（597/598）初始冷却秒数
+	DefaultCooldownTimeoutSeconds = 60
+
+	// DefaultCooldownRateLimitSeconds 限流错误（429）初始冷却秒数
+	DefaultCooldownRateLimitSeconds = 60
+
+	// DefaultCooldownMaxSeconds 指数退避冷却上限秒数
+	DefaultCooldownMaxSeconds = 1800
+
+	// DefaultCooldownMinSeconds 指数退避冷却下限秒数
+	DefaultCooldownMinSeconds = 10
+
+	// DefaultChannelCheckIntervalHours 渠道定时检测默认间隔；0 仍表示显式关闭。
+	DefaultChannelCheckIntervalHours = 5.0
+
+	// DefaultDebugLogRetentionMinutes Debug 日志默认保留时长。
+	DefaultDebugLogRetentionMinutes = 2
+
+	// DefaultChannelTestContent 渠道测试与定时检测使用的默认内容。
+	DefaultChannelTestContent = "sonnet 4.0的发布日期是什么"
+
+	// DefaultAntigravitySensitiveWordsJSON Antigravity systemInstruction 默认敏感词。
+	DefaultAntigravitySensitiveWordsJSON = `["API","proxy","Claude","Anthropic"]`
+)
+
+// Responses WebSocket 资源默认值。
+const (
+	DefaultResponsesWebsocketMaxConnections         = 128
+	DefaultResponsesWebsocketMaxConnectionsPerToken = 64
+	DefaultResponsesWebsocketMaxSessions            = 256
+	DefaultResponsesWebsocketSessionTTLMinutes      = 15
+	DefaultResponsesWebsocketMaxTranscriptBytes     = 256 * 1024 * 1024 // 256 MiB
 )
 
 // HTTP客户端配置常量
@@ -116,14 +171,15 @@ const (
 const (
 	// LogCleanupInterval 日志清理间隔
 	LogCleanupInterval = 1 * time.Hour
-	// DebugLogCleanupInterval 调试日志清理初始间隔（首次触发后按实际保留时长动态调整）
+	// DebugLogCleanupInterval 调试日志固定清理间隔
 	DebugLogCleanupInterval = 2 * time.Minute
 )
 
 // 启动超时配置（Fail-Fast：启动阶段网络问题应快速失败，避免卡死）
 const (
 	// StartupDBPingTimeout 数据库连接测试超时
-	StartupDBPingTimeout = 10 * time.Second
+	// 远端数据库冷启动、DNS 和 TLS 建连可能超过 10 秒；30 秒仍能在不可达时快速失败。
+	StartupDBPingTimeout = 30 * time.Second
 	// StartupMigrationTimeout 数据库迁移超时
 	// 5min 选取理由：跨版本升级时，多次 ALTER TABLE ADD COLUMN（每次远程 RTT 可达数秒）
 	// 加上 CREATE INDEX 会轻易耗尽 60s。正常重启路径因 loadAllExistingIndexes 跳过

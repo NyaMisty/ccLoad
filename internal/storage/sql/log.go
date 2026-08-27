@@ -20,11 +20,14 @@ func scanLogEntry(scanner interface {
 	var e model.LogEntry
 	var duration sql.NullFloat64
 	var isStreamingInt int
+	var upstreamWebsocketInt int
 	var firstByteTime sql.NullFloat64
 	var logSource sql.NullString
 	var timeMs int64
 	var apiKeyUsed sql.NullString
 	var apiKeyHash sql.NullString
+	var clientProtocol sql.NullString
+	var upstreamProtocol sql.NullString
 	var clientIP sql.NullString
 	var baseURL sql.NullString
 	var actualModel sql.NullString
@@ -35,7 +38,7 @@ func scanLogEntry(scanner interface {
 	var costMultiplier sql.NullFloat64
 
 	if err := scanner.Scan(&e.ID, &timeMs, &e.Model, &actualModel, &logSource, &e.ChannelID,
-		&e.StatusCode, &e.Message, &duration, &isStreamingInt, &firstByteTime, &apiKeyUsed, &apiKeyHash, &e.AuthTokenID, &clientIP, &baseURL, &serviceTier, &thinkingEffort,
+		&e.StatusCode, &e.Message, &duration, &isStreamingInt, &upstreamWebsocketInt, &firstByteTime, &apiKeyUsed, &apiKeyHash, &e.AuthTokenID, &clientProtocol, &upstreamProtocol, &clientIP, &baseURL, &serviceTier, &thinkingEffort,
 		&inputTokens, &outputTokens, &reasoningTokens, &cacheReadTokens, &cacheCreationTokens, &cache5mTokens, &cache1hTokens, &cost, &costMultiplier); err != nil {
 		return nil, err
 	}
@@ -50,6 +53,7 @@ func scanLogEntry(scanner interface {
 		e.Duration = duration.Float64
 	}
 	e.IsStreaming = isStreamingInt != 0
+	e.UpstreamWebsocket = upstreamWebsocketInt != 0
 	if firstByteTime.Valid {
 		e.FirstByteTime = firstByteTime.Float64
 	}
@@ -58,6 +62,12 @@ func scanLogEntry(scanner interface {
 	}
 	if apiKeyHash.Valid {
 		e.APIKeyHash = apiKeyHash.String
+	}
+	if clientProtocol.Valid {
+		e.ClientProtocol = clientProtocol.String
+	}
+	if upstreamProtocol.Valid {
+		e.UpstreamProtocol = upstreamProtocol.String
 	}
 	if clientIP.Valid {
 		e.ClientIP = clientIP.String
@@ -152,35 +162,65 @@ func (s *SQLStore) fillLogAuthTokenDescriptions(ctx context.Context, entries []*
 
 // AddLog 添加日志记录
 func (s *SQLStore) AddLog(ctx context.Context, e *model.LogEntry) error {
+	_, err := s.AddLogWithOAuthQuotaCost(ctx, e)
+	return err
+}
+
+// AddLogWithOAuthQuotaCost atomically persists one log and any OAuth weekly or
+// monthly standard-cost update caused by it. The returned IDs are the channel
+// credentials actually changed by the transaction.
+func (s *SQLStore) AddLogWithOAuthQuotaCost(ctx context.Context, e *model.LogEntry) ([]int64, error) {
+	return s.addLog(ctx, e, true)
+}
+
+// AddLogReplica mirrors a log without applying its cost to the replica's OAuth
+// credential. The authoritative store already committed that channel state.
+func (s *SQLStore) AddLogReplica(ctx context.Context, e *model.LogEntry) error {
+	_, err := s.addLog(ctx, e, false)
+	return err
+}
+
+func (s *SQLStore) addLog(ctx context.Context, e *model.LogEntry, updateOAuthQuotaCost bool) ([]int64, error) {
+	if e == nil {
+		return nil, nil
+	}
 	if s.isChannelDeleted(e.ChannelID) {
-		return nil
+		return nil, nil
 	}
 	if e.Time.IsZero() {
 		e.Time = model.JSONTime{Time: time.Now()}
 	}
-	if e.DebugData != nil {
-		tx, err := s.db.BeginTx(ctx, nil)
-		if err != nil {
-			return err
-		}
-		defer func() { _ = tx.Rollback() }()
-		if err := insertLogsWithDebug(ctx, tx, []*model.LogEntry{e}); err != nil {
-			return err
-		}
-		return tx.Commit()
+	tx, err := s.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
 	}
-
-	// 复用 logRowArgs 统一构造参数（脱敏、时间标准化等逻辑集中维护）
-	_, err := s.db.ExecContext(ctx, logsInsertColumns+logRowPlaceholders, logRowArgs(e)...)
-	return err
+	defer func() { _ = tx.Rollback() }()
+	if e.DebugData != nil {
+		if err := insertLogsWithDebug(ctx, s, tx, []*model.LogEntry{e}); err != nil {
+			return nil, err
+		}
+	} else if _, err := s.execTx(ctx, tx, logsInsertColumns+logRowPlaceholders, logRowArgs(e)...); err != nil {
+		return nil, err
+	}
+	var updatedChannelIDs []int64
+	if updateOAuthQuotaCost {
+		updatedChannelIDs, err = s.updateOAuthQuotaCostsTx(ctx, tx, []*model.LogEntry{e})
+		if err != nil {
+			return nil, err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return updatedChannelIDs, nil
 }
 
-const logsInsertColumns = `INSERT INTO logs(time, minute_bucket, model, actual_model, log_source, channel_id, status_code, message, duration, is_streaming, first_byte_time, api_key_used, api_key_hash, auth_token_id, client_ip, base_url, service_tier, thinking_effort,
-			input_tokens, output_tokens, reasoning_tokens, cache_read_input_tokens, cache_creation_input_tokens, cache_5m_input_tokens, cache_1h_input_tokens, cost, cost_multiplier) VALUES `
+const logsInsertColumns = `INSERT INTO logs(time, minute_bucket, model, actual_model, log_source, channel_id, status_code, message, duration, is_streaming, upstream_websocket, first_byte_time, api_key_used, api_key_hash, auth_token_id, client_protocol, upstream_protocol, client_ip, base_url, service_tier, thinking_effort,
+				input_tokens, output_tokens, reasoning_tokens, cache_read_input_tokens, cache_creation_input_tokens, cache_5m_input_tokens, cache_1h_input_tokens, cost, cost_multiplier) VALUES `
 
-const logRowPlaceholders = `(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+const logRowPlaceholders = `(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
 
-const logRowParams = 27
+const logRowParams = 30
 
 // BatchAddLogs 批量写入日志（单事务，多值 INSERT 提升刷盘吞吐）
 // 设计：
@@ -189,14 +229,40 @@ const logRowParams = 27
 //
 // 两路径仍处于同一事务内，保持原子性。
 func (s *SQLStore) BatchAddLogs(ctx context.Context, logs []*model.LogEntry) error {
+	_, err := s.BatchAddLogsWithOAuthQuotaCost(ctx, logs)
+	return err
+}
+
+// BatchAddLogsWithOAuthQuotaCost is the batch form of AddLogWithOAuthQuotaCost.
+func (s *SQLStore) BatchAddLogsWithOAuthQuotaCost(ctx context.Context, logs []*model.LogEntry) ([]int64, error) {
+	return s.batchAddLogs(ctx, logs, true)
+}
+
+// BatchAddLogsReplica is the batch form of AddLogReplica.
+func (s *SQLStore) BatchAddLogsReplica(ctx context.Context, logs []*model.LogEntry) error {
+	_, err := s.batchAddLogs(ctx, logs, false)
+	return err
+}
+
+func (s *SQLStore) batchAddLogs(
+	ctx context.Context,
+	logs []*model.LogEntry,
+	updateOAuthQuotaCost bool,
+) ([]int64, error) {
 	logs = s.filterDeletedChannelLogs(logs)
 	if len(logs) == 0 {
-		return nil
+		return nil, nil
+	}
+	now := time.Now()
+	for _, entry := range logs {
+		if entry.Time.IsZero() {
+			entry.Time = model.JSONTime{Time: now}
+		}
 	}
 
-	tx, err := s.db.BeginTx(ctx, nil)
+	tx, err := s.BeginTx(ctx, nil)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer func() { _ = tx.Rollback() }()
 
@@ -211,18 +277,27 @@ func (s *SQLStore) BatchAddLogs(ctx context.Context, logs []*model.LogEntry) err
 	}
 
 	if len(plain) > 0 {
-		if err := batchInsertPlainLogs(ctx, tx, plain, s.IsSQLite()); err != nil {
-			return err
+		if err := batchInsertPlainLogs(ctx, s, tx, plain); err != nil {
+			return nil, err
 		}
 	}
 
 	if len(withDebug) > 0 {
-		if err := insertLogsWithDebug(ctx, tx, withDebug); err != nil {
-			return err
+		if err := insertLogsWithDebug(ctx, s, tx, withDebug); err != nil {
+			return nil, err
 		}
 	}
-
-	return tx.Commit()
+	var updatedChannelIDs []int64
+	if updateOAuthQuotaCost {
+		updatedChannelIDs, err = s.updateOAuthQuotaCostsTx(ctx, tx, logs)
+		if err != nil {
+			return nil, err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return updatedChannelIDs, nil
 }
 
 func (s *SQLStore) filterDeletedChannelLogs(logs []*model.LogEntry) []*model.LogEntry {
@@ -237,8 +312,7 @@ func (s *SQLStore) filterDeletedChannelLogs(logs []*model.LogEntry) []*model.Log
 }
 
 // batchInsertPlainLogs 多值 INSERT 写入无 debug 数据的日志，按 batchSize 分块。
-// 回填每条日志的自增 ID（供 app 层缓存 ID→attempt_index 用）。
-func batchInsertPlainLogs(ctx context.Context, tx *sql.Tx, logs []*model.LogEntry, isSQLite bool) error {
+func batchInsertPlainLogs(ctx context.Context, s *SQLStore, tx *sql.Tx, logs []*model.LogEntry) error {
 	// 单批最多 100 行（2500 占位符），兼容 SQLite 32766/MySQL 65535 上限。
 	const batchSize = 100
 	for offset := 0; offset < len(logs); offset += batchSize {
@@ -256,43 +330,42 @@ func batchInsertPlainLogs(ctx context.Context, tx *sql.Tx, logs []*model.LogEntr
 			b.WriteString(logRowPlaceholders)
 			args = append(args, logRowArgs(e)...)
 		}
-		result, err := tx.ExecContext(ctx, b.String(), args...)
-		if err != nil {
+		if _, err := s.execTx(ctx, tx, b.String(), args...); err != nil {
 			return err
 		}
-		assignInsertedIDs(chunk, result, isSQLite)
 	}
 	return nil
 }
 
-// assignInsertedIDs 回填多值 INSERT 生成的自增 ID 到各条目。
-//
-// 单条多值 INSERT 内自增 ID 连续，但两端语义因驱动不同：
-//   - SQLite：LastInsertId 返回最后一条
-//   - MySQL：LastInsertId 返回第一条
-//
-// 若驱动不支持或无返回值，跳过回填（不影响其他功能，仅 attempt_index 查不到）。
-func assignInsertedIDs(entries []*model.LogEntry, result sql.Result, isSQLite bool) {
-	lastID, err := result.LastInsertId()
-	if err != nil || lastID <= 0 {
-		return
-	}
-	n := int64(len(entries))
-	if isSQLite {
-		first := lastID - n + 1
-		for i := range entries {
-			entries[i].ID = first + int64(i)
+// insertLogsWithDebug 逐条插入需要关联 debug_logs 的日志。
+// Postgres 无 LastInsertId，走 RETURNING id。
+func insertLogsWithDebug(ctx context.Context, s *SQLStore, tx *sql.Tx, logs []*model.LogEntry) error {
+	insertSQL := logsInsertColumns + logRowPlaceholders
+	if s.IsPostgres() {
+		insertSQL += " RETURNING id"
+		for _, e := range logs {
+			var logID int64
+			if err := s.queryRowTx(ctx, tx, insertSQL, logRowArgs(e)...).Scan(&logID); err != nil {
+				return err
+			}
+			if _, err := s.execTx(ctx, tx, `
+				INSERT INTO debug_logs (log_id, created_at, req_method, req_url, req_headers, req_body, resp_status, resp_headers, resp_body, upstream_error,
+					protocol_transformed, original_req_url, original_req_headers, original_req_body,
+					translated_resp_status, translated_resp_headers, translated_resp_body)
+				VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+				logID, e.DebugData.CreatedAt, e.DebugData.ReqMethod, e.DebugData.ReqURL,
+				e.DebugData.ReqHeaders, e.DebugData.ReqBody, e.DebugData.RespStatus,
+				e.DebugData.RespHeaders, e.DebugData.RespBody, e.DebugData.UpstreamError, e.DebugData.ProtocolTransformed,
+				e.DebugData.OriginalReqURL, e.DebugData.OriginalReqHeaders, e.DebugData.OriginalReqBody,
+				e.DebugData.TranslatedRespStatus, e.DebugData.TranslatedRespHeaders, e.DebugData.TranslatedRespBody,
+			); err != nil {
+				return err
+			}
 		}
-	} else {
-		for i := range entries {
-			entries[i].ID = lastID + int64(i)
-		}
+		return nil
 	}
-}
 
-// insertLogsWithDebug 逐条插入需要 LastInsertId 关联 debug_logs 的日志。
-func insertLogsWithDebug(ctx context.Context, tx *sql.Tx, logs []*model.LogEntry) error {
-	stmt, err := tx.PrepareContext(ctx, logsInsertColumns+logRowPlaceholders)
+	stmt, err := s.prepareTx(ctx, tx, insertSQL)
 	if err != nil {
 		return err
 	}
@@ -304,13 +377,16 @@ func insertLogsWithDebug(ctx context.Context, tx *sql.Tx, logs []*model.LogEntry
 			return err
 		}
 		logID, _ := result.LastInsertId()
-		e.ID = logID // 回填自增 ID
-		if _, err := tx.ExecContext(ctx, `
-			INSERT INTO debug_logs (log_id, created_at, req_method, req_url, req_headers, req_body, resp_status, resp_headers, resp_body)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		if _, err := s.execTx(ctx, tx, `
+			INSERT INTO debug_logs (log_id, created_at, req_method, req_url, req_headers, req_body, resp_status, resp_headers, resp_body, upstream_error,
+				protocol_transformed, original_req_url, original_req_headers, original_req_body,
+				translated_resp_status, translated_resp_headers, translated_resp_body)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 			logID, e.DebugData.CreatedAt, e.DebugData.ReqMethod, e.DebugData.ReqURL,
 			e.DebugData.ReqHeaders, e.DebugData.ReqBody, e.DebugData.RespStatus,
-			e.DebugData.RespHeaders, e.DebugData.RespBody,
+			e.DebugData.RespHeaders, e.DebugData.RespBody, e.DebugData.UpstreamError, e.DebugData.ProtocolTransformed,
+			e.DebugData.OriginalReqURL, e.DebugData.OriginalReqHeaders, e.DebugData.OriginalReqBody,
+			e.DebugData.TranslatedRespStatus, e.DebugData.TranslatedRespHeaders, e.DebugData.TranslatedRespBody,
 		); err != nil {
 			return err
 		}
@@ -337,8 +413,8 @@ func logRowArgs(e *model.LogEntry) []any {
 		timeMs, minuteBucket, e.Model, e.ActualModel,
 		model.NormalizeStoredLogSource(e.LogSource),
 		e.ChannelID, e.StatusCode, e.Message, e.Duration,
-		e.IsStreaming, e.FirstByteTime, maskedKey, apiKeyHash,
-		e.AuthTokenID, e.ClientIP, e.BaseURL, e.ServiceTier, e.ThinkingEffort,
+		e.IsStreaming, e.UpstreamWebsocket, e.FirstByteTime, maskedKey, apiKeyHash,
+		e.AuthTokenID, e.ClientProtocol, e.UpstreamProtocol, e.ClientIP, e.BaseURL, e.ServiceTier, e.ThinkingEffort,
 		e.InputTokens, e.OutputTokens, e.ReasoningTokens, e.CacheReadInputTokens, e.CacheCreationInputTokens,
 		e.Cache5mInputTokens, e.Cache1hInputTokens, e.Cost,
 		normalizeCostMultiplier(e.CostMultiplier),
@@ -350,7 +426,7 @@ func (s *SQLStore) ListLogs(ctx context.Context, since time.Time, limit, offset 
 	// 使用查询构建器构建复杂查询
 	// 消除 N+1：渠道过滤/名称解析用一次批量查询完成
 	baseQuery := `
-			SELECT id, time, model, actual_model, log_source, channel_id, status_code, message, duration, is_streaming, first_byte_time, api_key_used, api_key_hash, auth_token_id, client_ip, base_url, service_tier, thinking_effort,
+			SELECT id, time, model, actual_model, log_source, channel_id, status_code, message, duration, is_streaming, upstream_websocket, first_byte_time, api_key_used, api_key_hash, auth_token_id, client_protocol, upstream_protocol, client_ip, base_url, service_tier, thinking_effort,
 				input_tokens, output_tokens, reasoning_tokens, cache_read_input_tokens, cache_creation_input_tokens, cache_5m_input_tokens, cache_1h_input_tokens, cost, cost_multiplier
 			FROM logs`
 
@@ -360,8 +436,8 @@ func (s *SQLStore) ListLogs(ctx context.Context, since time.Time, limit, offset 
 	qb := NewQueryBuilder(baseQuery).
 		Where("time >= ?", sinceMs)
 
-	// 应用渠道过滤（支持ChannelType、ChannelName、ChannelNameLike）
-	if _, isEmpty, err := s.applyChannelFilter(ctx, qb, filter); err != nil {
+	// 应用渠道名称或 ID 过滤。
+	if isEmpty, err := s.applyChannelFilter(ctx, qb, filter); err != nil {
 		return nil, err
 	} else if isEmpty {
 		return []*model.LogEntry{}, nil
@@ -374,7 +450,7 @@ func (s *SQLStore) ListLogs(ctx context.Context, since time.Time, limit, offset 
 	query, args := qb.BuildWithSuffix(suffix)
 	args = append(args, limit, offset)
 
-	rows, err := s.db.QueryContext(ctx, query, args...)
+	rows, err := s.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -414,7 +490,7 @@ func (s *SQLStore) CountLogs(ctx context.Context, since time.Time, filter *model
 		Where("time >= ?", sinceMs)
 
 	// 应用渠道过滤（与ListLogs保持一致）
-	if _, isEmpty, err := s.applyChannelFilter(ctx, qb, filter); err != nil {
+	if isEmpty, err := s.applyChannelFilter(ctx, qb, filter); err != nil {
 		return 0, err
 	} else if isEmpty {
 		return 0, nil
@@ -425,14 +501,14 @@ func (s *SQLStore) CountLogs(ctx context.Context, since time.Time, filter *model
 
 	query, args := qb.Build()
 	var count int
-	err := s.db.QueryRowContext(ctx, query, args...).Scan(&count)
+	err := s.QueryRowContext(ctx, query, args...).Scan(&count)
 	return count, err
 }
 
 // ListLogsRange 查询指定时间范围内的日志（支持精确日期范围如"昨日"）
 func (s *SQLStore) ListLogsRange(ctx context.Context, since, until time.Time, limit, offset int, filter *model.LogFilter) ([]*model.LogEntry, error) {
 	baseQuery := `
-		SELECT id, time, model, actual_model, log_source, channel_id, status_code, message, duration, is_streaming, first_byte_time, api_key_used, api_key_hash, auth_token_id, client_ip, base_url, service_tier, thinking_effort,
+		SELECT id, time, model, actual_model, log_source, channel_id, status_code, message, duration, is_streaming, upstream_websocket, first_byte_time, api_key_used, api_key_hash, auth_token_id, client_protocol, upstream_protocol, client_ip, base_url, service_tier, thinking_effort,
 			input_tokens, output_tokens, reasoning_tokens, cache_read_input_tokens, cache_creation_input_tokens, cache_5m_input_tokens, cache_1h_input_tokens, cost, cost_multiplier
 		FROM logs`
 
@@ -443,8 +519,8 @@ func (s *SQLStore) ListLogsRange(ctx context.Context, since, until time.Time, li
 		Where("time >= ?", sinceMs).
 		Where("time <= ?", untilMs)
 
-	// 应用渠道过滤（支持ChannelType、ChannelName、ChannelNameLike）
-	if _, isEmpty, err := s.applyChannelFilter(ctx, qb, filter); err != nil {
+	// 应用渠道名称或 ID 过滤。
+	if isEmpty, err := s.applyChannelFilter(ctx, qb, filter); err != nil {
 		return nil, err
 	} else if isEmpty {
 		return []*model.LogEntry{}, nil
@@ -456,7 +532,7 @@ func (s *SQLStore) ListLogsRange(ctx context.Context, since, until time.Time, li
 	query, args := qb.BuildWithSuffix(suffix)
 	args = append(args, limit, offset)
 
-	rows, err := s.db.QueryContext(ctx, query, args...)
+	rows, err := s.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -497,8 +573,8 @@ func (s *SQLStore) CountLogsRange(ctx context.Context, since, until time.Time, f
 		Where("time >= ?", sinceMs).
 		Where("time <= ?", untilMs)
 
-	// 应用渠道过滤（支持ChannelType、ChannelName、ChannelNameLike）
-	if _, isEmpty, err := s.applyChannelFilter(ctx, qb, filter); err != nil {
+	// 应用渠道名称或 ID 过滤。
+	if isEmpty, err := s.applyChannelFilter(ctx, qb, filter); err != nil {
 		return 0, err
 	} else if isEmpty {
 		return 0, nil
@@ -508,7 +584,7 @@ func (s *SQLStore) CountLogsRange(ctx context.Context, since, until time.Time, f
 
 	query, args := qb.Build()
 	var count int
-	err := s.db.QueryRowContext(ctx, query, args...).Scan(&count)
+	err := s.QueryRowContext(ctx, query, args...).Scan(&count)
 	return count, err
 }
 
@@ -538,7 +614,7 @@ func (s *SQLStore) GetTodayChannelURLStats(ctx context.Context, dayStart time.Ti
 		ORDER BY channel_id ASC, base_url ASC
 	`
 
-	rows, err := s.db.QueryContext(ctx, query, sinceMs)
+	rows, err := s.QueryContext(ctx, query, sinceMs)
 	if err != nil {
 		return nil, err
 	}
@@ -601,7 +677,7 @@ func (s *SQLStore) ListLogsRangeWithCount(ctx context.Context, since, until time
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
-		qb := NewQueryBuilder(`SELECT id, time, model, actual_model, log_source, channel_id, status_code, message, duration, is_streaming, first_byte_time, api_key_used, api_key_hash, auth_token_id, client_ip, base_url, service_tier, thinking_effort,
+		qb := NewQueryBuilder(`SELECT id, time, model, actual_model, log_source, channel_id, status_code, message, duration, is_streaming, upstream_websocket, first_byte_time, api_key_used, api_key_hash, auth_token_id, client_protocol, upstream_protocol, client_ip, base_url, service_tier, thinking_effort,
 			input_tokens, output_tokens, reasoning_tokens, cache_read_input_tokens, cache_creation_input_tokens, cache_5m_input_tokens, cache_1h_input_tokens, cost, cost_multiplier
 			FROM logs`).
 			Where("time >= ?", sinceMs).
@@ -611,7 +687,7 @@ func (s *SQLStore) ListLogsRangeWithCount(ctx context.Context, since, until time
 		query, args := qb.BuildWithSuffix("ORDER BY time DESC LIMIT ? OFFSET ?")
 		args = append(args, limit, offset)
 
-		rows, err := s.db.QueryContext(ctx, query, args...)
+		rows, err := s.QueryContext(ctx, query, args...)
 		if err != nil {
 			logsErr = err
 			return
@@ -638,7 +714,7 @@ func (s *SQLStore) ListLogsRangeWithCount(ctx context.Context, since, until time
 		applySharedConditions(qb)
 
 		query, args := qb.Build()
-		countErr = s.db.QueryRowContext(ctx, query, args...).Scan(&total)
+		countErr = s.QueryRowContext(ctx, query, args...).Scan(&total)
 	}()
 
 	wg.Wait()

@@ -5,8 +5,6 @@ import (
 	"compress/gzip"
 	"encoding/json"
 	"net/http"
-	"os"
-	"path/filepath"
 	"strings"
 	"testing"
 
@@ -64,37 +62,49 @@ func TestHandleGetDebugLog_NotFoundIncludesRelevantSettings(t *testing.T) {
 	}
 }
 
-func TestMergeResponseBody_ReplaysDocsSamples(t *testing.T) {
+func TestDebugLogResponse_IncludesProtocolTransformBodiesOnlyForLocalTransform(t *testing.T) {
 	t.Parallel()
 
-	root := testRepoRoot(t)
-	docsDir := filepath.Join(root, "docs")
-	if _, err := os.Stat(docsDir); err != nil {
-		if os.IsNotExist(err) {
-			t.Skip("docs replay samples are not present")
-		}
-		t.Fatalf("stat docs dir: %v", err)
+	transformed := debugLogResponse(&model.DebugLogEntry{
+		ProtocolTransformed:   true,
+		OriginalReqURL:        "/v1/chat/completions",
+		OriginalReqHeaders:    `{"Content-Type":"application/json","Authorization":"Bearer secret"}`,
+		OriginalReqBody:       []byte(`{"messages":[{"content":"hello"}]}`),
+		ReqBody:               []byte(`{"contents":[{"parts":[{"text":"hello"}]}]}`),
+		RespBody:              []byte(`{"candidates":[{"content":"world"}]}`),
+		UpstreamError:         "unexpected EOF",
+		TranslatedRespStatus:  http.StatusOK,
+		TranslatedRespHeaders: `{"Content-Type":"application/json"}`,
+		TranslatedRespBody:    []byte(`{"choices":[{"message":{"content":"world"}}]}`),
+	})
+	if got, ok := transformed["protocol_transformed"].(bool); !ok || !got {
+		t.Fatalf("protocol_transformed=%v, want true", transformed["protocol_transformed"])
 	}
-	for _, name := range []string{"1.txt", "2.txt", "3.txt", "4.txt", "5.txt", "6.txt"} {
-		name := name
-		t.Run(name, func(t *testing.T) {
-			t.Parallel()
+	if got := transformed["original_req_body"]; got != `{"messages":[{"content":"hello"}]}` {
+		t.Fatalf("original_req_body=%v", got)
+	}
+	if got := transformed["translated_resp_body"]; got != `{"choices":[{"message":{"content":"world"}}]}` {
+		t.Fatalf("translated_resp_body=%v", got)
+	}
+	if got := transformed["original_req_url"]; got != "/v1/chat/completions" {
+		t.Fatalf("original_req_url=%v", got)
+	}
+	if got := transformed["original_req_headers"].(string); strings.Contains(got, "Bearer secret") || !strings.Contains(got, "*") {
+		t.Fatalf("original_req_headers was not masked: %s", got)
+	}
+	if got := transformed["translated_resp_status"]; got != http.StatusOK {
+		t.Fatalf("translated_resp_status=%v", got)
+	}
+	if got := transformed["translated_resp_headers"]; got != `{"Content-Type":"application/json"}` {
+		t.Fatalf("translated_resp_headers=%v", got)
+	}
+	if got := transformed["upstream_error"]; got != "unexpected EOF" {
+		t.Fatalf("upstream_error=%v", got)
+	}
 
-			raw, err := os.ReadFile(filepath.Join(docsDir, name))
-			if err != nil {
-				if os.IsNotExist(err) {
-					t.Skipf("docs replay sample %s is not present", name)
-				}
-				t.Fatalf("read docs sample: %v", err)
-			}
-			parts := mergeResponseBody(string(raw))
-			if strings.TrimSpace(parts.Content) == "" && strings.TrimSpace(parts.Tools) == "" {
-				t.Fatalf("merged response should contain content or tools for %s", name)
-			}
-			if strings.Contains(parts.Content, "event:") || strings.Contains(parts.Content, `"type":"response.output_text.delta"`) {
-				t.Fatalf("merged content leaked raw SSE framing for %s", name)
-			}
-		})
+	native := debugLogResponse(&model.DebugLogEntry{ReqBody: []byte(`{"model":"gpt-4"}`)})
+	if _, ok := native["protocol_transformed"]; ok {
+		t.Fatalf("native debug response should not expose protocol transform fields: %v", native)
 	}
 }
 
@@ -133,6 +143,39 @@ func TestHandleMergeDebugResponse_AcceptsGzipBody(t *testing.T) {
 	}
 	if resp.Data.Content != "hello" {
 		t.Fatalf("content=%q, want hello", resp.Data.Content)
+	}
+}
+
+func TestHandleMergeDebugResponse_UnwrapsAntigravityGeminiStream(t *testing.T) {
+	t.Parallel()
+
+	srv := newInMemoryServer(t)
+	raw := strings.Join([]string{
+		"HTTP 200",
+		"Content-Type: text/event-stream",
+		"",
+		`data: {"response":{"candidates":[{"content":{"role":"model","parts":[{"text":"hello "}]}}]},"traceId":"trace-1"}`,
+		"",
+		`data: {"response":{"candidates":[{"content":{"role":"model","parts":[{"text":"world"}]}}]},"traceId":"trace-1"}`,
+		"",
+	}, "\n")
+	payload, err := json.Marshal(map[string]string{"resp_body": raw})
+	if err != nil {
+		t.Fatalf("marshal payload: %v", err)
+	}
+
+	c, w := newTestContext(t, newJSONRequestBytes(http.MethodPost, "/admin/debug-logs/merged-response", payload))
+	srv.HandleMergeDebugResponse(c)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status=%d, want %d; body=%s", w.Code, http.StatusOK, w.Body.String())
+	}
+	resp := mustParseAPIResponse[mergedResponseParts](t, w.Body.Bytes())
+	if !resp.Success {
+		t.Fatalf("success=%v, want true", resp.Success)
+	}
+	if resp.Data.Content != "hello world" {
+		t.Fatalf("content=%q, want hello world", resp.Data.Content)
 	}
 }
 
@@ -253,26 +296,6 @@ func TestMergeResponseBody_DeduplicatesCodexToolCallWhenOutputIndexChanges(t *te
 	}
 }
 
-func TestMergeResponseBody_DeduplicatesDocs5ToolCalls(t *testing.T) {
-	t.Parallel()
-
-	raw, err := os.ReadFile(filepath.Join(testRepoRoot(t), "docs", "5.txt"))
-	if err != nil {
-		if os.IsNotExist(err) {
-			t.Skip("docs/5.txt replay sample is not present")
-		}
-		t.Fatalf("read docs sample: %v", err)
-	}
-
-	parts := mergeResponseBody(string(raw))
-	if strings.Count(parts.Tools, "### codegraph_explore") != 1 {
-		t.Fatalf("codegraph_explore should render once, got tools:\n%s", parts.Tools)
-	}
-	if strings.Count(parts.Tools, `"projectPath": "/Users/caidaoli/Share/Source/go/ccLoad"`) != 1 {
-		t.Fatalf("codegraph_explore arguments should render once, got tools:\n%s", parts.Tools)
-	}
-}
-
 func TestMergeResponseBody_MergesOpenAIStreamingToolCallIDWithIndexDeltas(t *testing.T) {
 	t.Parallel()
 
@@ -294,48 +317,5 @@ func TestMergeResponseBody_MergesOpenAIStreamingToolCallIDWithIndexDeltas(t *tes
 	}
 	if strings.Contains(parts.Tools, "### tool_call") {
 		t.Fatalf("tool call should not be split into an anonymous second block, got:\n%s", parts.Tools)
-	}
-}
-
-func TestMergeResponseBody_DeduplicatesDocs6ToolCalls(t *testing.T) {
-	t.Parallel()
-
-	raw, err := os.ReadFile(filepath.Join(testRepoRoot(t), "docs", "6.txt"))
-	if err != nil {
-		if os.IsNotExist(err) {
-			t.Skip("docs/6.txt replay sample is not present")
-		}
-		t.Fatalf("read docs sample: %v", err)
-	}
-
-	parts := mergeResponseBody(string(raw))
-	for _, cmd := range []string{
-		"test -d .codegraph && printf yes || printf no",
-		"git status --short",
-		"git diff --name-only --diff-filter=U",
-	} {
-		block := "```bash\n" + cmd + "\n```"
-		if strings.Count(parts.Tools, block) != 1 {
-			t.Fatalf("command %q should render once, got tools:\n%s", cmd, parts.Tools)
-		}
-	}
-}
-
-func testRepoRoot(t *testing.T) string {
-	t.Helper()
-
-	dir, err := os.Getwd()
-	if err != nil {
-		t.Fatalf("getwd: %v", err)
-	}
-	for {
-		if _, err := os.Stat(filepath.Join(dir, "go.mod")); err == nil {
-			return dir
-		}
-		parent := filepath.Dir(dir)
-		if parent == dir {
-			t.Fatal("repo root not found")
-		}
-		dir = parent
 	}
 }

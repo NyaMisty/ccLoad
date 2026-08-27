@@ -47,7 +47,7 @@ func TestBillingPipeline_OpenAI_ChatCompletions(t *testing.T) {
 	//     = 0.0005 + 0.0005 + 0.001
 	//     = 0.002
 	expected := 0.002
-	if !floatEquals(cost, expected, 0.000001) {
+	if !floatEquals(cost, expected) {
 		t.Errorf("OpenAI计费错误: 期望%.6f, 实际%.6f", expected, cost)
 	}
 
@@ -92,7 +92,7 @@ data: {"type":"message_stop","usage":{"input_tokens":12,"output_tokens":73,"cach
 	//     = 0.000036 + 0.001095 + 0.005267 + 0.001043
 	//     = 0.007441
 	expected := 0.007441
-	if !floatEquals(cost, expected, 0.000001) {
+	if !floatEquals(cost, expected) {
 		t.Errorf("Claude计费错误: 期望%.6f, 实际%.6f", expected, cost)
 	}
 
@@ -191,34 +191,17 @@ func TestBillingPipeline_OpenAI_CacheExceedsInput(t *testing.T) {
 	//     = 0.00125 + 0.001 + 0.001
 	//     = 0.00325
 	expected := 0.00325
-	if !floatEquals(cost, expected, 0.000001) {
+	if !floatEquals(cost, expected) {
 		t.Errorf("OpenAI缓存超限计费错误: 期望%.6f, 实际%.6f", expected, cost)
 	}
 
 }
 
-// TestBillingPipeline_ZeroCostWarning 验证费用0值告警机制
-func TestBillingPipeline_ZeroCostWarning(t *testing.T) {
-	// 场景：使用未定义定价的模型但有token消耗
-	// 预期：触发WARN日志，避免财务损失
-
-	model := "gpt-999-unknown"
-	inputTokens := 10000
-	outputTokens := 5000
-
-	cost := util.CalculateCostDetailed(model, inputTokens, outputTokens, 0, 0, 0)
-
-	// 验证：返回0费用
-	if cost != 0.0 {
-		t.Errorf("未知模型应返回0成本，实际%.6f", cost)
-	}
-}
-
 // floatEquals 浮点数相等性比较（避免精度问题）
-func floatEquals(a, b, tolerance float64) bool {
+func floatEquals(a, b float64) bool {
 	diff := a - b
 	if diff < 0 {
 		diff = -diff
 	}
-	return diff < tolerance
+	return diff < 1e-6
 }

@@ -2,6 +2,7 @@ package app
 
 import (
 	"net/http"
+	"net/http/httptest"
 	"strconv"
 	"testing"
 	"time"
@@ -325,11 +326,38 @@ func TestBuildLogFilter(t *testing.T) {
 			},
 		},
 		{
-			name:  "channel_type",
-			query: "channel_type=openai",
+			name:  "upstream_protocol",
+			query: "upstream_protocol=OpenAI",
 			check: func(t *testing.T, lf model.LogFilter) {
-				if lf.ChannelType != "openai" {
-					t.Errorf("ChannelType=%q, want %q", lf.ChannelType, "openai")
+				if lf.UpstreamProtocol != "openai" {
+					t.Errorf("UpstreamProtocol=%q, want %q", lf.UpstreamProtocol, "openai")
+				}
+			},
+		},
+		{
+			name:  "client_protocol",
+			query: "client_protocol=OpenAI",
+			check: func(t *testing.T, lf model.LogFilter) {
+				if lf.ClientProtocol != "openai" {
+					t.Errorf("ClientProtocol=%q, want %q", lf.ClientProtocol, "openai")
+				}
+			},
+		},
+		{
+			name:  "all_client_protocols",
+			query: "client_protocol=all",
+			check: func(t *testing.T, lf model.LogFilter) {
+				if lf.ClientProtocol != "" {
+					t.Errorf("ClientProtocol=%q, want no filter", lf.ClientProtocol)
+				}
+			},
+		},
+		{
+			name:  "all_upstream_protocols",
+			query: "upstream_protocol=all",
+			check: func(t *testing.T, lf model.LogFilter) {
+				if lf.UpstreamProtocol != "" {
+					t.Errorf("UpstreamProtocol=%q, want no filter", lf.UpstreamProtocol)
 				}
 			},
 		},
@@ -402,5 +430,16 @@ func TestBuildLogFilter(t *testing.T) {
 			lf := BuildLogFilter(c)
 			tc.check(t, lf)
 		})
+	}
+}
+
+func TestBuildLogFilterForcesAPITokenWebScope(t *testing.T) {
+	req := httptest.NewRequest(http.MethodGet, "/dashboard/logs?auth_token_id=999", nil)
+	c, _ := newTestContext(t, req)
+	c.Set(webIdentityContextKey, WebIdentity{Role: model.WebRoleAPIToken, AuthTokenID: 42})
+
+	filter := BuildLogFilter(c)
+	if filter.AuthTokenID == nil || *filter.AuthTokenID != 42 {
+		t.Fatalf("AuthTokenID=%v, want forced token ID 42", filter.AuthTokenID)
 	}
 }

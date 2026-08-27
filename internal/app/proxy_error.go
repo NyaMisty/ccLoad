@@ -8,8 +8,10 @@ import (
 	"sync/atomic"
 	"time"
 
+	"ccLoad/internal/codexauth"
 	"ccLoad/internal/cooldown"
 	"ccLoad/internal/model"
+	"ccLoad/internal/protocol"
 	"ccLoad/internal/util"
 )
 
@@ -17,10 +19,14 @@ import (
 // 错误处理核心函数
 // ============================================================================
 
-const cooldownWriteTimeout = 3 * time.Second
+const (
+	cooldownWriteTimeout                 = 3 * time.Second
+	codexQuotaOverdraftStatisticsTimeout = 3 * time.Second
+)
 
 var cooldownClearChannelFailCount atomic.Uint64
 var cooldownClearKeyFailCount atomic.Uint64
+var cooldownClearModelFailCount atomic.Uint64
 
 func cooldownWriteContext(ctx context.Context) (context.Context, context.CancelFunc) {
 	// 断开请求取消链，但保留 ctx.Value（例如 trace ID）。
@@ -36,12 +42,16 @@ func (s *Server) applyCooldownDecision(
 	cooldownCtx, cancel := cooldownWriteContext(ctx)
 	defer cancel()
 
-	// 设置渠道类型，用于特定渠道的错误处理策略
-	in.ChannelType = cfg.ChannelType
+	in = s.completeCooldownInput(cfg, in)
 
-	action := s.cooldownManager.HandleError(cooldownCtx, in)
+	var action cooldown.Action
+	if cfg.RetryOtherKeysOnFailure {
+		action = s.cooldownManager.HandleErrorWithKeyFallback(cooldownCtx, in)
+	} else {
+		action = s.cooldownManager.HandleError(cooldownCtx, in)
+	}
 
-	if action == cooldown.ActionRetryKey || action == cooldown.ActionRetryChannel {
+	if action == cooldown.ActionRetryKey || action == cooldown.ActionRetryModel || action == cooldown.ActionRetryChannel {
 		s.invalidateChannelRelatedCache(cfg.ID)
 	}
 
@@ -53,16 +63,80 @@ func (s *Server) decideCooldownAction(
 	cfg *model.Config,
 	in cooldown.ErrorInput,
 ) cooldown.Action {
-	// 设置渠道类型，用于特定渠道的错误处理策略
-	in.ChannelType = cfg.ChannelType
+	in = s.completeCooldownInput(cfg, in)
 	return s.cooldownManager.DecideAction(ctx, in)
+}
+
+func (s *Server) applyAntigravityModelCapacityCooldown(
+	ctx context.Context,
+	cfg *model.Config,
+	keyIndex int,
+	actualModel string,
+	res *fwResult,
+) {
+	cooldownCtx, cancel := cooldownWriteContext(ctx)
+	defer cancel()
+
+	// MODEL_CAPACITY_EXHAUSTED is a provider-defined model failure. Apply the
+	// original 503 before converting the client response to 429 so the normal
+	// server-error policy starts at two minutes. Bypass channel rules here: this
+	// exact error must never cool a Key, URL, or unrelated model.
+	in := cooldownInputForModel(httpErrorInput(cfg.ID, keyIndex, res), actualModel)
+	in.ChannelModels = s.channelModelCooldownKeys(cfg)
+	s.cooldownManager.HandleError(cooldownCtx, in)
+	s.invalidateChannelRelatedCache(cfg.ID)
+}
+
+func (s *Server) completeCooldownInput(cfg *model.Config, in cooldown.ErrorInput) cooldown.ErrorInput {
+	in.CooldownDetectionRules, _ = s.effectiveChannelCooldownDetectionRules(cfg.CooldownDetectionRules)
+	if strings.TrimSpace(in.Model) != "" && len(in.ChannelModels) == 0 {
+		in.ChannelModels = s.channelModelCooldownKeys(cfg)
+	}
+	return in
+}
+
+func (s *Server) effectiveChannelCooldownDetectionRules(channelRules *model.CooldownDetectionRules) (*model.CooldownDetectionRules, bool) {
+	if channelRules == nil || channelRules.IsEmpty() {
+		return s.globalCooldownDetectionRules, true
+	}
+	return channelRules, false
+}
+
+func (s *Server) channelModelCooldownKeys(cfg *model.Config) []string {
+	if cfg == nil || len(cfg.ModelEntries) == 0 {
+		return nil
+	}
+
+	seen := make(map[string]struct{}, len(cfg.ModelEntries))
+	models := make([]string, 0, len(cfg.ModelEntries))
+	for _, upstreamProtocol := range protocol.AllProtocols() {
+		for _, entry := range cfg.ModelEntries {
+			if entry.Disabled {
+				continue
+			}
+			modelName := strings.TrimSpace(s.resolveFinalUpstreamModel(cfg, entry.Model, string(upstreamProtocol)))
+			if modelName == "" {
+				continue
+			}
+			if _, exists := seen[modelName]; exists {
+				continue
+			}
+			seen[modelName] = struct{}{}
+			models = append(models, modelName)
+		}
+	}
+	return models
 }
 
 func httpErrorInput(channelID int64, keyIndex int, res *fwResult) cooldown.ErrorInput {
 	if res == nil {
 		return httpErrorInputFromParts(channelID, keyIndex, 0, nil, nil)
 	}
-	return httpErrorInputFromParts(channelID, keyIndex, res.Status, res.Body, res.Header)
+	in := httpErrorInputFromParts(channelID, keyIndex, res.Status, res.Body, res.Header)
+	if res.UpstreamStatus != 0 {
+		in.UpstreamStatusCode = res.UpstreamStatus
+	}
+	return in
 }
 
 func httpErrorInputFromParts(
@@ -73,12 +147,13 @@ func httpErrorInputFromParts(
 	headers map[string][]string,
 ) cooldown.ErrorInput {
 	return cooldown.ErrorInput{
-		ChannelID:      channelID,
-		KeyIndex:       keyIndex,
-		StatusCode:     statusCode,
-		ErrorBody:      body,
-		IsNetworkError: false,
-		Headers:        headers,
+		ChannelID:          channelID,
+		KeyIndex:           keyIndex,
+		StatusCode:         statusCode,
+		UpstreamStatusCode: statusCode,
+		ErrorBody:          body,
+		IsNetworkError:     false,
+		Headers:            headers,
 	}
 }
 
@@ -93,6 +168,18 @@ func networkErrorInput(channelID int64, keyIndex int, statusCode int) cooldown.E
 	}
 }
 
+func cooldownInputForModel(in cooldown.ErrorInput, model string) cooldown.ErrorInput {
+	in.Model = strings.TrimSpace(model)
+	return in
+}
+
+func isProtocolEndpointMissing(res *fwResult) bool {
+	if res == nil || res.ResponseCommitted {
+		return false
+	}
+	return util.ShouldFallbackProtocol(res.Status, res.Body)
+}
+
 func (s *Server) logProxyResult(
 	reqCtx *proxyRequestContext,
 	cfg *model.Config,
@@ -103,26 +190,40 @@ func (s *Server) logProxyResult(
 	res *fwResult,
 	errMsg string,
 ) {
-	s.AddLogAsync(buildLogEntry(logEntryParams{
-		RequestModel:   reqCtx.originalModel,
-		ActualModel:    actualModel,
-		ChannelID:      cfg.ID,
-		StatusCode:     statusCode,
-		Duration:       duration,
-		IsStreaming:    reqCtx.isStreaming,
-		APIKeyUsed:     selectedKey,
-		AuthTokenID:    reqCtx.tokenID,
-		ClientIP:       reqCtx.clientIP,
-		BaseURL:        reqCtx.baseURL,
-		Result:         res,
-		ErrMsg:         errMsg,
-		StartTime:      reqCtx.attemptStartTime,
-		DebugData:      reqCtx.debugData,
-		CostMultiplier: cfg.CostMultiplier,
-		AttemptIndex:   int32(reqCtx.attemptIndex),
-		RequestID:      reqCtx.activeReqID,
-		ThinkingEffort: reqCtx.thinkingEffort,
-	}))
+	s.AddLogAsync(buildProxyLogEntry(reqCtx, cfg, actualModel, selectedKey, statusCode, duration, res, errMsg))
+}
+
+func buildProxyLogEntry(
+	reqCtx *proxyRequestContext,
+	cfg *model.Config,
+	actualModel string,
+	selectedKey string,
+	statusCode int,
+	duration float64,
+	res *fwResult,
+	errMsg string,
+) *model.LogEntry {
+	return buildLogEntry(logEntryParams{
+		RequestModel:     reqCtx.originalModel,
+		ActualModel:      actualModel,
+		RequestPath:      reqCtx.requestPath,
+		ChannelID:        cfg.ID,
+		StatusCode:       statusCode,
+		Duration:         duration,
+		IsStreaming:      reqCtx.isStreaming,
+		APIKeyUsed:       selectedKey,
+		AuthTokenID:      reqCtx.tokenID,
+		ClientProtocol:   reqCtx.clientProtocol,
+		UpstreamProtocol: reqCtx.upstreamProtocol,
+		ClientIP:         reqCtx.clientIP,
+		BaseURL:          reqCtx.baseURL,
+		Result:           res,
+		ErrMsg:           errMsg,
+		StartTime:        reqCtx.attemptStartTime,
+		DebugData:        reqCtx.debugData,
+		CostMultiplier:   cfg.CostMultiplier,
+		ThinkingEffort:   reqCtx.thinkingEffort,
+	})
 }
 
 func (s *Server) updateTokenStatsForProxy(
@@ -133,7 +234,14 @@ func (s *Server) updateTokenStatsForProxy(
 	res *fwResult,
 	actualModel string,
 ) {
-	s.updateTokenStatsAsync(reqCtx.tokenHash, cfg.CostMultiplier, isSuccess, duration, reqCtx.isStreaming, res, actualModel)
+	requestModel := ""
+	requestPath := ""
+	if reqCtx != nil {
+		requestModel = reqCtx.originalModel
+		requestPath = reqCtx.requestPath
+	}
+	billingModel := resolveProxyBillingModel(requestPath, actualModel, requestModel)
+	s.updateTokenStatsAsync(reqCtx.tokenHash, cfg.CostMultiplier, isSuccess, duration, reqCtx.isStreaming, res, billingModel)
 }
 
 // handleNetworkError 处理网络错误
@@ -168,6 +276,7 @@ func (s *Server) handleNetworkError(
 		duration:         duration,
 		succeeded:        false,
 		isClientCanceled: errors.Is(err, context.Canceled),
+		proxyLogWritten:  true,
 	}
 
 	// [FIX] 2025-12: 保留 499 场景下已消耗的 token 统计
@@ -183,11 +292,15 @@ func (s *Server) handleNetworkError(
 		failure.nextAction = cooldown.ActionReturnClient
 		return failure, cooldown.ActionReturnClient
 	}
+	failure.isNetworkError = true
 
-	input := networkErrorInput(cfg.ID, keyIndex, statusCode)
+	input := cooldownInputForModel(networkErrorInput(cfg.ID, keyIndex, statusCode), actualModel)
+	input.ModelScoped = util.IsModelScopedNetworkError(err)
 	if deferChannelCooldown {
 		action := s.decideCooldownAction(ctx, cfg, input)
-		if action == cooldown.ActionRetryChannel {
+		keyFallback := cfg.RetryOtherKeysOnFailure &&
+			s.cooldownManager.CanFallbackToOtherKey(s.completeCooldownInput(cfg, input))
+		if action == cooldown.ActionRetryChannel && !keyFallback {
 			failure.nextAction = action
 			return failure, action
 		}
@@ -210,6 +323,7 @@ func hasConsumedTokens(res *fwResult) bool {
 
 type tokenStatsUpdate struct {
 	tokenHash           string
+	completedAt         time.Time
 	isSuccess           bool
 	duration            float64
 	isStreaming         bool
@@ -265,10 +379,10 @@ func (s *Server) applyTokenStatsUpdate(upd tokenStatsUpdate) {
 
 	// 内存缓存是费用限额的实时权威来源。DB 落盘失败不能让限额 fail-open。
 	if upd.isSuccess && upd.costUSD > 0 && s.authService != nil {
-		s.authService.AddCostToCache(upd.tokenHash, util.USDToMicroUSD(effectiveCostUSD))
+		s.authService.AddCostToCache(upd.tokenHash, util.USDToMicroUSD(effectiveCostUSD), upd.completedAt)
 	}
 
-	if err := s.store.UpdateTokenStats(updateCtx, upd.tokenHash, upd.isSuccess, upd.duration, upd.isStreaming, upd.firstByteTime, upd.promptTokens, upd.completionTokens, upd.cacheReadTokens, upd.cacheCreationTokens, upd.costUSD, effectiveCostUSD); err != nil {
+	if err := s.store.UpdateTokenStats(updateCtx, upd.tokenHash, upd.isSuccess, upd.duration, upd.isStreaming, upd.firstByteTime, upd.promptTokens, upd.completionTokens, upd.cacheReadTokens, upd.cacheCreationTokens, upd.costUSD, effectiveCostUSD, upd.completedAt); err != nil {
 		// Token 被删除是正常的并发场景（请求进行中 token 被删除），静默忽略
 		if strings.Contains(err.Error(), "token not found") {
 			return
@@ -291,6 +405,7 @@ func (s *Server) updateTokenStatsAsync(tokenHash string, costMultiplier float64,
 	if tokenHash == "" || s.tokenStatsCh == nil {
 		return
 	}
+	completedAt := time.Now()
 
 	var promptTokens, completionTokens, cacheReadTokens, cacheCreationTokens int64
 	var costUSD float64
@@ -316,6 +431,7 @@ func (s *Server) updateTokenStatsAsync(tokenHash string, costMultiplier float64,
 
 	upd := tokenStatsUpdate{
 		tokenHash:           tokenHash,
+		completedAt:         completedAt,
 		isSuccess:           isSuccess,
 		duration:            duration,
 		isStreaming:         isStreaming,
@@ -391,36 +507,96 @@ func (s *Server) handleProxySuccess(
 			log.Printf("[WARN] ClearChannelCooldown 失败 (累计: %d): channel_id=%d err=%v", count, cfg.ID, err)
 		}
 	}
-	if err := s.cooldownManager.ClearKeyCooldown(cooldownCtx, cfg.ID, keyIndex); err != nil {
-		count := cooldownClearKeyFailCount.Add(1)
-		if count%100 == 1 {
-			log.Printf("[WARN] ClearKeyCooldown 失败 (累计: %d): channel_id=%d key_index=%d err=%v", count, cfg.ID, keyIndex, err)
+	if keyIndex != cooldown.NoKeyIndex {
+		if err := s.cooldownManager.ClearKeyCooldown(cooldownCtx, cfg.ID, keyIndex); err != nil {
+			count := cooldownClearKeyFailCount.Add(1)
+			if count%100 == 1 {
+				log.Printf("[WARN] ClearKeyCooldown 失败 (累计: %d): channel_id=%d key_index=%d err=%v", count, cfg.ID, keyIndex, err)
+			}
+		}
+	}
+	if actualModel != "" && s.hasActiveModelCooldown(ctx, cfg.ID, actualModel) {
+		if err := s.cooldownManager.ClearModelCooldown(cooldownCtx, cfg.ID, actualModel); err != nil {
+			count := cooldownClearModelFailCount.Add(1)
+			if count%100 == 1 {
+				log.Printf("[WARN] ClearModelCooldown 失败 (累计: %d): channel_id=%d model=%s err=%v",
+					count, cfg.ID, actualModel, err)
+			}
 		}
 	}
 
 	// 冷却状态已恢复，刷新相关缓存避免下次命中过期数据
 	s.invalidateChannelRelatedCache(cfg.ID)
 
-	// 记录成功日志
-	s.logProxyResult(reqCtx, cfg, actualModel, selectedKey, res.Status, duration, res, "")
+	if cfg.RetryOtherKeysOnFailure && reqCtx.routingSession != nil {
+		reqCtx.routingSession.rememberPreferredChannel(cfg.ID)
+	}
+
+	// 日志与超额统计必须复用同一次成本计算，避免两个记账口径漂移。
+	entry := buildProxyLogEntry(reqCtx, cfg, actualModel, selectedKey, res.Status, duration, res, "")
+	overdraftEnabled, persistedOverdraftActive := codexQuotaOverdraftState(cfg, time.Now().Unix())
+	overdraftUsed := res.QuotaOverdraftReplayed
+	if res.QuotaOverdraftReplayed || overdraftEnabled {
+		if s.codexCredentials == nil {
+			log.Printf("[WARN] Codex 超额使用统计未写入: channel_id=%d credential manager unavailable", cfg.ID)
+			overdraftUsed = overdraftUsed || persistedOverdraftActive
+		} else {
+			statisticsCtx, statisticsCancel := context.WithTimeout(
+				context.WithoutCancel(ctx), codexQuotaOverdraftStatisticsTimeout,
+			)
+			_, recorded, err := s.codexCredentials.recordQuotaOverdraftSuccess(
+				statisticsCtx, cfg.ID, util.USDToMicroUSD(entry.Cost),
+				res.QuotaOverdraftReplayed, res.QuotaOverdraftActiveUntil,
+			)
+			statisticsCancel()
+			if err != nil {
+				// 统计失败不允许把已经成功的上游请求改成客户端失败。
+				log.Printf("[WARN] Codex 超额使用统计写入失败: channel_id=%d err=%v", cfg.ID, err)
+				// active_until 是已持久化的超额周期证据。本次记账失败不应
+				// 把真实超额请求的日志降级成普通 ok。
+				overdraftUsed = overdraftUsed || persistedOverdraftActive
+			} else {
+				overdraftUsed = overdraftUsed || recorded
+			}
+		}
+	}
+	if overdraftUsed && !res.QuotaOverdraftReplayed {
+		entry.Message = appendRetryStrategyToMessage(entry.Message, codexQuotaOverdraftRetryStrategy)
+	}
+	s.AddLogAsync(entry)
 
 	// 异步更新Token统计
 	s.updateTokenStatsForProxy(reqCtx, cfg, true, duration, res, actualModel)
 
 	return &proxyResult{
-		status:        res.Status,
-		header:        res.Header,
-		channelID:     &cfg.ID,
-		duration:      duration,
-		firstByteTime: res.FirstByteTime,
-		succeeded:     true,
-		nextAction:    cooldown.ActionReturnClient,
+		status:           res.Status,
+		header:           res.Header,
+		channelID:        &cfg.ID,
+		duration:         duration,
+		firstByteTime:    res.FirstByteTime,
+		succeeded:        true,
+		nextAction:       cooldown.ActionReturnClient,
+		proxyLogWritten:  true,
+		responsesTurn:    res.ResponsesTurnResult,
+		hasResponsesTurn: res.HasResponsesTurnResult,
 	}, cooldown.ActionReturnClient
+}
+
+func codexQuotaOverdraftState(cfg *model.Config, now int64) (enabled bool, active bool) {
+	if cfg == nil || !cfg.UsesCodexOAuth() {
+		return false, false
+	}
+	credential, err := codexauth.ParseCredential([]byte(cfg.OAuthCredential))
+	if err != nil || credential.QuotaOverdraft == nil || !credential.QuotaOverdraft.Enabled {
+		return false, false
+	}
+	return true, credential.QuotaOverdraft.ActiveUntil > now
 }
 
 // handleStreamingErrorNoRetry 处理流式响应中途检测到的错误（597/599）
 // 场景：HTTP 200 已发送，流传输中途检测到 SSE error 或流不完整
-// 关键：响应头已发送，重试在 HTTP 协议层面不可能，只触发冷却+记录日志
+// 关键：响应头已发送，重试在 HTTP 协议层面不可能，只记录日志并返回客户端。
+// 普通 SSE/HTTP 故障仍做模型冷却；原生 WS 1006 由目标级 tracker 处理。
 func (s *Server) handleStreamingErrorNoRetry(
 	ctx context.Context,
 	cfg *model.Config,
@@ -434,17 +610,54 @@ func (s *Server) handleStreamingErrorNoRetry(
 	// 记录错误日志
 	s.logProxyResult(reqCtx, cfg, actualModel, selectedKey, res.Status, duration, res, res.StreamDiagMsg)
 
-	// 触发冷却（保护后续请求）
-	_ = s.applyCooldownDecision(ctx, cfg, httpErrorInput(cfg.ID, keyIndex, res))
+	// 原生 WS close 1006/心跳传输错误按“两个新物理连接连续失败”冷却具体目标。
+	// 这里再做模型冷却会把网络抖动错误扩大到同渠道的整个模型。
+	if !res.UpstreamWebsocketTransportFailure {
+		_ = s.applyCooldownDecision(ctx, cfg, cooldownInputForModel(httpErrorInput(cfg.ID, keyIndex, res), actualModel))
+	}
 
 	// 返回"成功"：数据已发送给客户端，不触发重试
 	return &proxyResult{
-		status:     res.Status,
-		channelID:  &cfg.ID,
-		duration:   duration,
-		succeeded:  true, // 关键：标记为成功，避免触发重试逻辑
-		nextAction: cooldown.ActionReturnClient,
+		status:          res.Status,
+		channelID:       &cfg.ID,
+		duration:        duration,
+		succeeded:       true, // 关键：标记为成功，避免触发重试逻辑
+		nextAction:      cooldown.ActionReturnClient,
+		proxyLogWritten: true,
 	}, cooldown.ActionReturnClient
+}
+
+func (s *Server) handleUncommittedWebsocketTransportFailure(
+	cfg *model.Config,
+	actualModel string,
+	selectedKey string,
+	res *fwResult,
+	duration float64,
+	reqCtx *proxyRequestContext,
+) (*proxyResult, cooldown.Action) {
+	s.logProxyResult(
+		reqCtx,
+		cfg,
+		actualModel,
+		selectedKey,
+		res.Status,
+		time.Since(reqCtx.channelStartTime).Seconds(),
+		res,
+		res.StreamDiagMsg,
+	)
+	s.updateTokenStatsForProxy(reqCtx, cfg, false, duration, res, actualModel)
+
+	return &proxyResult{
+		status:                 res.Status,
+		header:                 res.Header,
+		body:                   res.Body,
+		channelID:              &cfg.ID,
+		duration:               duration,
+		succeeded:              false,
+		nextAction:             cooldown.ActionRetryChannel,
+		proxyLogWritten:        true,
+		websocketTargetCooling: true,
+	}, cooldown.ActionRetryChannel
 }
 
 // handleProxyErrorResponse 处理代理错误响应（业务逻辑层）
@@ -461,6 +674,7 @@ func (s *Server) handleProxyErrorResponse(
 	reqCtx *proxyRequestContext,
 	deferChannelCooldown bool,
 	forceReturnClient bool,
+	modelCapacityRateLimited bool,
 ) (*proxyResult, cooldown.Action) {
 	// 日志改进: 明确标识上游返回的499错误
 	errMsg := ""
@@ -468,8 +682,12 @@ func (s *Server) handleProxyErrorResponse(
 		errMsg = "upstream returned 499 (not client cancel)"
 	}
 
-	// Duration 使用「当前渠道开始到现在」的累计耗时（覆盖同渠道多URL尝试，不跨渠道）
-	s.logProxyResult(reqCtx, cfg, actualModel, selectedKey, res.Status, time.Since(reqCtx.channelStartTime).Seconds(), res, errMsg)
+	// Duration 使用「当前渠道开始到现在」的累计耗时（覆盖同渠道多URL尝试，不跨渠道）。
+	// Antigravity URL 回退错误要等重试器决定最终结果后再落日志；否则一次逻辑请求会产生多条日志。
+	logEntry := buildProxyLogEntry(
+		reqCtx, cfg, actualModel, selectedKey, res.Status,
+		time.Since(reqCtx.channelStartTime).Seconds(), res, errMsg,
+	)
 
 	// [FIX] 2026-01: 499（客户端取消）不计入成功/失败统计，与 logs 表聚合逻辑保持一致
 	if res.Status != 499 {
@@ -485,17 +703,41 @@ func (s *Server) handleProxyErrorResponse(
 		duration:  duration,
 		succeeded: false,
 	}
+	deferAntigravityFallbackLog := cfg.UsesAntigravityOAuth() && deferChannelCooldown &&
+		shouldFallbackAntigravityBaseURL(res.Status, res.Body)
+	if modelCapacityRateLimited || deferAntigravityFallbackLog {
+		failure.deferredLog = logEntry
+	} else {
+		s.AddLogAsync(logEntry)
+		failure.proxyLogWritten = true
+	}
 
 	if forceReturnClient {
 		failure.nextAction = cooldown.ActionReturnClient
 		return failure, cooldown.ActionReturnClient
 	}
 
-	input := httpErrorInput(cfg.ID, keyIndex, res)
+	input := cooldownInputForModel(httpErrorInput(cfg.ID, keyIndex, res), actualModel)
+	if modelCapacityRateLimited {
+		// The original 503 already installed the model cooldown before URL retry.
+		// Only decide where to continue; applying this converted 429 again would
+		// double the same failure and change the initial two-minute cooldown.
+		action := s.decideCooldownAction(ctx, cfg, input)
+		failure.nextAction = action
+		return failure, action
+	}
 	if deferChannelCooldown {
 		action := s.decideCooldownAction(ctx, cfg, input)
-		if action == cooldown.ActionRetryChannel {
+		if cfg.UsesAntigravityOAuth() && shouldFallbackAntigravityBaseURL(res.Status, res.Body) {
 			failure.nextAction = action
+			failure.deferredCooldown = &input
+			return failure, action
+		}
+		keyFallback := cfg.RetryOtherKeysOnFailure &&
+			s.cooldownManager.CanFallbackToOtherKey(s.completeCooldownInput(cfg, input))
+		if action == cooldown.ActionRetryChannel && !keyFallback {
+			failure.nextAction = action
+			failure.deferredCooldown = &input
 			return failure, action
 		}
 	}

@@ -3,6 +3,7 @@ package storage
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"log"
 	"strings"
@@ -11,14 +12,14 @@ import (
 // sqliteMigratableTables 允许增量迁移的SQLite表名白名单
 // 安全设计：防止SQL注入，新增表时需在此处注册
 var sqliteMigratableTables = map[string]bool{
-	"logs":                        true,
-	"auth_tokens":                 true,
-	"channel_models":              true,
-	"channel_protocol_transforms": true,
-	"api_keys":                    true,
-	"channels":                    true,
-	"debug_logs":                  true,
-	"schema_migrations":           true,
+	"logs":                    true,
+	"auth_tokens":             true,
+	"channel_models":          true,
+	"channel_model_cooldowns": true,
+	"api_keys":                true,
+	"channels":                true,
+	"debug_logs":              true,
+	"schema_migrations":       true,
 }
 
 type sqliteColumnDef struct {
@@ -74,14 +75,85 @@ func ensureMySQLColumns(ctx context.Context, db *sql.DB, table string, cols []my
 	return nil
 }
 
+// ensurePostgresColumns 通用 PostgreSQL 添加列（幂等）
+func ensurePostgresColumns(ctx context.Context, db *sql.DB, table string, cols []mysqlColumnDef) error {
+	added := false
+	for _, col := range cols {
+		def := stripMySQLColumnDecorators(col.definition)
+		def = mysqlColDefToPostgres(def)
+		var count int
+		if err := db.QueryRowContext(ctx,
+			rebindIfPostgres(DialectPostgres, "SELECT COUNT(*) FROM information_schema.columns WHERE table_schema=current_schema() AND table_name=? AND column_name=?"),
+			table, col.name,
+		).Scan(&count); err != nil {
+			return fmt.Errorf("check %s field: %w", col.name, err)
+		}
+		if count == 0 {
+			if _, err := db.ExecContext(ctx, fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s %s", table, col.name, def)); err != nil {
+				return fmt.Errorf("add %s column: %w", col.name, err)
+			}
+			added = true
+		}
+	}
+	if added {
+		log.Printf("[MIGRATE] 已向 %s 添加列 (postgres)", table)
+	}
+	return nil
+}
+
+func stripMySQLColumnDecorators(def string) string {
+	// 去掉 COMMENT '...'
+	for {
+		i := strings.Index(strings.ToUpper(def), " COMMENT ")
+		if i < 0 {
+			break
+		}
+		def = strings.TrimSpace(def[:i])
+	}
+	return def
+}
+
+func mysqlColDefToPostgres(def string) string {
+	def = strings.ReplaceAll(def, "TINYINT", "SMALLINT")
+	def = strings.ReplaceAll(def, "DOUBLE", "DOUBLE PRECISION")
+	return def
+}
+
 // ensureColumn 跨方言单列幂等添加。
 // MySQL 走 INFORMATION_SCHEMA 探测 + ALTER ADD；SQLite 走 PRAGMA table_info + ALTER ADD。
 // 调用方各自传入 MySQL/SQLite 列定义子句（不含 ADD COLUMN 关键字）。
 func ensureColumn(ctx context.Context, db *sql.DB, dialect Dialect, table, col, mysqlDef, sqliteDef string) error {
-	if dialect == DialectMySQL {
+	switch dialect {
+	case DialectMySQL:
 		return ensureMySQLColumns(ctx, db, table, []mysqlColumnDef{{name: col, definition: mysqlDef}})
+	case DialectPostgres:
+		return ensurePostgresColumns(ctx, db, table, []mysqlColumnDef{{name: col, definition: mysqlDef}})
+	default:
+		return ensureSQLiteColumns(ctx, db, table, []sqliteColumnDef{{name: col, definition: sqliteDef}})
 	}
-	return ensureSQLiteColumns(ctx, db, table, []sqliteColumnDef{{name: col, definition: sqliteDef}})
+}
+
+func ensureModelCooldownDuration(ctx context.Context, db *sql.DB, dialect Dialect) error {
+	if err := ensureColumn(
+		ctx,
+		db,
+		dialect,
+		"channel_model_cooldowns",
+		"cooldown_duration_ms",
+		"BIGINT NOT NULL DEFAULT 0",
+		"INTEGER NOT NULL DEFAULT 0",
+	); err != nil {
+		return err
+	}
+
+	if _, err := db.ExecContext(ctx, `
+		UPDATE channel_model_cooldowns
+		SET cooldown_duration_ms = (cooldown_until - updated_at) * 1000
+		WHERE cooldown_duration_ms = 0 AND cooldown_until > updated_at
+	`); err != nil {
+		return fmt.Errorf("backfill model cooldown duration: %w", err)
+	}
+	return nil
 }
 
 func sqliteExistingColumns(ctx context.Context, db *sql.DB, table string) (map[string]bool, error) {
@@ -115,7 +187,8 @@ func sqliteExistingColumns(ctx context.Context, db *sql.DB, table string) (map[s
 
 // ensureLogsNewColumns 确保logs表有新增字段(2025-12新增,支持MySQL和SQLite)
 func ensureLogsNewColumns(ctx context.Context, db *sql.DB, dialect Dialect) error {
-	if dialect == DialectMySQL {
+	switch dialect {
+	case DialectMySQL:
 		if err := ensureLogsMinuteBucketMySQL(ctx, db); err != nil {
 			return err
 		}
@@ -144,9 +217,58 @@ func ensureLogsNewColumns(ctx context.Context, db *sql.DB, dialect Dialect) erro
 			return err
 		}
 		return ensureLogsLogSourceMySQL(ctx, db)
+	case DialectPostgres:
+		return ensureLogsColumnsPostgres(ctx, db)
+	default:
+		return ensureLogsColumnsSQLite(ctx, db)
 	}
-	// SQLite: 使用PRAGMA table_info检查列
-	return ensureLogsColumnsSQLite(ctx, db)
+}
+
+// ensureLogsColumnsPostgres PostgreSQL 增量迁移 logs 新字段（新库 DDL 已含全列；此路径服务旧库）
+func ensureLogsColumnsPostgres(ctx context.Context, db *sql.DB) error {
+	if err := ensurePostgresColumns(ctx, db, "logs", []mysqlColumnDef{
+		{name: "minute_bucket", definition: "BIGINT NOT NULL DEFAULT 0"},
+		{name: "auth_token_id", definition: "BIGINT NOT NULL DEFAULT 0"},
+		{name: "client_ip", definition: "VARCHAR(64) NOT NULL DEFAULT ''"},
+		{name: "cache_5m_input_tokens", definition: "BIGINT NOT NULL DEFAULT 0"},
+		{name: "cache_1h_input_tokens", definition: "BIGINT NOT NULL DEFAULT 0"},
+		{name: "actual_model", definition: "VARCHAR(191) NOT NULL DEFAULT ''"},
+		{name: "log_source", definition: "VARCHAR(32) NOT NULL DEFAULT 'proxy'"},
+		{name: "api_key_hash", definition: "VARCHAR(64) NOT NULL DEFAULT ''"},
+		{name: "base_url", definition: "VARCHAR(500) NOT NULL DEFAULT ''"},
+		{name: "service_tier", definition: "VARCHAR(32) NOT NULL DEFAULT ''"},
+		{name: "thinking_effort", definition: "VARCHAR(32) NOT NULL DEFAULT ''"},
+		{name: "reasoning_tokens", definition: "INT NOT NULL DEFAULT 0"},
+	}); err != nil {
+		return err
+	}
+	// 历史回填与 MySQL 同语义，标记记到 schema_migrations
+	const cache5mBackfillMarker = "cache_5m_backfill_done"
+	if !hasMigration(ctx, db, cache5mBackfillMarker, DialectPostgres) {
+		if _, err := db.ExecContext(ctx,
+			"UPDATE logs SET cache_5m_input_tokens = cache_creation_input_tokens WHERE cache_5m_input_tokens = 0 AND cache_1h_input_tokens = 0 AND cache_creation_input_tokens > 0",
+		); err != nil {
+			return fmt.Errorf("migrate cache_5m data: %w", err)
+		}
+		if _, err := db.ExecContext(ctx,
+			"UPDATE logs SET cache_5m_input_tokens = cache_creation_input_tokens - cache_1h_input_tokens WHERE cache_1h_input_tokens > 0 AND cache_5m_input_tokens = cache_creation_input_tokens",
+		); err != nil {
+			return fmt.Errorf("repair cache_5m data: %w", err)
+		}
+		if err := recordMigration(ctx, db, cache5mBackfillMarker, DialectPostgres); err != nil {
+			return fmt.Errorf("record cache_5m migration marker: %w", err)
+		}
+	}
+	const backfillMarker = "minute_bucket_backfill_done"
+	if !hasMigration(ctx, db, backfillMarker, DialectPostgres) {
+		if _, err := db.ExecContext(ctx, "UPDATE logs SET minute_bucket = (time / 60000) WHERE minute_bucket = 0 AND time > 0"); err != nil {
+			return fmt.Errorf("backfill minute_bucket: %w", err)
+		}
+		if err := recordMigration(ctx, db, backfillMarker, DialectPostgres); err != nil {
+			return fmt.Errorf("record migration marker: %w", err)
+		}
+	}
+	return nil
 }
 
 // ensureLogsColumnsSQLite SQLite增量迁移logs表新字段
@@ -171,7 +293,7 @@ func ensureLogsColumnsSQLite(ctx context.Context, db *sql.DB) error {
 
 	// 第二步：迁移历史数据，将cache_creation_input_tokens复制到cache_5m_input_tokens（一次性）
 	const cache5mBackfillMarker = "cache_5m_backfill_done"
-	if !hasMigration(ctx, db, cache5mBackfillMarker) {
+	if !hasMigration(ctx, db, cache5mBackfillMarker, DialectSQLite) {
 		_, err := db.ExecContext(ctx,
 			"UPDATE logs SET cache_5m_input_tokens = cache_creation_input_tokens WHERE cache_5m_input_tokens = 0 AND cache_1h_input_tokens = 0 AND cache_creation_input_tokens > 0",
 		)
@@ -192,7 +314,7 @@ func ensureLogsColumnsSQLite(ctx context.Context, db *sql.DB) error {
 
 	// 第三步：回填 minute_bucket（基于标记机制，支持崩溃恢复）
 	const backfillMarker = "minute_bucket_backfill_done"
-	if !hasMigration(ctx, db, backfillMarker) {
+	if !hasMigration(ctx, db, backfillMarker, DialectSQLite) {
 		log.Println("[migrate] 正在为 SQLite 回填 minute_bucket...")
 		if err := backfillLogsMinuteBucketSQLite(ctx, db, 5_000); err != nil {
 			return fmt.Errorf("backfill minute_bucket: %w", err)
@@ -282,7 +404,7 @@ func ensureLogsMinuteBucketMySQL(ctx context.Context, db *sql.DB) error {
 
 	// 第二步：回填历史数据（基于标记机制，支持崩溃恢复）
 	const backfillMarker = "minute_bucket_backfill_done"
-	if !hasMigration(ctx, db, backfillMarker) {
+	if !hasMigration(ctx, db, backfillMarker, DialectMySQL) {
 		log.Println("[migrate] 正在为 MySQL 回填 minute_bucket...")
 		if err := backfillLogsMinuteBucketMySQL(ctx, db, 10_000); err != nil {
 			return err
@@ -316,12 +438,39 @@ func ensureLogsCostMultiplier(ctx context.Context, db *sql.DB, dialect Dialect) 
 		"REAL NOT NULL DEFAULT 1")
 }
 
+// ensureLogsUpstreamWebsocket ensures logs record the transport actually used for the upstream request.
+func ensureLogsUpstreamWebsocket(ctx context.Context, db *sql.DB, dialect Dialect) error {
+	return ensureColumn(ctx, db, dialect, "logs", "upstream_websocket",
+		"TINYINT NOT NULL DEFAULT 0",
+		"INTEGER NOT NULL DEFAULT 0")
+}
+
+// ensureLogsClientProtocol ensures protocol statistics use the immutable client request protocol.
+func ensureLogsClientProtocol(ctx context.Context, db *sql.DB, dialect Dialect) error {
+	return ensureColumn(ctx, db, dialect, "logs", "client_protocol",
+		"VARCHAR(32) NOT NULL DEFAULT ''",
+		"TEXT NOT NULL DEFAULT ''")
+}
+
+func ensureLogsUpstreamProtocol(ctx context.Context, db *sql.DB, dialect Dialect) error {
+	return ensureColumn(ctx, db, dialect, "logs", "upstream_protocol",
+		"VARCHAR(32) NOT NULL DEFAULT ''",
+		"TEXT NOT NULL DEFAULT ''")
+}
+
 // ensureAuthTokensCacheFields 确保auth_tokens表有缓存token字段(2025-12新增,支持MySQL和SQLite)
 func ensureAuthTokensCacheFields(ctx context.Context, db *sql.DB, dialect Dialect) error {
-	if dialect == DialectMySQL {
+	switch dialect {
+	case DialectMySQL:
 		return ensureAuthTokensCacheFieldsMySQL(ctx, db)
+	case DialectPostgres:
+		return ensurePostgresColumns(ctx, db, "auth_tokens", []mysqlColumnDef{
+			{name: "cache_read_tokens_total", definition: "BIGINT NOT NULL DEFAULT 0"},
+			{name: "cache_creation_tokens_total", definition: "BIGINT NOT NULL DEFAULT 0"},
+		})
+	default:
+		return ensureAuthTokensCacheFieldsSQLite(ctx, db)
 	}
-	return ensureAuthTokensCacheFieldsSQLite(ctx, db)
 }
 
 // ensureAuthTokensCacheFieldsSQLite SQLite增量迁移auth_tokens缓存字段
@@ -342,51 +491,130 @@ func ensureAuthTokensCacheFieldsMySQL(ctx context.Context, db *sql.DB) error {
 
 // ensureAuthTokensAllowedModels 确保auth_tokens表有allowed_models字段
 func ensureAuthTokensAllowedModels(ctx context.Context, db *sql.DB, dialect Dialect) error {
-	return ensureColumn(ctx, db, dialect, "auth_tokens", "allowed_models",
-		"VARCHAR(2000) NOT NULL DEFAULT ''",
-		"TEXT NOT NULL DEFAULT ''")
+	return ensureAuthTokenRestrictionColumn(ctx, db, dialect, "allowed_models")
 }
 
 // ensureAuthTokensAllowedChannelIDs 确保auth_tokens表有allowed_channel_ids字段
 func ensureAuthTokensAllowedChannelIDs(ctx context.Context, db *sql.DB, dialect Dialect) error {
-	return ensureColumn(ctx, db, dialect, "auth_tokens", "allowed_channel_ids",
-		"VARCHAR(2000) NOT NULL DEFAULT ''",
-		"TEXT NOT NULL DEFAULT ''")
+	return ensureAuthTokenRestrictionColumn(ctx, db, dialect, "allowed_channel_ids")
+}
+
+func ensureAuthTokenRestrictionColumn(ctx context.Context, db *sql.DB, dialect Dialect, column string) error {
+	if dialect != DialectPostgres {
+		return ensureColumn(ctx, db, dialect, "auth_tokens", column,
+			"VARCHAR(2000) NOT NULL DEFAULT ''",
+			"TEXT NOT NULL DEFAULT ''")
+	}
+
+	if err := ensurePostgresColumns(ctx, db, "auth_tokens", []mysqlColumnDef{{
+		name:       column,
+		definition: "TEXT NOT NULL DEFAULT ''",
+	}}); err != nil {
+		return err
+	}
+
+	var dataType string
+	if err := db.QueryRowContext(ctx, `
+		SELECT data_type
+		FROM information_schema.columns
+		WHERE table_schema = current_schema() AND table_name = 'auth_tokens' AND column_name = $1
+	`, column).Scan(&dataType); err != nil {
+		return fmt.Errorf("inspect auth_tokens.%s type: %w", column, err)
+	}
+	if dataType == "text" {
+		return nil
+	}
+	if dataType != "character varying" {
+		return fmt.Errorf("auth_tokens.%s has unsupported type %q", column, dataType)
+	}
+
+	// column 只来自上面两个固定调用点，不接受外部输入。
+	if _, err := db.ExecContext(ctx, fmt.Sprintf(
+		"ALTER TABLE auth_tokens ALTER COLUMN %s TYPE TEXT", column,
+	)); err != nil {
+		return fmt.Errorf("migrate auth_tokens.%s to TEXT: %w", column, err)
+	}
+	log.Printf("[MIGRATE] 已将 auth_tokens.%s 扩展为 TEXT (postgres)", column)
+	return nil
+}
+
+// ensureAuthTokensChannelRestrictionMode 确保auth_tokens表有channel_restriction_mode字段
+func ensureAuthTokensChannelRestrictionMode(ctx context.Context, db *sql.DB, dialect Dialect) error {
+	return ensureColumn(ctx, db, dialect, "auth_tokens", "channel_restriction_mode",
+		"VARCHAR(16) NOT NULL DEFAULT 'allow'",
+		"TEXT NOT NULL DEFAULT 'allow'")
 }
 
 // ensureAuthTokensCostLimit 确保auth_tokens表有费用限额字段（2026-01新增）
 func ensureAuthTokensCostLimit(ctx context.Context, db *sql.DB, dialect Dialect) error {
-	if dialect == DialectMySQL {
+	switch dialect {
+	case DialectMySQL:
 		return ensureMySQLColumns(ctx, db, "auth_tokens", []mysqlColumnDef{
 			{name: "cost_used_microusd", definition: "BIGINT NOT NULL DEFAULT 0"},
 			{name: "cost_limit_microusd", definition: "BIGINT NOT NULL DEFAULT 0"},
 		})
+	case DialectPostgres:
+		return ensurePostgresColumns(ctx, db, "auth_tokens", []mysqlColumnDef{
+			{name: "cost_used_microusd", definition: "BIGINT NOT NULL DEFAULT 0"},
+			{name: "cost_limit_microusd", definition: "BIGINT NOT NULL DEFAULT 0"},
+		})
+	default:
+		return ensureSQLiteColumns(ctx, db, "auth_tokens", []sqliteColumnDef{
+			{name: "cost_used_microusd", definition: "INTEGER NOT NULL DEFAULT 0"},
+			{name: "cost_limit_microusd", definition: "INTEGER NOT NULL DEFAULT 0"},
+		})
 	}
+}
 
-	// SQLite: 使用通用添加列函数
-	return ensureSQLiteColumns(ctx, db, "auth_tokens", []sqliteColumnDef{
-		{name: "cost_used_microusd", definition: "INTEGER NOT NULL DEFAULT 0"},
-		{name: "cost_limit_microusd", definition: "INTEGER NOT NULL DEFAULT 0"},
-	})
+// ensureAuthTokensPeriodCostLimits 确保auth_tokens表有日/月限额字段（2026-08新增）
+func ensureAuthTokensPeriodCostLimits(ctx context.Context, db *sql.DB, dialect Dialect) error {
+	switch dialect {
+	case DialectMySQL:
+		return ensureMySQLColumns(ctx, db, "auth_tokens", []mysqlColumnDef{
+			{name: "cost_daily_used_microusd", definition: "BIGINT NOT NULL DEFAULT 0"},
+			{name: "cost_daily_limit_microusd", definition: "BIGINT NOT NULL DEFAULT 0"},
+			{name: "cost_daily_period_start", definition: "BIGINT NOT NULL DEFAULT 0"},
+			{name: "cost_monthly_used_microusd", definition: "BIGINT NOT NULL DEFAULT 0"},
+			{name: "cost_monthly_limit_microusd", definition: "BIGINT NOT NULL DEFAULT 0"},
+			{name: "cost_monthly_period_start", definition: "BIGINT NOT NULL DEFAULT 0"},
+		})
+	case DialectPostgres:
+		return ensurePostgresColumns(ctx, db, "auth_tokens", []mysqlColumnDef{
+			{name: "cost_daily_used_microusd", definition: "BIGINT NOT NULL DEFAULT 0"},
+			{name: "cost_daily_limit_microusd", definition: "BIGINT NOT NULL DEFAULT 0"},
+			{name: "cost_daily_period_start", definition: "BIGINT NOT NULL DEFAULT 0"},
+			{name: "cost_monthly_used_microusd", definition: "BIGINT NOT NULL DEFAULT 0"},
+			{name: "cost_monthly_limit_microusd", definition: "BIGINT NOT NULL DEFAULT 0"},
+			{name: "cost_monthly_period_start", definition: "BIGINT NOT NULL DEFAULT 0"},
+		})
+	default:
+		return ensureSQLiteColumns(ctx, db, "auth_tokens", []sqliteColumnDef{
+			{name: "cost_daily_used_microusd", definition: "INTEGER NOT NULL DEFAULT 0"},
+			{name: "cost_daily_limit_microusd", definition: "INTEGER NOT NULL DEFAULT 0"},
+			{name: "cost_daily_period_start", definition: "INTEGER NOT NULL DEFAULT 0"},
+			{name: "cost_monthly_used_microusd", definition: "INTEGER NOT NULL DEFAULT 0"},
+			{name: "cost_monthly_limit_microusd", definition: "INTEGER NOT NULL DEFAULT 0"},
+			{name: "cost_monthly_period_start", definition: "INTEGER NOT NULL DEFAULT 0"},
+		})
+	}
 }
 
 // ensureAuthTokensMaxConcurrency 确保auth_tokens表有令牌并发限制字段（2026-04新增）
 func ensureAuthTokensMaxConcurrency(ctx context.Context, db *sql.DB, dialect Dialect) error {
-	if dialect == DialectMySQL {
+	switch dialect {
+	case DialectMySQL:
 		return ensureMySQLColumns(ctx, db, "auth_tokens", []mysqlColumnDef{
 			{name: "max_concurrency", definition: "INT NOT NULL DEFAULT 0"},
 		})
+	case DialectPostgres:
+		return ensurePostgresColumns(ctx, db, "auth_tokens", []mysqlColumnDef{
+			{name: "max_concurrency", definition: "INT NOT NULL DEFAULT 0"},
+		})
+	default:
+		return ensureSQLiteColumns(ctx, db, "auth_tokens", []sqliteColumnDef{
+			{name: "max_concurrency", definition: "INTEGER NOT NULL DEFAULT 0"},
+		})
 	}
-
-	return ensureSQLiteColumns(ctx, db, "auth_tokens", []sqliteColumnDef{
-		{name: "max_concurrency", definition: "INTEGER NOT NULL DEFAULT 0"},
-	})
-}
-
-func ensureChannelsProtocolTransformMode(ctx context.Context, db *sql.DB, dialect Dialect) error {
-	return ensureColumn(ctx, db, dialect, "channels", "protocol_transform_mode",
-		"VARCHAR(32) NOT NULL DEFAULT 'local'",
-		"TEXT NOT NULL DEFAULT 'local'")
 }
 
 // ensureChannelsDailyCostLimit 确保channels表有daily_cost_limit字段
@@ -434,10 +662,103 @@ func ensureChannelsCustomRequestRules(ctx context.Context, db *sql.DB, dialect D
 	return ensureColumn(ctx, db, dialect, "channels", "custom_request_rules", "TEXT", "TEXT")
 }
 
+func ensureChannelsCooldownDetectionRules(ctx context.Context, db *sql.DB, dialect Dialect) error {
+	return ensureColumn(ctx, db, dialect, "channels", "cooldown_detection_rules", "TEXT", "TEXT")
+}
+
 func ensureChannelsProxyURL(ctx context.Context, db *sql.DB, dialect Dialect) error {
 	return ensureColumn(ctx, db, dialect, "channels", "proxy_url",
 		"VARCHAR(255) NOT NULL DEFAULT ''",
 		"TEXT NOT NULL DEFAULT ''")
+}
+
+func ensureChannelsAvailableTime(ctx context.Context, db *sql.DB, dialect Dialect) error {
+	if err := ensureColumn(ctx, db, dialect, "channels", "available_time_start",
+		"VARCHAR(5) NOT NULL DEFAULT ''", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return err
+	}
+	return ensureColumn(ctx, db, dialect, "channels", "available_time_end",
+		"VARCHAR(5) NOT NULL DEFAULT ''", "TEXT NOT NULL DEFAULT ''")
+}
+
+func ensureChannelsRetryOtherKeysOnFailure(ctx context.Context, db *sql.DB, dialect Dialect) error {
+	return ensureColumn(ctx, db, dialect, "channels", "retry_other_keys_on_failure",
+		"TINYINT NOT NULL DEFAULT 0",
+		"INTEGER NOT NULL DEFAULT 0")
+}
+
+func ensureChannelsWebsockets(ctx context.Context, db *sql.DB, dialect Dialect) error {
+	return ensureColumn(ctx, db, dialect, "channels", "websockets",
+		"TINYINT NOT NULL DEFAULT 0",
+		"INTEGER NOT NULL DEFAULT 0")
+}
+
+func ensureChannelsProtocolTransformMode(ctx context.Context, db *sql.DB, dialect Dialect) error {
+	return ensureColumn(ctx, db, dialect, "channels", "protocol_transform_mode",
+		"VARCHAR(32) NOT NULL DEFAULT 'auto'",
+		"TEXT NOT NULL DEFAULT 'auto'")
+}
+
+// ensureChannelsAuthType adds an authentication-specific discriminator. It is
+// deliberately independent from the retained historical channel_type column.
+func ensureChannelsAuthType(ctx context.Context, db *sql.DB, dialect Dialect) error {
+	return ensureColumn(ctx, db, dialect, "channels", "auth_type",
+		"VARCHAR(32) NOT NULL DEFAULT 'api_key'",
+		"TEXT NOT NULL DEFAULT 'api_key'")
+}
+
+func ensureChannelsOAuthCredential(ctx context.Context, db *sql.DB, dialect Dialect) error {
+	legacyExists, err := migrationColumnExists(ctx, db, dialect, "channels", "codex_credential")
+	if err != nil {
+		return err
+	}
+	oauthExists, err := migrationColumnExists(ctx, db, dialect, "channels", "oauth_credential")
+	if err != nil {
+		return err
+	}
+	if oauthExists {
+		if legacyExists {
+			return errors.New("channels contains both codex_credential and oauth_credential")
+		}
+		return nil
+	}
+	if !legacyExists {
+		return ensureColumn(ctx, db, dialect, "channels", "oauth_credential", "TEXT", "TEXT")
+	}
+
+	statement := "ALTER TABLE channels RENAME COLUMN codex_credential TO oauth_credential"
+	if dialect == DialectMySQL {
+		statement = "ALTER TABLE channels CHANGE COLUMN codex_credential oauth_credential TEXT NULL"
+	}
+	if _, err := db.ExecContext(ctx, statement); err != nil {
+		return fmt.Errorf("rename channels codex_credential to oauth_credential: %w", err)
+	}
+	return nil
+}
+
+func migrationColumnExists(ctx context.Context, db *sql.DB, dialect Dialect, table, column string) (bool, error) {
+	switch dialect {
+	case DialectMySQL:
+		var count int
+		err := db.QueryRowContext(ctx,
+			"SELECT COUNT(*) FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME=? AND COLUMN_NAME=?",
+			table, column,
+		).Scan(&count)
+		return count > 0, err
+	case DialectPostgres:
+		var count int
+		err := db.QueryRowContext(ctx,
+			rebindIfPostgres(DialectPostgres, "SELECT COUNT(*) FROM information_schema.columns WHERE table_schema=current_schema() AND table_name=? AND column_name=?"),
+			table, column,
+		).Scan(&count)
+		return count > 0, err
+	default:
+		columns, err := sqliteExistingColumns(ctx, db, table)
+		if err != nil {
+			return false, err
+		}
+		return columns[column], nil
+	}
 }
 
 // migrateChannelsURLToText 将channels.url从VARCHAR(191)扩展为TEXT
@@ -524,6 +845,12 @@ func ensureChannelModelsRedirectField(ctx context.Context, db *sql.DB, dialect D
 		"TEXT NOT NULL DEFAULT ''")
 }
 
+func ensureChannelModelsDisabled(ctx context.Context, db *sql.DB, dialect Dialect) error {
+	return ensureColumn(ctx, db, dialect, "channel_models", "disabled",
+		"TINYINT NOT NULL DEFAULT 0",
+		"INTEGER NOT NULL DEFAULT 0")
+}
+
 func ensureAPIKeysDisabled(ctx context.Context, db *sql.DB, dialect Dialect) error {
 	return ensureColumn(ctx, db, dialect, "api_keys", "disabled",
 		"TINYINT NOT NULL DEFAULT 0",
@@ -546,21 +873,29 @@ func ensureAuthTokensEffectiveCost(ctx context.Context, db *sql.DB, dialect Dial
 
 	// 从 logs 回填历史数据（一次性）
 	const marker = "auth_tokens_effective_cost_backfill"
-	if hasMigration(ctx, db, marker) {
+	if hasMigration(ctx, db, marker, dialect) {
 		return nil
 	}
 
 	// 用 logs 表的 SUM(cost * cost_multiplier) 回填，按 token 聚合
 	// 防御性检查：logs 表可能尚未创建（迁移顺序依赖）
 	hasLogs := false
-	if dialect == DialectMySQL {
+	switch dialect {
+	case DialectMySQL:
 		var count int
 		if err := db.QueryRowContext(ctx,
 			"SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='logs'",
 		).Scan(&count); err == nil && count > 0 {
 			hasLogs = true
 		}
-	} else {
+	case DialectPostgres:
+		var count int
+		if err := db.QueryRowContext(ctx,
+			"SELECT COUNT(*) FROM information_schema.tables WHERE table_schema=current_schema() AND table_name='logs'",
+		).Scan(&count); err == nil && count > 0 {
+			hasLogs = true
+		}
+	default:
 		var name string
 		if err := db.QueryRowContext(ctx,
 			"SELECT name FROM sqlite_master WHERE type='table' AND name='logs'",

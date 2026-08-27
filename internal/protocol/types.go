@@ -21,6 +21,23 @@ const (
 	Gemini Protocol = "gemini"
 )
 
+// AllProtocols returns every supported protocol in canonical display order.
+// This is the single enumeration source: adding a protocol means updating
+// this list (plus the transform table below) and nothing else.
+func AllProtocols() []Protocol {
+	return []Protocol{Anthropic, Codex, OpenAI, Gemini}
+}
+
+// IsValid reports whether p is one of the supported protocols.
+func IsValid(p Protocol) bool {
+	switch p {
+	case Anthropic, Codex, OpenAI, Gemini:
+		return true
+	default:
+		return false
+	}
+}
+
 // RequestFamily identifies the client request surface that is being transformed.
 type RequestFamily string
 
@@ -34,6 +51,9 @@ const (
 	RequestFamilyCompletions     RequestFamily = "completions"
 	RequestFamilyEmbeddings      RequestFamily = "embeddings"
 	RequestFamilyImages          RequestFamily = "images"
+	// RequestFamilyAlphaSearch is the Codex /v1/alpha/search surface.
+	// It is native passthrough only — not a protocol-transform family.
+	RequestFamilyAlphaSearch RequestFamily = "alpha_search"
 )
 
 // TransformPlan captures the chosen transform metadata for one proxy attempt.
@@ -128,11 +148,16 @@ func DetectRequestFamily(path string) RequestFamily {
 	switch {
 	case matchesCanonicalEndpoint(path, "/v1/chat/completions"):
 		return RequestFamilyChatCompletions
-	case matchesCanonicalEndpoint(path, "/v1/responses"):
+	case matchesCanonicalEndpoint(path, "/v1/responses"),
+		matchesCanonicalEndpoint(path, "/v1/codex/responses"),
+		matchesCanonicalEndpoint(path, "/backend-api/codex/responses"):
 		return RequestFamilyResponses
 	case matchesCanonicalEndpoint(path, "/v1/messages"):
 		return RequestFamilyMessages
-	case strings.Contains(path, ":generateContent"), strings.Contains(path, ":streamGenerateContent"):
+	case matchesCanonicalEndpoint(path, "/v1/alpha/search"):
+		return RequestFamilyAlphaSearch
+	case strings.Contains(path, ":generateContent"), strings.Contains(path, ":streamGenerateContent"),
+		strings.Contains(path, ":countTokens"):
 		return RequestFamilyGenerateContent
 	case matchesCanonicalEndpoint(path, "/v1/completions"):
 		return RequestFamilyCompletions

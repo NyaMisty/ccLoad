@@ -15,7 +15,7 @@ function buildPriorityRow(rowClass, valueClass, value) {
 }
 
 const CHANNEL_PRIORITY_MIN = -99999;
-const CHANNEL_PRIORITY_MAX = 99999;
+const CHANNEL_PRIORITY_MAX = 9999999;
 let channelPrioritySaveTimers = new Map();
 
 function escapeChannelRefreshText(value) {
@@ -27,6 +27,33 @@ function escapeChannelRefreshText(value) {
     '"': '&quot;',
     "'": '&#39;'
   }[c]));
+}
+
+function buildOAuthPlanBadge(channel) {
+  let planType = '';
+  if (channel?.auth_type === 'codex_oauth') {
+    planType = String(channel.codex_plan_type || '').trim();
+  } else if (channel?.auth_type === 'antigravity_oauth') {
+    planType = String(channel.antigravity_paid_tier || '').trim();
+  } else if (channel?.auth_type === 'xai_oauth') {
+    planType = String(channel.xai_subscription_tier || '').trim();
+  } else if (channel?.auth_type === 'anthropic_oauth') {
+    planType = String(channel.anthropic_plan_type || '').trim();
+    const usageState = typeof getOAuthUsageState === 'function'
+      ? getOAuthUsageState(channel.id)
+      : null;
+    if (usageState?.status === 'ready' && String(usageState.data?.plan_type || '').trim()) {
+      planType = String(usageState.data.plan_type).trim();
+    }
+  }
+  if (!planType) return '';
+
+  const planTokens = planType.toLowerCase().split(/[^a-z0-9]+/).filter(Boolean);
+  if (channel?.auth_type !== 'xai_oauth' && planTokens.includes('free')) return '';
+
+  const planTone = ['plus', 'pro', 'team'].find(tier => planTokens.includes(tier));
+  const toneClass = planTone ? ` ch-oauth-plan-badge--${planTone}` : '';
+  return `<span class="ch-oauth-plan-badge${toneClass}">${escapeChannelRefreshText(planType)}</span>`;
 }
 
 function normalizeBatchRefreshChannelID(channelID) {
@@ -177,10 +204,6 @@ async function copyChannelLastRequestFailure(btn) {
     if (window.showError) window.showError(window.t('channels.keyCopyFailed'));
   }
 }
-if (!window.ChannelProtocolConfig) {
-  throw new Error('ChannelProtocolConfig helper is required before channels-render.js');
-}
-
 function buildEffectivePriorityHtml(channel) {
   const basePriority = channel.priority;
   const priorityLabel = window.t('channels.table.priority');
@@ -235,7 +258,7 @@ function normalizeInlinePriorityValue(value, fallback) {
 }
 
 function buildPriorityEditorRow(channelId, priority, priorityLabel) {
-  const disabledAttr = channelId > 0 ? '' : ' disabled';
+  const disabledAttr = channelId > 0 && !isTokenChannelsReadOnly() ? '' : ' disabled';
   return `<div class="ch-priority-row ch-priority-base">
     <div class="ch-priority-editor-wrap" data-channel-id="${channelId}">
       <div class="ch-priority-editor">
@@ -274,7 +297,7 @@ function updateLocalChannelPriority(channelId, priority) {
 }
 
 async function saveInlineChannelPriority(input) {
-  if (!input) return;
+  if (!input || isTokenChannelsReadOnly()) return;
   const channelId = Number(input.dataset.channelId);
   if (!Number.isFinite(channelId) || channelId <= 0) return;
 
@@ -316,7 +339,7 @@ async function saveInlineChannelPriority(input) {
 }
 
 function queueInlineChannelPrioritySave(input, delay = 1000) {
-  if (!input) return;
+  if (!input || isTokenChannelsReadOnly()) return;
   const channelId = Number(input.dataset.channelId);
   if (!Number.isFinite(channelId) || channelId <= 0) return;
   input.classList.add('is-dirty');
@@ -330,7 +353,7 @@ function queueInlineChannelPrioritySave(input, delay = 1000) {
 }
 
 function flushInlineChannelPrioritySave(input) {
-  if (!input) return;
+  if (!input || isTokenChannelsReadOnly()) return;
   const channelId = Number(input.dataset.channelId);
   const existingTimer = channelPrioritySaveTimers.get(channelId);
   if (existingTimer) {
@@ -338,49 +361,6 @@ function flushInlineChannelPrioritySave(input) {
     channelPrioritySaveTimers.delete(channelId);
   }
   return saveInlineChannelPriority(input);
-}
-
-function inlineCooldownBadge(c) {
-  const ms = c.cooldown_remaining_ms || 0;
-  if (!ms || ms <= 0) return '';
-  const text = humanizeMS(ms);
-  return `<span style="display: inline-flex; align-items: center; color: #dc2626; font-size: 0.68rem; font-weight: 600; line-height: 1; background: linear-gradient(135deg, #fee2e2 0%, #fecaca 100%); padding: 1px 6px; border-radius: 4px; border: 1px solid #fca5a5; vertical-align: middle;">${window.t('channels.cooldownBadge', { time: text })}</span>`;
-}
-
-/**
- * 获取渠道类型配置信息
- * @param {string} channelType - 渠道类型
- * @returns {Object} 类型配置
- */
-function getChannelTypeConfig(channelType) {
-  const configs = {
-    'anthropic': {
-      text: 'Claude',
-      color: '#8b5cf6',
-      bgColor: '#f3e8ff',
-      borderColor: '#c4b5fd'
-    },
-    'codex': {
-      text: 'Codex',
-      color: '#059669',
-      bgColor: '#d1fae5',
-      borderColor: '#6ee7b7'
-    },
-    'openai': {
-      text: 'OpenAI',
-      color: '#10b981',
-      bgColor: '#d1fae5',
-      borderColor: '#6ee7b7'
-    },
-    'gemini': {
-      text: 'Gemini',
-      color: '#2563eb',
-      bgColor: '#dbeafe',
-      borderColor: '#93c5fd'
-    }
-  };
-  const type = (channelType || '').toLowerCase();
-  return configs[type] || configs['anthropic'];
 }
 
 function buildInlineNameBadgeStyle({ background, color, borderColor, borderStyle = 'solid' }) {
@@ -396,62 +376,6 @@ function buildInlineNameBadgeStyle({ background, color, borderColor, borderStyle
     `border: 1px ${borderStyle} ${borderColor}`,
     'line-height: 1'
   ].join('; ');
-}
-
-/**
- * 生成渠道类型徽章HTML
- * @param {string} channelType - 渠道类型
- * @returns {string} 徽章HTML
- */
-function buildChannelTypeBadge(channelType) {
-  const config = getChannelTypeConfig(channelType);
-  const badgeStyle = buildInlineNameBadgeStyle({
-    background: config.bgColor,
-    color: config.color,
-    borderColor: config.borderColor
-  });
-  return `<span style="${badgeStyle}">${config.text}</span>`;
-}
-
-function getProtocolTransformBadgeLabel(protocol) {
-  const labels = {
-    anthropic: ['channels.protocolBadgeAnthropic', 'Claude'],
-    codex: ['channels.protocolTransformCodex', 'Codex'],
-    openai: ['channels.protocolTransformOpenAI', 'OpenAI'],
-    gemini: ['channels.protocolTransformGemini', 'Gemini']
-  };
-  const [translationKey, fallback] = labels[protocol] || [];
-  if (!translationKey) return protocol;
-  if (window.t) {
-    const translated = window.t(translationKey);
-    if (translated && translated !== translationKey) {
-      return translated;
-    }
-  }
-  return fallback;
-}
-
-function normalizeProtocolTransformsForDisplay(channelType, protocolTransforms) {
-  return window.ChannelProtocolConfig.normalizeProtocolTransformsForChannel(channelType, protocolTransforms);
-}
-
-function buildProtocolTransformBadges(channelType, protocolTransforms) {
-  const transforms = normalizeProtocolTransformsForDisplay(channelType, protocolTransforms);
-  if (transforms.length === 0) return '';
-
-  const translatedPrefix = window.t ? window.t('channels.modal.protocolTransforms') : '';
-  const titlePrefix = translatedPrefix && translatedPrefix !== 'channels.modal.protocolTransforms'
-    ? translatedPrefix
-    : 'Additional Protocol Transforms';
-
-  const protocolBadgeStyle = buildInlineNameBadgeStyle({
-    background: '#fff7ed',
-    color: '#9a3412',
-    borderColor: '#fdba74',
-    borderStyle: 'dashed'
-  });
-
-  return `<span style="display: inline-flex; align-items: center; gap: 4px; flex-wrap: wrap; margin-left: 6px; vertical-align: middle;">${transforms.map((protocol) => `<span title="${titlePrefix}: ${getProtocolTransformBadgeLabel(protocol)}" style="${protocolBadgeStyle}">${getProtocolTransformBadgeLabel(protocol)}</span>`).join('')}</span>`;
 }
 
 /**
@@ -598,6 +522,396 @@ function buildChannelLastRequestFailureHtml(stats) {
   </div>`;
 }
 
+function formatCooldownRecoveryTime(remainingMS) {
+  const ms = Math.max(0, Number(remainingMS) || 0);
+  if (ms <= 5 * 60 * 1000) {
+    return window.t('channels.status.secondsUntilRecovery', { count: Math.ceil(ms / 1000) });
+  }
+  const totalMinutes = Math.ceil(ms / 60000);
+  if (ms < 60 * 60 * 1000) {
+    return window.t('channels.status.minutesUntilRecovery', { count: totalMinutes });
+  }
+  return window.t('channels.status.hoursMinutesUntilRecovery', {
+    hours: Math.floor(totalMinutes / 60),
+    minutes: totalMinutes % 60
+  });
+}
+
+function formatOAuthUsagePercent(value) {
+  const percent = Math.min(100, Math.max(0, Number(value) || 0));
+  return Number.isInteger(percent) ? String(percent) : percent.toFixed(1).replace(/\.0$/, '');
+}
+
+// 累计标准成本按美元显示，与渠道日消费同一形状，无需本地化前缀。
+function formatOAuthAccumulatedCost(standardCostMicroUSD) {
+  const microUSD = Number(standardCostMicroUSD);
+  if (!Number.isFinite(microUSD) || microUSD < 0) return '';
+  return `$${(microUSD / 1_000_000).toFixed(1)}`;
+}
+
+// 累计成本按上游窗口标识（limit_name|kind）取用：同一时长可能对应多个互不相干的窗口。
+function oauthAccumulatedCostByKey(quotaCostUsage, key) {
+  const windows = Array.isArray(quotaCostUsage?.windows) ? quotaCostUsage.windows : [];
+  const match = windows.find(item => item?.key === key);
+  return match ? match.standard_cost_microusd : null;
+}
+
+function formatOAuthUsageResetAt(resetAt) {
+  const timestamp = Number(resetAt);
+  if (!Number.isFinite(timestamp) || timestamp <= 0) return '';
+  const date = new Date(timestamp * 1000);
+  if (Number.isNaN(date.getTime())) return '';
+  const pad = value => String(value).padStart(2, '0');
+  return `${pad(date.getMonth() + 1)}/${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`;
+}
+
+function formatOAuthUsageWindowDuration(seconds) {
+  const duration = Math.max(0, Number(seconds) || 0);
+  const day = 24 * 60 * 60;
+  if (duration >= 28 * day && duration <= 31 * day) return window.t('channels.oauth.usageMonthly');
+  if (duration === 7 * day) return window.t('channels.oauth.usageWeekly');
+  if (duration > 0 && duration % day === 0) {
+    return window.t('channels.oauth.usageDays', { count: duration / day });
+  }
+  if (duration > 0 && duration % (60 * 60) === 0) {
+    return window.t('channels.oauth.usageHours', { count: duration / (60 * 60) });
+  }
+  return window.t('channels.oauth.usageQuota');
+}
+
+function formatOAuthUsageLimitName(limitName) {
+  const normalized = String(limitName || '').trim().toLowerCase();
+  if (!normalized || normalized === 'codex') return '';
+  if (normalized === 'codex-spark') return 'GPT-5.3-Codex-Spark';
+  if (normalized === 'gemini models') return 'Gemini';
+  // Z.ai 的 token 窗口只有时长有信息量，时长已单独渲染，避免出现「five_hour 5小时」。
+  if (normalized === 'five_hour' || normalized === 'weekly') return '';
+  if (normalized === 'mcp_limit') return 'MCP';
+  if (normalized === 'claude and gpt models') return 'Claude';
+  return String(limitName).trim();
+}
+
+function formatOAuthUsageError(value) {
+  const raw = String(value || '').trim();
+  if (!raw) return '';
+  let payload;
+  try {
+    payload = JSON.parse(raw);
+  } catch (_) {
+    return raw;
+  }
+  if (typeof payload === 'string') return payload.trim() || raw;
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return raw;
+
+  const nested = payload.error && typeof payload.error === 'object' ? payload.error : null;
+  const code = String(
+    (typeof payload.error === 'string' ? payload.error : '') ||
+    nested?.code || nested?.type || payload.code || payload.type || ''
+  ).trim();
+  const description = String(
+    payload.error_description || nested?.message || payload.message || payload.description || ''
+  ).trim();
+  return description || code || raw;
+}
+
+function oauthUsageLevel(remainingPercent) {
+  if (remainingPercent >= 70) return 'high';
+  if (remainingPercent >= 30) return 'medium';
+  if (remainingPercent > 0) return 'low';
+  return 'empty';
+}
+
+function buildOAuthUsageRefreshButton(channelID, loading = false, disabled = false) {
+  const text = loading
+    ? window.t('channels.oauth.usageRefreshing')
+    : window.t('channels.oauth.usageRefresh');
+  return `<button type="button" class="ch-oauth-usage__refresh channel-action-btn" data-action="refresh-oauth-usage" data-channel-id="${channelID}"${loading || disabled ? ' disabled' : ''}${loading ? ' aria-busy="true"' : ''}>${escapeChannelRefreshText(text)}</button>`;
+}
+
+function formatCodexResetCreditExpiry(expiresAt) {
+  const date = new Date(String(expiresAt || '').trim());
+  if (Number.isNaN(date.getTime()) || date.getTime() <= Date.now()) return null;
+  const pad = value => String(value).padStart(2, '0');
+  return {
+    timestamp: date.getTime(),
+    text: `${pad(date.getMonth() + 1)}/${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`
+  };
+}
+
+function buildCodexResetCreditsHtml(data, state, channelID) {
+  const resetCredits = data?.rate_limit_reset_credits || {};
+  const rawCount = Number(resetCredits.available_count);
+  const normalizedCount = Number.isInteger(rawCount) && rawCount > 0 ? rawCount : 0;
+  const hasCreditList = Array.isArray(resetCredits.credits);
+  const expiries = (hasCreditList ? resetCredits.credits : [])
+    .map(credit => formatCodexResetCreditExpiry(credit?.expires_at))
+    .filter(Boolean)
+    .sort((left, right) => left.timestamp - right.timestamp);
+  const availableCount = hasCreditList ? Math.min(normalizedCount, expiries.length) : normalizedCount;
+  if (availableCount <= 0) return '';
+  const visibleExpiries = expiries.slice(0, availableCount);
+  const earliest = visibleExpiries[0]?.text || '';
+  const resetting = state?.reset_status === 'loading';
+  const stale = state?.reset_status === 'stale';
+  const disabled = resetting || stale;
+  const buttonText = resetting
+    ? window.t('channels.oauth.resettingQuota')
+    : window.t('channels.oauth.resetQuota');
+  const expiryText = earliest
+    ? window.t('channels.oauth.resetCreditExpiresEarliest', { time: earliest })
+    : window.t('channels.oauth.resetCreditExpiresUnknown');
+  const resetError = String(state?.reset_error || '').trim();
+  const expiryDetails = visibleExpiries.length > 1
+    ? `<details class="ch-oauth-usage__credit-expiries">
+        <summary>${escapeChannelRefreshText(window.t('channels.oauth.resetCreditExpiresAll', { count: visibleExpiries.length }))}</summary>
+        <ul>${visibleExpiries.map(expiry => `<li>${escapeChannelRefreshText(expiry.text)}</li>`).join('')}</ul>
+      </details>`
+    : '';
+  return `<div class="ch-oauth-usage__credits">
+    <div class="ch-oauth-usage__credits-summary">
+      <span class="ch-oauth-usage__credit-count">${escapeChannelRefreshText(window.t('channels.oauth.resetCredits', { count: availableCount }))}</span>
+      <span class="ch-oauth-usage__credit-expiry">${escapeChannelRefreshText(expiryText)}</span>
+      <button type="button" class="ch-oauth-usage__reset-action channel-action-btn" data-action="reset-codex-quota" data-channel-id="${channelID}" data-reset-count="${availableCount}" data-reset-expiry="${escapeChannelRefreshText(earliest)}"${disabled ? ' disabled' : ''}${resetting ? ' aria-busy="true"' : ''}>${escapeChannelRefreshText(buttonText)}</button>
+    </div>
+    ${expiryDetails}
+    ${resetError ? `<div class="ch-oauth-usage__error" role="status">${escapeChannelRefreshText(resetError)}</div>` : ''}
+  </div>`;
+}
+
+function formatXAIUsagePercent(value) {
+  if (value === null || value === undefined || value === '' || !Number.isFinite(Number(value))) return '--';
+  const percent = Math.min(100, Math.max(0, Number(value)));
+  return `${Number.isInteger(percent) ? percent : percent.toFixed(2).replace(/0+$/, '').replace(/\.$/, '')}%`;
+}
+
+function formatXAIUsageMoney(cents) {
+  if (cents === null || cents === undefined || cents === '' || !Number.isFinite(Number(cents))) return '--';
+  return `US$${(Math.round(Number(cents)) / 100).toFixed(2)}`;
+}
+
+function formatXAIUsageReset(resetAt) {
+  const date = new Date(String(resetAt || '').trim());
+  if (Number.isNaN(date.getTime())) return '';
+  const pad = value => String(value).padStart(2, '0');
+  return `${pad(date.getMonth() + 1)}/${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`;
+}
+
+function xaiUsageNumber(value) {
+  if (value === null || value === undefined || value === '') return null;
+  const number = Number(value);
+  return Number.isFinite(number) ? number : null;
+}
+
+function buildXAIUsageInlineRow(label, value) {
+  return `<div class="ch-oauth-usage__window">
+    <div class="ch-oauth-usage__meta">
+      <span class="ch-oauth-usage__label" title="${escapeChannelRefreshText(label)}">${escapeChannelRefreshText(label)}</span>
+      <span class="ch-oauth-usage__details">
+        <span class="ch-oauth-usage__percent">${escapeChannelRefreshText(value)}</span>
+      </span>
+    </div>
+  </div>`;
+}
+
+function buildXAIUsageRow(label, usedPercent, amount, resetAt, accumulatedCostMicroUSD) {
+  const percent = formatXAIUsagePercent(usedPercent);
+  const reset = formatXAIUsageReset(resetAt);
+  const accumulatedCost = formatOAuthAccumulatedCost(accumulatedCostMicroUSD);
+  const numericUsed = xaiUsageNumber(usedPercent);
+  const remaining = numericUsed !== null ? Math.min(100, Math.max(0, 100 - numericUsed)) : 0;
+  const ariaLabel = numericUsed === null
+    ? `${label}: ${window.t('channels.oauth.usageUsed', { percent })}`
+    : window.t('channels.oauth.usageRemaining', {
+      label,
+      percent: formatOAuthUsagePercent(remaining)
+    });
+  return `<div class="ch-oauth-usage__window">
+    <div class="ch-oauth-usage__meta">
+      <span class="ch-oauth-usage__heading">
+        <span class="ch-oauth-usage__label" title="${escapeChannelRefreshText(label)}">${escapeChannelRefreshText(label)}</span>
+        ${accumulatedCost ? `<span class="ch-oauth-usage__amount">${escapeChannelRefreshText(accumulatedCost)}</span>` : ''}
+      </span>
+      <span class="ch-oauth-usage__details">
+        <span class="ch-oauth-usage__percent">${escapeChannelRefreshText(window.t('channels.oauth.usageUsed', { percent }))}</span>
+        ${amount ? `<span class="ch-oauth-usage__amount">${escapeChannelRefreshText(amount)}</span>` : ''}
+        ${reset ? `<span class="ch-oauth-usage__reset">${escapeChannelRefreshText(window.t('channels.oauth.usageReset', { time: reset }))}</span>` : ''}
+      </span>
+    </div>
+    <div class="ch-oauth-usage__track" role="progressbar" aria-label="${escapeChannelRefreshText(ariaLabel)}" aria-valuemin="0" aria-valuemax="100"${numericUsed !== null ? ` aria-valuenow="${remaining}"` : ''}>
+      <span class="ch-oauth-usage__fill ch-oauth-usage__fill--${oauthUsageLevel(remaining)}" style="width:${remaining}%"></span>
+    </div>
+  </div>`;
+}
+
+function buildXAIUsageRows(data) {
+  const billing = data?.xai_billing || {};
+  const rows = [];
+  const plan = String(data?.plan_type || data?.subscription_tier || '').trim();
+  if (plan) {
+    rows.push(buildXAIUsageInlineRow(window.t('channels.oauth.usagePlan'), plan));
+  }
+  if (billing.weekly_present === true) {
+    rows.push(buildXAIUsageRow(
+      window.t('channels.oauth.usageWeekly'),
+      billing.weekly_usage_percent,
+      '',
+      billing.weekly_reset_at,
+      oauthAccumulatedCostByKey(data?.quota_cost_usage, 'xai|weekly')
+    ));
+  }
+  const products = Array.isArray(billing.product_usage) ? billing.product_usage : [];
+  for (const product of products) {
+    rows.push(buildXAIUsageRow(
+      window.t('channels.oauth.usageProduct', { product: String(product?.product || '') }),
+      product?.usage_percent,
+      '',
+      ''
+    ));
+  }
+  const onDemandCap = xaiUsageNumber(billing.on_demand_cap_cents);
+  if (onDemandCap !== null && onDemandCap > 0) {
+    const used = xaiUsageNumber(billing.on_demand_used_cents);
+    const usedPercent = used !== null ? used * 100 / onDemandCap : null;
+    rows.push(buildXAIUsageRow(
+      window.t('channels.oauth.usageOnDemand'),
+      usedPercent,
+      `${formatXAIUsageMoney(billing.on_demand_used_cents)} / ${formatXAIUsageMoney(billing.on_demand_cap_cents)}`,
+      ''
+    ));
+  } else {
+    rows.push(buildXAIUsageInlineRow(
+      window.t('channels.oauth.usageOnDemand'),
+      window.t('channels.oauth.usageOnDemandDisabled')
+    ));
+  }
+  const monthlyLimit = xaiUsageNumber(billing.monthly_limit_cents);
+  const includedUsed = xaiUsageNumber(billing.included_used_cents);
+  const monthlyPercent = monthlyLimit !== null && monthlyLimit > 0 && includedUsed !== null
+    ? includedUsed * 100 / monthlyLimit
+    : null;
+  if (billing.monthly_present === true) {
+    rows.push(buildXAIUsageRow(
+      window.t('channels.oauth.usageMonthlyCredits'),
+      monthlyPercent,
+      `${formatXAIUsageMoney(billing.included_used_cents)} / ${formatXAIUsageMoney(billing.monthly_limit_cents)}`,
+      billing.monthly_reset_at,
+      oauthAccumulatedCostByKey(data?.quota_cost_usage, 'xai|monthly')
+    ));
+  }
+  return rows;
+}
+
+function buildOAuthUsageStatusHtml(channel) {
+  if (!['codex_oauth', 'antigravity_oauth', 'xai_oauth', 'anthropic_oauth', 'zai_oauth'].includes(channel?.auth_type) ||
+      (typeof isTokenChannelsReadOnly === 'function' && isTokenChannelsReadOnly())) {
+    return '';
+  }
+  const liveState = typeof getOAuthUsageState === 'function' ? getOAuthUsageState(channel.id) : null;
+  const state = liveState || (channel?.oauth_usage ? { status: 'ready', data: channel.oauth_usage } : null);
+  if (!state) {
+    return `<div class="ch-oauth-usage">${buildOAuthUsageRefreshButton(channel.id)}</div>`;
+  }
+  if (state.status === 'loading') {
+    return `<div class="ch-oauth-usage">${buildOAuthUsageRefreshButton(channel.id, true)}</div>`;
+  }
+  if (state.status === 'error') {
+    const fallback = window.t('channels.oauth.usageFailed');
+    const message = formatOAuthUsageError(state.error) || fallback;
+    return `<div class="ch-oauth-usage">
+      ${buildOAuthUsageRefreshButton(channel.id)}
+      <div class="ch-oauth-usage__error" title="${escapeChannelRefreshText(message)}">${escapeChannelRefreshText(message)}</div>
+    </div>`;
+  }
+
+  const windows = Array.isArray(state.data?.windows) ? state.data.windows : [];
+  const isXAI = channel?.auth_type === 'xai_oauth' || state.data?.provider === 'xai';
+  const isCodex = channel?.auth_type === 'codex_oauth';
+  const rows = isXAI ? buildXAIUsageRows(state.data) : windows.map(windowInfo => {
+    const remaining = Math.min(100, Math.max(0, Number(windowInfo?.remaining_percent) || 0));
+    const percent = formatOAuthUsagePercent(remaining);
+    const duration = formatOAuthUsageWindowDuration(windowInfo?.limit_window_seconds);
+    const limitName = formatOAuthUsageLimitName(windowInfo?.limit_name);
+    // 名称与时长的连接方式交给语言包：中文直接相连，英文才需要空格。
+    const label = limitName
+      ? window.t('channels.oauth.usageLabel', { name: limitName, duration })
+      : duration;
+    const resetAt = formatOAuthUsageResetAt(windowInfo?.reset_at);
+    const accumulatedCost = formatOAuthAccumulatedCost(windowInfo?.standard_cost_microusd);
+    const ariaLabel = window.t('channels.oauth.usageRemaining', { label, percent });
+    return `<div class="ch-oauth-usage__window">
+      <div class="ch-oauth-usage__meta">
+        <span class="ch-oauth-usage__heading">
+          <span class="ch-oauth-usage__label" title="${escapeChannelRefreshText(label)}">${escapeChannelRefreshText(label)}</span>
+          ${accumulatedCost ? `<span class="ch-oauth-usage__amount">${escapeChannelRefreshText(accumulatedCost)}</span>` : ''}
+        </span>
+        <span class="ch-oauth-usage__details">
+          <span class="ch-oauth-usage__percent">${escapeChannelRefreshText(percent)}%</span>
+          ${resetAt ? `<span class="ch-oauth-usage__reset">${escapeChannelRefreshText(resetAt)}</span>` : ''}
+        </span>
+      </div>
+      <div class="ch-oauth-usage__track" role="progressbar" aria-label="${escapeChannelRefreshText(ariaLabel)}" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${escapeChannelRefreshText(percent)}">
+        <span class="ch-oauth-usage__fill ch-oauth-usage__fill--${oauthUsageLevel(remaining)}" style="width:${remaining}%"></span>
+      </div>
+    </div>`;
+  });
+  const warnings = Array.isArray(state.data?.warnings)
+    ? state.data.warnings.filter(Boolean).map(warning => `<li>${escapeChannelRefreshText(warning)}</li>`).join('')
+    : '';
+  return `<div class="ch-oauth-usage">
+    <div class="ch-oauth-usage__toolbar">${buildOAuthUsageRefreshButton(channel.id, false, state.reset_status === 'loading')}</div>
+    ${rows.join('')}
+    ${isCodex ? buildCodexResetCreditsHtml(state.data, state, channel.id) : ''}
+    ${warnings ? `<div role="status"><span>${escapeChannelRefreshText(window.t('channels.oauth.usageWarnings'))}</span><ul>${warnings}</ul></div>` : ''}
+  </div>`;
+}
+
+function buildChannelRuntimeStatusHtml(channel, stats) {
+  const statuses = [];
+  const channelCooldownMS = Number(channel.cooldown_remaining_ms || 0);
+  if (channelCooldownMS > 0) {
+    const text = window.t('channels.status.channelCooldown', { time: formatCooldownRecoveryTime(channelCooldownMS) });
+    statuses.push(`<div class="ch-runtime-status ch-runtime-status--channel">${escapeChannelRefreshText(text)}</div>`);
+  }
+
+  const coolingKeys = (Array.isArray(channel.key_cooldowns) ? channel.key_cooldowns : [])
+    .map(key => Number(key?.cooldown_remaining_ms || 0))
+    .filter(remainingMS => remainingMS > 0);
+  if (coolingKeys.length > 0) {
+    const nextRecoveryMS = Math.min(...coolingKeys);
+    const text = window.t('channels.status.keyCooldowns', {
+      count: coolingKeys.length,
+      time: formatCooldownRecoveryTime(nextRecoveryMS)
+    });
+    const label = window.t('channels.status.viewKeyCooldowns', { count: coolingKeys.length });
+    statuses.push(`<button type="button" class="ch-runtime-status ch-runtime-status--keys channel-action-btn" data-action="edit-cooling-keys" data-channel-id="${channel.id}" aria-label="${escapeChannelRefreshText(label)}">${escapeChannelRefreshText(text)}</button>`);
+  }
+
+  const coolingModels = (Array.isArray(channel.model_cooldowns) ? channel.model_cooldowns : [])
+    .map(model => Number(model?.cooldown_remaining_ms || 0))
+    .filter(remainingMS => remainingMS > 0);
+  if (coolingModels.length > 0) {
+    const nextRecoveryMS = Math.min(...coolingModels);
+    const text = window.t('channels.status.modelCooldowns', {
+      count: coolingModels.length,
+      time: formatCooldownRecoveryTime(nextRecoveryMS)
+    });
+    statuses.push(`<div class="ch-runtime-status ch-runtime-status--models">${escapeChannelRefreshText(text)}</div>`);
+  }
+
+  const oauthUsageState = typeof getOAuthUsageState === 'function' ? getOAuthUsageState(channel.id) : null;
+  if (statuses.length === 0 && oauthUsageState?.status !== 'ready') {
+    const lastSuccessHtml = buildChannelLastSuccessHtml(stats);
+    if (lastSuccessHtml) statuses.push(lastSuccessHtml);
+  }
+
+  const oauthUsageHtml = buildOAuthUsageStatusHtml(channel);
+  if (oauthUsageHtml) statuses.push(oauthUsageHtml);
+
+  return statuses.length > 0
+    ? `<div class="ch-runtime-status-list">${statuses.join('')}</div>`
+    : '';
+}
+
 /**
  * 使用模板引擎创建渠道表格行
  * @param {Object} channel - 渠道数据
@@ -605,7 +919,13 @@ function buildChannelLastRequestFailureHtml(stats) {
  */
 function createChannelCard(channel) {
   const isCooldown = channel.cooldown_remaining_ms > 0;
-  const channelTypeRaw = (channel.channel_type || '').toLowerCase();
+  const configuredProtocols = new Set(
+    (Array.isArray(channel.urls) ? channel.urls : [])
+      .flatMap(entry => Array.isArray(entry?.protocols) ? entry.protocols : [])
+      .map(protocol => String(protocol || '').trim().toLowerCase())
+  );
+  const hasAutoProtocolURL = (Array.isArray(channel.urls) ? channel.urls : [])
+    .some(entry => !Array.isArray(entry?.protocols) || entry.protocols.length === 0);
   const stats = channelStatsById[channel.id] || null;
   const batchRefreshResult = getBatchRefreshResult(channel.id);
 
@@ -625,7 +945,8 @@ function createChannelCard(channel) {
     : '';
 
   const durationHtml = buildChannelTimingHtml(stats);
-  const lastSuccessHtml = buildChannelLastSuccessHtml(stats);
+  const runtimeStatusHtml = buildChannelRuntimeStatusHtml(channel, stats);
+  const lastRequestFailureHtml = buildChannelLastRequestFailureHtml(stats);
 
   // 消耗HTML：仅保留 token 相关消耗项
   let usageHtml = '';
@@ -633,7 +954,7 @@ function createChannelCard(channel) {
     const parts = [];
     parts.push(`<div class="ch-usage-row"><span class="ch-usage-label">${window.t('channels.stats.input')}</span><span class="ch-usage-value" style="color: var(--warning-500);">${statsCache.inputTokensText}</span></div>`);
     parts.push(`<div class="ch-usage-row"><span class="ch-usage-label">${window.t('channels.stats.output')}</span><span class="ch-usage-value" style="color: var(--warning-500);">${statsCache.outputTokensText}</span></div>`);
-    const supportsCaching = channelTypeRaw === 'anthropic' || channelTypeRaw === 'codex';
+    const supportsCaching = hasAutoProtocolURL || configuredProtocols.has('anthropic') || configuredProtocols.has('codex');
     if (supportsCaching) {
       parts.push(`<div class="ch-usage-row"><span class="ch-usage-label">${window.t('channels.stats.cacheRead')}</span><span class="ch-usage-value" style="color: var(--success-500);">${statsCache.cacheReadText}</span></div>`);
       if (statsCache.cacheCreationTokens > 0) {
@@ -659,29 +980,33 @@ function createChannelCard(channel) {
   // 行class
   const rowClasses = ['channel-table-row'];
   if (isCooldown) rowClasses.push('channel-card-cooldown');
-  const lastRequestFailureHtml = buildChannelLastRequestFailureHtml(stats);
   if (batchRefreshResult && batchRefreshResult.status) {
     rowClasses.push(`channel-row-refresh-${batchRefreshResult.status}`);
   }
 
   // 准备模板数据
+  const configuredURLs = (Array.isArray(channel.urls) ? channel.urls : [])
+    .map(entry => {
+      const url = String(entry?.url || '').trim();
+      return url && entry?.exact ? `${url}#` : url;
+    })
+    .filter(Boolean);
+
   const cardData = {
     rowClasses: rowClasses.join(' '),
     id: channel.id,
-    name: channel.name,
-    nameMultiplierBadge: buildCornerMultiplierBadge(channel.cost_multiplier),
-    typeBadge: buildChannelTypeBadge(channelTypeRaw),
-    protocolTransformBadges: buildProtocolTransformBadges(channelTypeRaw, channel.protocol_transforms),
-    url: channel.url,
+		name: channel.name,
+		nameMultiplierBadge: buildCornerMultiplierBadge(channel.cost_multiplier),
+    oauthPlanBadge: buildOAuthPlanBadge(channel),
+    url: configuredURLs.join('\n'),
     batchRefreshStatusHtml: buildBatchRefreshStatusHtml(batchRefreshResult),
     modelsText: modelsText,
     priority: channel.priority,
     effectivePriorityHtml: buildEffectivePriorityHtml(channel),
-    cooldownBadge: inlineCooldownBadge(channel),
     durationHtml: durationHtml,
     usageHtml: usageHtml,
     costHtml: costHtml,
-    lastSuccessHtml: lastSuccessHtml,
+    runtimeStatusHtml: runtimeStatusHtml,
     lastRequestFailureHtml: lastRequestFailureHtml,
     healthHtml: healthHtml,
     enabled: channel.enabled,
@@ -690,19 +1015,28 @@ function createChannelCard(channel) {
     durationCellClass: durationHtml ? '' : 'ch-mobile-empty',
     usageCellClass: usageHtml ? '' : 'ch-mobile-empty',
     costCellClass: costHtml ? '' : 'ch-mobile-empty',
-    lastSuccessCellClass: lastSuccessHtml ? '' : 'ch-mobile-empty',
+    lastSuccessCellClass: runtimeStatusHtml ? '' : 'ch-mobile-empty',
     mobileLabelModels: window.t('channels.table.models'),
     mobileLabelPriority: window.t('channels.table.priority'),
     mobileLabelDuration: window.t('channels.table.duration'),
     mobileLabelUsage: window.t('channels.table.usage'),
     mobileLabelCost: window.t('channels.stats.cost'),
-    mobileLabelLastSuccess: window.t('channels.table.lastSuccess'),
+    mobileLabelLastSuccess: window.t('channels.table.statusAndLastSuccess'),
     mobileLabelEnabled: window.t('channels.table.enabled'),
     mobileLabelActions: window.t('channels.table.actions')
   };
 
   const card = TemplateEngine.render('tpl-channel-card', cardData);
   return card;
+}
+
+async function editChannelCoolingKeys(channelId) {
+  await editChannel(channelId);
+  if (editingChannelId !== channelId) return;
+
+  const filter = document.getElementById('keyStatusFilter');
+  if (filter) filter.value = 'cooldown';
+  filterKeysByStatus('cooldown');
 }
 
 /**
@@ -742,13 +1076,13 @@ function initChannelEventDelegation() {
 
   container.addEventListener('input', (e) => {
     const input = e.target.closest('.ch-priority-input');
-    if (!input) return;
+    if (!input || isTokenChannelsReadOnly()) return;
     queueInlineChannelPrioritySave(input);
   });
 
   container.addEventListener('keydown', (e) => {
     const input = e.target.closest('.ch-priority-input');
-    if (!input) return;
+    if (!input || isTokenChannelsReadOnly()) return;
     if (e.key === 'Enter') {
       e.preventDefault();
       flushInlineChannelPrioritySave(input);
@@ -761,7 +1095,7 @@ function initChannelEventDelegation() {
 
   container.addEventListener('focusout', (e) => {
     const input = e.target.closest('.ch-priority-input');
-    if (!input) return;
+    if (!input || isTokenChannelsReadOnly()) return;
     flushInlineChannelPrioritySave(input);
   });
 
@@ -788,6 +1122,9 @@ function initChannelEventDelegation() {
     if (!btn) return;
 
     const action = btn.dataset.action;
+    if (isTokenChannelsReadOnly() && ['edit', 'edit-cooling-keys', 'refresh-oauth-usage', 'reset-codex-quota', 'test', 'copy', 'delete', 'toggle'].includes(action)) {
+      return;
+    }
     const channelId = parseInt(btn.dataset.channelId);
     const channelName = btn.dataset.channelName;
     const enabled = btn.dataset.enabled === 'true';
@@ -795,6 +1132,33 @@ function initChannelEventDelegation() {
     switch (action) {
       case 'edit':
         editChannel(channelId);
+        break;
+      case 'edit-cooling-keys':
+        editChannelCoolingKeys(channelId);
+        break;
+      case 'refresh-oauth-usage':
+        if (typeof refreshOAuthUsage === 'function') {
+          refreshOAuthUsage(channelId).catch(error => {
+            if (window.showError) window.showError(error?.message || window.t('channels.oauth.usageFailed'));
+          });
+        }
+        break;
+      case 'reset-codex-quota':
+        if (typeof resetCodexQuota === 'function') {
+          const count = Math.max(0, Number(btn.dataset.resetCount) || 0);
+          const expiry = btn.dataset.resetExpiry || window.t('channels.oauth.resetCreditExpiresUnknown');
+          const confirmed = window.confirm(window.t('channels.oauth.resetConfirm', { count, time: expiry }));
+          if (!confirmed) break;
+          resetCodexQuota(channelId).then(result => {
+            const hasWarnings = Array.isArray(result?.warnings) && result.warnings.length > 0;
+            const message = !result?.usage || hasWarnings
+              ? window.t('channels.oauth.resetSuccessNeedsRefresh')
+              : window.t('channels.oauth.resetSuccess');
+            if (window.showSuccess) window.showSuccess(message);
+          }).catch(error => {
+            if (window.showError) window.showError(error?.message || window.t('channels.oauth.resetFailed'));
+          });
+        }
         break;
       case 'test':
         testChannel(channelId, channelName);
@@ -846,7 +1210,7 @@ function renderChannels(channelsToRender = channels) {
       <th class="ch-col-duration">${window.t('channels.table.duration')}</th>
       <th class="ch-col-usage">${window.t('channels.table.usage')}</th>
       <th class="ch-col-cost">${window.t('channels.stats.cost')}</th>
-      <th class="ch-col-last-success">${window.t('channels.table.lastSuccess')}</th>
+      <th class="ch-col-last-success">${window.t('channels.table.statusAndLastSuccess')}</th>
       <th class="ch-col-enabled">${window.t('channels.table.enabled')}</th>
       <th class="ch-col-actions">${window.t('channels.table.actions')}</th>
     </tr>
@@ -874,4 +1238,8 @@ function renderChannels(channelsToRender = channels) {
   if (typeof updateBatchChannelSelectionUI === 'function') {
     updateBatchChannelSelectionUI();
   }
+}
+
+if (typeof module !== 'undefined' && module.exports) {
+  module.exports = { buildChannelRuntimeStatusHtml, buildOAuthPlanBadge, buildOAuthUsageStatusHtml, formatCooldownRecoveryTime };
 }

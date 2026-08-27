@@ -1,7 +1,26 @@
 // Filter channels based on current filters
 let filteredChannels = []; // 存储筛选后的渠道列表
+let channelAuthTypeFilterCombobox = null; // 认证类型筛选组合框实例
 let modelFilterCombobox = null; // 通用组件实例
 let channelNameCombobox = null; // 渠道名筛选组合框实例
+
+function getChannelAuthTypeOptions() {
+  return [
+    { value: 'all', label: window.t('channels.authTypeAll') },
+    { value: 'api_key', label: window.t('channels.authTypeAPI') },
+    { value: 'codex_oauth', label: window.t('channels.authTypeCodex') },
+    { value: 'antigravity_oauth', label: window.t('channels.authTypeAntigravity') },
+    { value: 'xai_oauth', label: window.t('channels.authTypeXAI') },
+    { value: 'anthropic_oauth', label: window.t('channels.authTypeAnthropic') },
+    { value: 'zai_oauth', label: window.t('channels.authTypeZAI') }
+  ];
+}
+
+function channelAuthTypeFilterLabel(value) {
+  const options = getChannelAuthTypeOptions();
+  const option = options.find(item => item.value === value);
+  return option ? option.label : options[0].label;
+}
 
 function getModelAllLabel() {
   return (window.t && window.t('channels.modelAll')) || '所有模型';
@@ -47,11 +66,6 @@ function filterChannels() {
     if (prioB !== prioA) {
       return prioB - prioA;
     }
-    const typeA = (a.channel_type || 'anthropic').toLowerCase();
-    const typeB = (b.channel_type || 'anthropic').toLowerCase();
-    if (typeA !== typeB) {
-      return typeA.localeCompare(typeB);
-    }
     return a.name.localeCompare(b.name);
   });
 
@@ -79,6 +93,12 @@ function updateModelOptions() {
   }
 }
 
+function updateChannelAuthTypeOptions() {
+  if (!channelAuthTypeFilterCombobox) return;
+  channelAuthTypeFilterCombobox.setValue(filters.authType, channelAuthTypeFilterLabel(filters.authType));
+  channelAuthTypeFilterCombobox.refresh();
+}
+
 // 刷新渠道名称下拉显示（选项由 getOptions 从 allAvailableChannelNames 动态读取）
 function updateChannelNameOptions() {
   if (channelNameCombobox) channelNameCombobox.refresh();
@@ -90,11 +110,30 @@ function setupFilterListeners() {
     filters.status = e.target.value;
     channelsCurrentPage = 1;
     if (typeof saveChannelsFilters === 'function') saveChannelsFilters();
-    if (typeof loadChannelsFilterOptions === 'function') {
-      loadChannelsFilterOptions(filters.channelType, filters.status);
-    }
-    loadChannels(filters.channelType);
+    loadChannels();
   });
+
+  const authTypeFilterInput = document.getElementById('channelAuthTypeFilter');
+  if (authTypeFilterInput) {
+    channelAuthTypeFilterCombobox = createSearchableCombobox({
+      attachMode: true,
+      inputId: 'channelAuthTypeFilter',
+      dropdownId: 'channelAuthTypeFilterDropdown',
+      initialValue: filters.authType,
+      initialLabel: channelAuthTypeFilterLabel(filters.authType),
+      allowCustomInput: false,
+      commitEmptyAsFirst: true,
+      showAllOptionsOnOpen: true,
+      getOptions: getChannelAuthTypeOptions,
+      onSelect: (value) => {
+        const validValues = new Set(['all', 'api_key', 'codex_oauth', 'antigravity_oauth', 'xai_oauth', 'anthropic_oauth', 'zai_oauth']);
+        filters.authType = validValues.has(value) ? value : 'all';
+        channelsCurrentPage = 1;
+        if (typeof saveChannelsFilters === 'function') saveChannelsFilters();
+        loadChannels();
+      }
+    });
+  }
 
   // 模型筛选 combobox
   const modelFilterInput = document.getElementById('modelFilter');
@@ -107,6 +146,7 @@ function setupFilterListeners() {
       initialLabel: modelFilterInputValueFromFilterValue(filters.model),
       allowCustomInput: true,
       commitEmptyAsFirst: true,
+      showAllOptionsOnOpen: true,
       getOptions: () => {
         const allLabel = getModelAllLabel();
         const models = Array.isArray(allAvailableModels) ? allAvailableModels : [];
@@ -120,7 +160,7 @@ function setupFilterListeners() {
         filters.modelExact = isExactChannelModelFilter(value);
         channelsCurrentPage = 1;
         if (typeof saveChannelsFilters === 'function') saveChannelsFilters();
-        loadChannels(filters.channelType);
+        loadChannels();
       }
     });
   }
@@ -137,6 +177,7 @@ function setupFilterListeners() {
       initialLabel: filters.search || allLabel,
       allowCustomInput: true,
       commitEmptyAsFirst: true,
+      showAllOptionsOnOpen: true,
       getOptions: () => {
         // 使用服务端在 search 过滤前冻结的全集，避免选中某渠道名后下拉收敛为单一项
         const names = Array.isArray(allAvailableChannelNames) ? allAvailableChannelNames : [];
@@ -160,7 +201,7 @@ function setupFilterListeners() {
         }
         channelsCurrentPage = 1;
         if (typeof saveChannelsFilters === 'function') saveChannelsFilters();
-        loadChannels(filters.channelType);
+        loadChannels();
       }
     });
   }
@@ -169,7 +210,7 @@ function setupFilterListeners() {
   document.getElementById('btn_filter').addEventListener('click', () => {
     channelsCurrentPage = 1;
     if (typeof saveChannelsFilters === 'function') saveChannelsFilters();
-    loadChannels(filters.channelType);
+    loadChannels();
   });
 
   const clearSearchBtn = document.getElementById('clearSearchBtn');
@@ -179,9 +220,9 @@ function setupFilterListeners() {
       filters.search = '';
       filters.searchExact = false;
       filters.status = 'all';
+      filters.authType = 'all';
       filters.model = 'all';
       filters.modelExact = false;
-      filters.channelType = 'all';
       channelsCurrentPage = 1;
 
       // 重置渠道名称 combobox
@@ -200,16 +241,23 @@ function setupFilterListeners() {
         if (modelFilterEl) modelFilterEl.value = getModelAllLabel();
       }
 
+      if (channelAuthTypeFilterCombobox) {
+        channelAuthTypeFilterCombobox.setValue('all', channelAuthTypeFilterLabel('all'));
+      } else {
+        const authTypeFilterEl = document.getElementById('channelAuthTypeFilter');
+        if (authTypeFilterEl) authTypeFilterEl.value = channelAuthTypeFilterLabel('all');
+      }
+
       // 重置状态下拉框
       const statusFilterEl = document.getElementById('statusFilter');
       if (statusFilterEl) statusFilterEl.value = 'all';
 
-      // 重置渠道类型下拉框
-      const channelTypeFilterEl = document.getElementById('channelTypeFilter');
-      if (channelTypeFilterEl) channelTypeFilterEl.value = 'all';
-
       if (typeof saveChannelsFilters === 'function') saveChannelsFilters();
-      loadChannels(filters.channelType);
+      loadChannels();
     });
   }
+}
+
+if (typeof module !== 'undefined' && module.exports) {
+  module.exports = { setupFilterListeners };
 }

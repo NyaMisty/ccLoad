@@ -27,14 +27,8 @@ func (s *SQLStore) executeStatsQuery(ctx context.Context, startTime, endTime tim
 			SUM(CASE WHEN status_code >= 200 AND status_code < 300 THEN 1 ELSE 0 END) AS success,
 			SUM(CASE WHEN (status_code < 200 OR status_code >= 300) AND status_code != 499 THEN 1 ELSE 0 END) AS error,
 			SUM(CASE WHEN status_code != 499 THEN 1 ELSE 0 END) AS total,
-			ROUND(
-				AVG(CASE WHEN is_streaming = 1 AND first_byte_time > 0 AND status_code >= 200 AND status_code < 300 THEN first_byte_time ELSE NULL END),
-				3
-			) as avg_first_byte_time,
-			ROUND(
-				AVG(CASE WHEN duration > 0 THEN duration ELSE NULL END),
-				3
-			) as avg_duration,
+			AVG(CASE WHEN is_streaming = 1 AND first_byte_time > 0 AND status_code >= 200 AND status_code < 300 THEN first_byte_time ELSE NULL END) as avg_first_byte_time,
+			AVG(CASE WHEN duration > 0 THEN duration ELSE NULL END) as avg_duration,
 			` + lastSuccessCol + `SUM(COALESCE(input_tokens, 0)) as total_input_tokens,
 			SUM(COALESCE(output_tokens, 0)) as total_output_tokens,
 			SUM(COALESCE(cache_read_input_tokens, 0)) as total_cache_read_input_tokens,
@@ -51,7 +45,7 @@ func (s *SQLStore) executeStatsQuery(ctx context.Context, startTime, endTime tim
 		Where("time <= ?", endMs).
 		Where("channel_id > 0")
 
-	_, isEmpty, err := s.applyChannelFilter(ctx, qb, filter)
+	isEmpty, err := s.applyChannelFilter(ctx, qb, filter)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -64,7 +58,7 @@ func (s *SQLStore) executeStatsQuery(ctx context.Context, startTime, endTime tim
 	suffix := "GROUP BY channel_id, model ORDER BY channel_id ASC, model ASC"
 	query, args := qb.BuildWithSuffix(suffix)
 
-	rows, err := s.db.QueryContext(ctx, query, args...)
+	rows, err := s.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -164,7 +158,6 @@ func (s *SQLStore) GetStats(ctx context.Context, startTime, endTime time.Time, f
 				if info, ok := channelInfos[int64(*stats[i].ChannelID)]; ok {
 					stats[i].ChannelName = info.Name
 					stats[i].ChannelPriority = &info.Priority
-					stats[i].ChannelType = info.Type
 					if info.CostMultiplier != 1 {
 						costMultiplier := info.CostMultiplier
 						stats[i].CostMultiplier = &costMultiplier
@@ -231,8 +224,8 @@ func (s *SQLStore) fillStatsLastSuccesses(ctx context.Context, stats []model.Sta
 
 	lastStateFilter := cloneLogFilterWithoutStatusCode(filter)
 
-	query, args := buildLatestChannelSuccessQuery(entryIndexesByChannel, lastStateFilter)
-	rows, err := s.db.QueryContext(ctx, query, args...)
+	query, args := buildLatestChannelSuccessQuery(entryIndexesByChannel, lastStateFilter, s.IsSQLite())
+	rows, err := s.QueryContext(ctx, query, args...)
 	if err != nil {
 		return err
 	}
@@ -240,19 +233,19 @@ func (s *SQLStore) fillStatsLastSuccesses(ctx context.Context, stats []model.Sta
 
 	for rows.Next() {
 		var channelID int
-		var successAt int64
-		var successID int64
+		var successAt sql.NullInt64
+		var successID sql.NullInt64
 		if err := rows.Scan(&channelID, &successAt, &successID); err != nil {
 			return err
 		}
-		if successAt <= 0 {
+		if !successAt.Valid || successAt.Int64 <= 0 {
 			continue
 		}
 		for _, idx := range entryIndexesByChannel[channelID] {
-			successAtValue := successAt
+			successAtValue := successAt.Int64
 			stats[idx].LastSuccessAt = &successAtValue
-			if successID > 0 {
-				successIDValue := successID
+			if successID.Valid && successID.Int64 > 0 {
+				successIDValue := successID.Int64
 				stats[idx].LastSuccessID = &successIDValue
 			}
 		}
@@ -279,8 +272,8 @@ func (s *SQLStore) fillStatsLastSuccessesByEntry(ctx context.Context, stats []mo
 
 	lastStateFilter := cloneLogFilterWithoutStatusCode(filter)
 
-	query, args := buildLatestEntrySuccessQuery(entryIndexes, lastStateFilter)
-	rows, err := s.db.QueryContext(ctx, query, args...)
+	query, args := buildLatestEntrySuccessQuery(entryIndexes, lastStateFilter, s.IsSQLite())
+	rows, err := s.QueryContext(ctx, query, args...)
 	if err != nil {
 		return err
 	}
@@ -289,12 +282,12 @@ func (s *SQLStore) fillStatsLastSuccessesByEntry(ctx context.Context, stats []mo
 	for rows.Next() {
 		var channelID int
 		var modelName string
-		var successAt int64
-		var successID int64
+		var successAt sql.NullInt64
+		var successID sql.NullInt64
 		if err := rows.Scan(&channelID, &modelName, &successAt, &successID); err != nil {
 			return err
 		}
-		if successAt <= 0 {
+		if !successAt.Valid || successAt.Int64 <= 0 {
 			continue
 		}
 		key := statsRequestKey{channelID: channelID, model: modelName}
@@ -302,9 +295,9 @@ func (s *SQLStore) fillStatsLastSuccessesByEntry(ctx context.Context, stats []mo
 		if !ok {
 			continue
 		}
-		stats[idx].LastSuccessAt = &successAt
-		if successID > 0 {
-			stats[idx].LastSuccessID = &successID
+		stats[idx].LastSuccessAt = &successAt.Int64
+		if successID.Valid && successID.Int64 > 0 {
+			stats[idx].LastSuccessID = &successID.Int64
 		}
 	}
 	if err := rows.Err(); err != nil {
@@ -333,8 +326,8 @@ func (s *SQLStore) fillStatsLastRequests(ctx context.Context, stats []model.Stat
 
 	lastStateFilter := cloneLogFilterWithoutStatusCode(filter)
 
-	query, args := buildLatestChannelRequestQuery(entryIndexesByChannel, lastStateFilter)
-	rows, err := s.db.QueryContext(ctx, query, args...)
+	query, args := buildLatestChannelRequestQuery(entryIndexesByChannel, lastStateFilter, s.IsSQLite())
+	rows, err := s.QueryContext(ctx, query, args...)
 	if err != nil {
 		return err
 	}
@@ -342,26 +335,28 @@ func (s *SQLStore) fillStatsLastRequests(ctx context.Context, stats []model.Stat
 
 	for rows.Next() {
 		var channelID int
-		var requestAt int64
-		var requestID int64
-		var status int
-		var message string
+		var requestAt sql.NullInt64
+		var requestID sql.NullInt64
+		var status sql.NullInt64
+		var message sql.NullString
 		if err := rows.Scan(&channelID, &requestAt, &requestID, &status, &message); err != nil {
 			return err
 		}
-		if requestAt <= 0 {
+		if !requestAt.Valid || requestAt.Int64 <= 0 {
 			continue
 		}
 		for _, idx := range entryIndexesByChannel[channelID] {
-			requestAtValue := requestAt
+			requestAtValue := requestAt.Int64
 			stats[idx].LastRequestAt = &requestAtValue
-			if requestID > 0 {
-				requestIDValue := requestID
+			if requestID.Valid && requestID.Int64 > 0 {
+				requestIDValue := requestID.Int64
 				stats[idx].LastRequestID = &requestIDValue
 			}
-			statusValue := status
-			stats[idx].LastRequestStatus = &statusValue
-			stats[idx].LastRequestMessage = message
+			if status.Valid {
+				statusValue := int(status.Int64)
+				stats[idx].LastRequestStatus = &statusValue
+			}
+			stats[idx].LastRequestMessage = message.String
 		}
 	}
 	if err := rows.Err(); err != nil {
@@ -386,8 +381,8 @@ func (s *SQLStore) fillStatsLastRequestsByEntry(ctx context.Context, stats []mod
 
 	lastStateFilter := cloneLogFilterWithoutStatusCode(filter)
 
-	query, args := buildLatestEntryRequestQuery(entryIndexes, lastStateFilter)
-	rows, err := s.db.QueryContext(ctx, query, args...)
+	query, args := buildLatestEntryRequestQuery(entryIndexes, lastStateFilter, s.IsSQLite())
+	rows, err := s.QueryContext(ctx, query, args...)
 	if err != nil {
 		return err
 	}
@@ -396,14 +391,14 @@ func (s *SQLStore) fillStatsLastRequestsByEntry(ctx context.Context, stats []mod
 	for rows.Next() {
 		var channelID int
 		var modelName string
-		var requestAt int64
-		var requestID int64
-		var status int
-		var message string
+		var requestAt sql.NullInt64
+		var requestID sql.NullInt64
+		var status sql.NullInt64
+		var message sql.NullString
 		if err := rows.Scan(&channelID, &modelName, &requestAt, &requestID, &status, &message); err != nil {
 			return err
 		}
-		if requestAt <= 0 {
+		if !requestAt.Valid || requestAt.Int64 <= 0 {
 			continue
 		}
 		key := statsRequestKey{channelID: channelID, model: modelName}
@@ -411,12 +406,15 @@ func (s *SQLStore) fillStatsLastRequestsByEntry(ctx context.Context, stats []mod
 		if !ok {
 			continue
 		}
-		stats[idx].LastRequestAt = &requestAt
-		if requestID > 0 {
-			stats[idx].LastRequestID = &requestID
+		stats[idx].LastRequestAt = &requestAt.Int64
+		if requestID.Valid && requestID.Int64 > 0 {
+			stats[idx].LastRequestID = &requestID.Int64
 		}
-		stats[idx].LastRequestStatus = &status
-		stats[idx].LastRequestMessage = message
+		if status.Valid {
+			statusValue := int(status.Int64)
+			stats[idx].LastRequestStatus = &statusValue
+		}
+		stats[idx].LastRequestMessage = message.String
 	}
 	if err := rows.Err(); err != nil {
 		return err
@@ -429,34 +427,46 @@ func hasStatsModelFilter(filter *model.LogFilter) bool {
 	return filter != nil && (filter.Model != "" || filter.ModelLike != "")
 }
 
-func buildLatestChannelSuccessQuery(entryIndexesByChannel map[int][]int, filter *model.LogFilter) (string, []any) {
-	return buildLatestChannelLogQuery(entryIndexesByChannel, filter, []string{"l.time", "l.id"}, func(qb *QueryBuilder) {
+func buildLatestChannelSuccessQuery(entryIndexesByChannel map[int][]int, filter *model.LogFilter, scalarProjection bool) (string, []any) {
+	return buildLatestChannelLogQuery(entryIndexesByChannel, filter, []string{"l.time", "l.id"}, scalarProjection, func(qb *QueryBuilder) {
 		qb.Where("status_code >= 200").
 			Where("status_code < 300")
 	})
 }
 
-func buildLatestChannelRequestQuery(entryIndexesByChannel map[int][]int, filter *model.LogFilter) (string, []any) {
-	return buildLatestChannelLogQuery(entryIndexesByChannel, filter, []string{"l.time", "l.id", "l.status_code", "l.message"}, func(qb *QueryBuilder) {
+func buildLatestChannelRequestQuery(entryIndexesByChannel map[int][]int, filter *model.LogFilter, scalarProjection bool) (string, []any) {
+	return buildLatestChannelLogQuery(entryIndexesByChannel, filter, []string{"l.time", "l.id", "l.status_code", "l.message"}, scalarProjection, func(qb *QueryBuilder) {
 		qb.Where("status_code != 499")
 	})
 }
 
-func buildLatestEntrySuccessQuery(entryIndexes map[statsRequestKey]int, filter *model.LogFilter) (string, []any) {
-	return buildLatestEntryLogQuery(entryIndexes, filter, []string{"l.time", "l.id"}, func(qb *QueryBuilder) {
+func buildLatestEntrySuccessQuery(entryIndexes map[statsRequestKey]int, filter *model.LogFilter, scalarProjection bool) (string, []any) {
+	return buildLatestEntryLogQuery(entryIndexes, filter, []string{"l.time", "l.id"}, scalarProjection, func(qb *QueryBuilder) {
 		qb.Where("status_code >= 200").
 			Where("status_code < 300")
 	})
 }
 
-func buildLatestEntryRequestQuery(entryIndexes map[statsRequestKey]int, filter *model.LogFilter) (string, []any) {
-	return buildLatestEntryLogQuery(entryIndexes, filter, []string{"l.time", "l.id", "l.status_code", "l.message"}, func(qb *QueryBuilder) {
+func buildLatestEntryRequestQuery(entryIndexes map[statsRequestKey]int, filter *model.LogFilter, scalarProjection bool) (string, []any) {
+	return buildLatestEntryLogQuery(entryIndexes, filter, []string{"l.time", "l.id", "l.status_code", "l.message"}, scalarProjection, func(qb *QueryBuilder) {
 		qb.Where("status_code != 499")
 	})
 }
 
-func buildLatestChannelLogQuery(entryIndexesByChannel map[int][]int, filter *model.LogFilter, selectColumns []string, applyStatePredicate func(*QueryBuilder)) (string, []any) {
+func buildLatestChannelLogQuery(entryIndexesByChannel map[int][]int, filter *model.LogFilter, selectColumns []string, scalarProjection bool, applyStatePredicate func(*QueryBuilder)) (string, []any) {
 	scopeSQL, scopeArgs := buildChannelScope(entryIndexesByChannel)
+	if scalarProjection {
+		// SQLite 会扁平化下面的相关 JOIN，并把 logs l 提到 scope 前做全表扫描。
+		// 标量投影让小 scope 驱动查询，每列都沿 channel_id,time,id 索引直接定位最新行。
+		projections, projectionArgs := buildLatestScalarProjections(selectColumns, filter, false, applyStatePredicate)
+		query := fmt.Sprintf(`
+			SELECT scope.channel_id, %s
+			FROM (%s) scope`, strings.Join(projections, ", "), scopeSQL)
+		args := make([]any, 0, len(projectionArgs)+len(scopeArgs))
+		args = append(args, projectionArgs...)
+		args = append(args, scopeArgs...)
+		return query, args
+	}
 
 	subQB := NewQueryBuilder("SELECT id FROM logs").
 		Where("channel_id = scope.channel_id").
@@ -476,8 +486,18 @@ func buildLatestChannelLogQuery(entryIndexesByChannel map[int][]int, filter *mod
 	return query, args
 }
 
-func buildLatestEntryLogQuery(entryIndexes map[statsRequestKey]int, filter *model.LogFilter, selectColumns []string, applyStatePredicate func(*QueryBuilder)) (string, []any) {
+func buildLatestEntryLogQuery(entryIndexes map[statsRequestKey]int, filter *model.LogFilter, selectColumns []string, scalarProjection bool, applyStatePredicate func(*QueryBuilder)) (string, []any) {
 	scopeSQL, scopeArgs := buildEntryScope(entryIndexes)
+	if scalarProjection {
+		projections, projectionArgs := buildLatestScalarProjections(selectColumns, filter, true, applyStatePredicate)
+		query := fmt.Sprintf(`
+			SELECT scope.channel_id, scope.model, %s
+			FROM (%s) scope`, strings.Join(projections, ", "), scopeSQL)
+		args := make([]any, 0, len(projectionArgs)+len(scopeArgs))
+		args = append(args, projectionArgs...)
+		args = append(args, scopeArgs...)
+		return query, args
+	}
 
 	subQB := NewQueryBuilder("SELECT id FROM logs").
 		Where("channel_id = scope.channel_id").
@@ -496,6 +516,26 @@ func buildLatestEntryLogQuery(entryIndexes map[statsRequestKey]int, filter *mode
 	args = append(args, scopeArgs...)
 	args = append(args, subArgs...)
 	return query, args
+}
+
+func buildLatestScalarProjections(selectColumns []string, filter *model.LogFilter, byEntry bool, applyStatePredicate func(*QueryBuilder)) ([]string, []any) {
+	projections := make([]string, 0, len(selectColumns))
+	args := make([]any, 0)
+	for _, column := range selectColumns {
+		column = strings.TrimPrefix(column, "l.")
+		qb := NewQueryBuilder("SELECT " + column + " FROM logs").
+			Where("channel_id = scope.channel_id").
+			Where("channel_id > 0")
+		if byEntry {
+			qb.Where("COALESCE(model, '') = scope.model")
+		}
+		applyStatePredicate(qb)
+		qb.ApplyFilter(filter)
+		query, queryArgs := qb.BuildWithSuffix("ORDER BY time DESC, id DESC LIMIT 1")
+		projections = append(projections, "("+query+")")
+		args = append(args, queryArgs...)
+	}
+	return projections, args
 }
 
 func buildChannelScope(entryIndexesByChannel map[int][]int) (string, []any) {
@@ -568,6 +608,67 @@ func (s *SQLStore) GetStatsLite(ctx context.Context, startTime, endTime time.Tim
 	return stats, err
 }
 
+// GetClientProtocolStats 按客户端入口协议聚合首页统计。
+func (s *SQLStore) GetClientProtocolStats(ctx context.Context, startTime, endTime time.Time, filter *model.LogFilter) ([]model.ClientProtocolStats, error) {
+	baseQuery := `
+		SELECT
+			COALESCE(client_protocol, '') AS client_protocol,
+			SUM(CASE WHEN status_code >= 200 AND status_code < 300 THEN 1 ELSE 0 END) AS success,
+			SUM(CASE WHEN (status_code < 200 OR status_code >= 300) AND status_code != 499 THEN 1 ELSE 0 END) AS error,
+			SUM(COALESCE(input_tokens, 0)) AS total_input_tokens,
+			SUM(COALESCE(output_tokens, 0)) AS total_output_tokens,
+			SUM(COALESCE(cache_read_input_tokens, 0)) AS total_cache_read_tokens,
+			SUM(COALESCE(cache_creation_input_tokens, 0)) AS total_cache_creation_tokens,
+			SUM(COALESCE(cost, 0.0)) AS total_cost,
+			SUM(COALESCE(cost, 0.0) * COALESCE(cost_multiplier, 1)) AS effective_cost
+		FROM logs`
+
+	qb := NewQueryBuilder(baseQuery).
+		Where("time >= ?", startTime.UnixMilli()).
+		Where("time <= ?", endTime.UnixMilli()).
+		Where("channel_id > 0")
+
+	isEmpty, err := s.applyChannelFilter(ctx, qb, filter)
+	if err != nil {
+		return nil, err
+	}
+	if isEmpty {
+		return []model.ClientProtocolStats{}, nil
+	}
+	qb.ApplyFilter(filter)
+
+	query, args := qb.BuildWithSuffix("GROUP BY client_protocol ORDER BY client_protocol ASC")
+	rows, err := s.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+
+	stats := make([]model.ClientProtocolStats, 0)
+	for rows.Next() {
+		var entry model.ClientProtocolStats
+		if err := rows.Scan(
+			&entry.ClientProtocol,
+			&entry.SuccessRequests,
+			&entry.ErrorRequests,
+			&entry.TotalInputTokens,
+			&entry.TotalOutputTokens,
+			&entry.TotalCacheReadTokens,
+			&entry.TotalCacheCreationTokens,
+			&entry.TotalCost,
+			&entry.EffectiveCost,
+		); err != nil {
+			return nil, err
+		}
+		entry.TotalRequests = entry.SuccessRequests + entry.ErrorRequests
+		stats = append(stats, entry)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return stats, nil
+}
+
 // GetRPMStats 获取RPM/QPS统计数据（峰值、平均、最近一分钟）
 // isToday参数控制是否计算最近一分钟数据（仅本日有意义）
 // [FIX] 2025-12: 排除499（客户端取消）避免污染RPM统计
@@ -591,8 +692,8 @@ func (s *SQLStore) GetRPMStats(ctx context.Context, startTime, endTime time.Time
 		Where("channel_id > 0").
 		Where("status_code != 499")
 
-	// 应用渠道类型或名称过滤
-	_, isEmpty, err := s.applyChannelFilter(ctx, combinedQB, filter)
+	// 应用渠道和上游协议过滤。
+	isEmpty, err := s.applyChannelFilter(ctx, combinedQB, filter)
 	if err != nil {
 		return nil, fmt.Errorf("apply channel filter: %w", err)
 	}
@@ -607,7 +708,7 @@ func (s *SQLStore) GetRPMStats(ctx context.Context, startTime, endTime time.Time
 
 	var peakRPM float64
 	var totalCount int64
-	if err := s.db.QueryRowContext(ctx, combinedQuery, combinedArgs...).Scan(&peakRPM, &totalCount); err != nil {
+	if err := s.QueryRowContext(ctx, combinedQuery, combinedArgs...).Scan(&peakRPM, &totalCount); err != nil {
 		return nil, fmt.Errorf("query peak RPM and total: %w", err)
 	}
 	stats.PeakRPM = peakRPM
@@ -635,7 +736,7 @@ func (s *SQLStore) GetRPMStats(ctx context.Context, startTime, endTime time.Time
 			Where("status_code != 499")
 
 		// 应用渠道过滤
-		_, isEmpty, err = s.applyChannelFilter(ctx, recentQB, filter)
+		isEmpty, err = s.applyChannelFilter(ctx, recentQB, filter)
 		if err != nil {
 			return nil, fmt.Errorf("apply channel filter for recent: %w", err)
 		}
@@ -645,7 +746,7 @@ func (s *SQLStore) GetRPMStats(ctx context.Context, startTime, endTime time.Time
 
 			recentQuery, recentArgs := recentQB.Build()
 			var recentCount int64
-			if err := s.db.QueryRowContext(ctx, recentQuery, recentArgs...).Scan(&recentCount); err != nil {
+			if err := s.QueryRowContext(ctx, recentQuery, recentArgs...).Scan(&recentCount); err != nil {
 				return nil, fmt.Errorf("query recent count: %w", err)
 			}
 
@@ -694,7 +795,7 @@ func (s *SQLStore) fillStatsRPM(ctx context.Context, stats []model.StatsEntry, s
 		Where("channel_id > 0").
 		Where("status_code != 499")
 
-	_, isEmpty, err := s.applyChannelFilter(ctx, peakQB, filter)
+	isEmpty, err := s.applyChannelFilter(ctx, peakQB, filter)
 	if err != nil {
 		return fmt.Errorf("apply channel filter for peak: %w", err)
 	}
@@ -704,7 +805,7 @@ func (s *SQLStore) fillStatsRPM(ctx context.Context, stats []model.StatsEntry, s
 		peakQB.ApplyFilter(filter)
 		peakQuery, peakArgs := peakQB.BuildWithSuffix("GROUP BY channel_id, model, minute_bucket) t GROUP BY channel_id, model")
 
-		peakRows, err := s.db.QueryContext(ctx, peakQuery, peakArgs...)
+		peakRows, err := s.QueryContext(ctx, peakQuery, peakArgs...)
 		if err != nil {
 			return fmt.Errorf("query peak RPM: %w", err)
 		}
@@ -740,7 +841,7 @@ func (s *SQLStore) fillStatsRPM(ctx context.Context, stats []model.StatsEntry, s
 			Where("channel_id > 0").
 			Where("status_code != 499")
 
-		_, isEmpty, err := s.applyChannelFilter(ctx, recentQB, filter)
+		isEmpty, err := s.applyChannelFilter(ctx, recentQB, filter)
 		if err != nil {
 			return fmt.Errorf("apply channel filter for recent: %w", err)
 		}
@@ -749,7 +850,7 @@ func (s *SQLStore) fillStatsRPM(ctx context.Context, stats []model.StatsEntry, s
 		if !isEmpty {
 			recentQB.ApplyFilter(filter)
 			recentQuery, recentArgs := recentQB.BuildWithSuffix("GROUP BY channel_id, model")
-			recentRows, err := s.db.QueryContext(ctx, recentQuery, recentArgs...)
+			recentRows, err := s.QueryContext(ctx, recentQuery, recentArgs...)
 			if err != nil {
 				return fmt.Errorf("query recent RPM: %w", err)
 			}
@@ -836,12 +937,14 @@ func (s *SQLStore) GetChannelSuccessRates(ctx context.Context, since time.Time) 
 		SELECT
 			channel_id,
 			SUM(CASE WHEN status_code >= 200 AND status_code < 300 THEN 1 ELSE 0 END) AS success,
-			SUM(CASE WHEN ` + eligible + ` THEN 1 ELSE 0 END) AS total
+			SUM(CASE WHEN ` + eligible + ` THEN 1 ELSE 0 END) AS total,
+			AVG(CASE WHEN status_code >= 200 AND status_code < 300 AND first_byte_time > 0 THEN first_byte_time ELSE NULL END) AS avg_first_byte,
+			SUM(CASE WHEN status_code >= 200 AND status_code < 300 AND first_byte_time > 0 THEN 1 ELSE 0 END) AS first_byte_samples
 		FROM logs
 		WHERE minute_bucket >= ? AND minute_bucket <= ? AND channel_id > 0 AND log_source = ?
 		GROUP BY channel_id`
 
-	rows, err := s.db.QueryContext(ctx, query, sinceBucket, untilBucket, model.LogSourceProxy)
+	rows, err := s.QueryContext(ctx, query, sinceBucket, untilBucket, model.LogSourceProxy)
 	if err != nil {
 		return nil, err
 	}
@@ -850,15 +953,21 @@ func (s *SQLStore) GetChannelSuccessRates(ctx context.Context, since time.Time) 
 	result := make(map[int64]model.ChannelHealthStats)
 	for rows.Next() {
 		var channelID int64
-		var success, total int64
-		if err := rows.Scan(&channelID, &success, &total); err != nil {
+		var success, total, firstByteSamples int64
+		var avgFirstByte sql.NullFloat64
+		if err := rows.Scan(&channelID, &success, &total, &avgFirstByte, &firstByteSamples); err != nil {
 			return nil, err
 		}
 		if total > 0 {
-			result[channelID] = model.ChannelHealthStats{
-				SuccessRate: float64(success) / float64(total),
-				SampleCount: total,
+			stats := model.ChannelHealthStats{
+				SuccessRate:          float64(success) / float64(total),
+				SampleCount:          total,
+				FirstByteSampleCount: firstByteSamples,
 			}
+			if avgFirstByte.Valid && firstByteSamples > 0 {
+				stats.AvgFirstByteSeconds = avgFirstByte.Float64
+			}
+			result[channelID] = stats
 		}
 	}
 
@@ -876,7 +985,7 @@ func (s *SQLStore) GetTodayChannelCosts(ctx context.Context, todayStart time.Tim
 		WHERE time >= ? AND channel_id > 0 AND log_source = ?
 		GROUP BY channel_id`
 
-	rows, err := s.db.QueryContext(ctx, query, todayStartMs, model.LogSourceProxy)
+	rows, err := s.QueryContext(ctx, query, todayStartMs, model.LogSourceProxy)
 	if err != nil {
 		return nil, err
 	}

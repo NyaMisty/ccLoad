@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
+	"strconv"
 	"testing"
 	"time"
 )
@@ -172,6 +174,13 @@ func TestClassifyHTTPResponse(t *testing.T) {
 			reason:       "404非model_not_found应返回渠道级错误以触发切换",
 		},
 		{
+			name:         "404_deployment_not_found",
+			statusCode:   404,
+			responseBody: []byte("404: Not Found (DEPLOYMENT_NOT_FOUND)\n\nThe requested deployment does not exist."),
+			expected:     ErrorLevelChannel,
+			reason:       "已下线部署不是模型错误，应切换URL或渠道",
+		},
+		{
 			name:         "500_internal_error",
 			statusCode:   500,
 			responseBody: []byte(`{"error":"internal server error"}`),
@@ -253,6 +262,36 @@ func TestClassifyHTTPStatus(t *testing.T) {
 	}
 }
 
+func TestClassifyHTTPResponse_Upstream499IsModelScoped(t *testing.T) {
+	classification := ClassifyHTTPResponseWithMeta(499, nil, []byte(`{"error":"client closed request"}`))
+	if classification.Level != ErrorLevelChannel {
+		t.Fatalf("Level=%v, want ErrorLevelChannel", classification.Level)
+	}
+	if !classification.ModelScoped {
+		t.Fatal("upstream HTTP 499 must be model-scoped")
+	}
+}
+
+func TestClassifyHTTPResponse_HTTP410ModelEOLIsModelScoped(t *testing.T) {
+	classification := ClassifyHTTPResponseWithMeta(http.StatusGone, nil, []byte(`{
+		"error": {
+			"type": "bad_response_status_code",
+			"message": "The model 'deepseek-ai/deepseek-v4-flash' has reached its end of life and is no longer available."
+		}
+	}`))
+	if classification.Level != ErrorLevelChannel {
+		t.Fatalf("Level=%v, want ErrorLevelChannel", classification.Level)
+	}
+	if !classification.ModelScoped {
+		t.Fatal("HTTP 410 model EOL must be model-scoped")
+	}
+
+	generic := ClassifyHTTPResponseWithMeta(http.StatusGone, nil, []byte(`{"error":"resource is gone"}`))
+	if generic.Level != ErrorLevelClient || generic.ModelScoped {
+		t.Fatalf("generic HTTP 410 classification=%+v, want client-scoped", generic)
+	}
+}
+
 // 测试context.Canceled与HTTP 499的区分
 func TestClassifyError_ContextCanceled(t *testing.T) {
 	tests := []struct {
@@ -278,6 +317,14 @@ func TestClassifyError_ContextCanceled(t *testing.T) {
 			expectedLevel:  ErrorLevelChannel,
 			expectedRetry:  true,
 			reason:         "上游超时（context.DeadlineExceeded）应返回504+ErrorLevelChannel，可重试其他渠道",
+		},
+		{
+			name:           "upstream_stream_timeout",
+			err:            fmt.Errorf("stream canceled: %w", ErrUpstreamStreamTimeout),
+			expectedStatus: StatusStreamIncomplete,
+			expectedLevel:  ErrorLevelChannel,
+			expectedRetry:  true,
+			reason:         "上游流式总超时应记为599并允许切换渠道，不能误判为客户端取消",
 		},
 	}
 
@@ -329,6 +376,19 @@ func TestClassifyError_EmptyResponse(t *testing.T) {
 			assertClassifyError(t, tt.err, tt.expectedStatus, tt.expectedLevel, tt.expectedRetry, tt.reason)
 		})
 	}
+}
+
+func TestClassifyError_InvalidUpstreamResponse(t *testing.T) {
+	t.Parallel()
+
+	assertClassifyError(
+		t,
+		fmt.Errorf("response validation failed: %w", ErrUpstreamInvalidResponse),
+		http.StatusBadGateway,
+		ErrorLevelChannel,
+		true,
+		"HTTP 2xx HTML 响应不是 API 成功，应按渠道故障重试",
+	)
 }
 
 // 测试HTTP/2流错误分类
@@ -412,6 +472,34 @@ func TestClassifyError_ConnectionResetAndBrokenPipe(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			assertClassifyError(t, tt.err, tt.expectedStatus, tt.expectedLevel, tt.expectedRetry, tt.reason)
+		})
+	}
+}
+
+func TestIsModelScopedNetworkError(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{name: "first byte timeout", err: ErrUpstreamFirstByteTimeout, want: true},
+		{name: "stream timeout", err: ErrUpstreamStreamTimeout, want: true},
+		{name: "empty response", err: ErrUpstreamEmptyResponse, want: true},
+		{name: "deadline exceeded", err: context.DeadlineExceeded, want: true},
+		{name: "connection reset", err: errors.New("read: connection reset by peer"), want: true},
+		{name: "http2 body closed", err: errors.New("http2: response body closed"), want: true},
+		{name: "http2 stream error", err: errors.New("stream error: stream ID 7; INTERNAL_ERROR"), want: true},
+		{name: "connection timeout", err: errors.New("upstream connection timeout"), want: true},
+		{name: "connection refused", err: errors.New("connect: connection refused"), want: false},
+		{name: "dns failure", err: errors.New("dial: no such host"), want: false},
+		{name: "client canceled", err: context.Canceled, want: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := IsModelScopedNetworkError(tt.err); got != tt.want {
+				t.Fatalf("IsModelScopedNetworkError(%v)=%v, want %v", tt.err, got, tt.want)
+			}
 		})
 	}
 }
@@ -634,10 +722,13 @@ func TestClassifyRateLimitError(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result := ClassifyHTTPResponseWithMeta(429, tt.headers, tt.responseBody).Level
-			if result != tt.expected {
+			classification := ClassifyHTTPResponseWithMeta(429, tt.headers, tt.responseBody)
+			if classification.Level != tt.expected {
 				t.Errorf("%s\n  期望: %v\n  实际: %v\n  原因: %s",
-					tt.name, tt.expected, result, tt.reason)
+					tt.name, tt.expected, classification.Level, tt.reason)
+			}
+			if !classification.ModelScoped {
+				t.Errorf("%s: 429 must be model-scoped, classification=%+v", tt.name, classification)
 			}
 		})
 	}
@@ -830,84 +921,236 @@ func TestClassifySSEError(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			// 使用 ClassifyHTTPResponseWithMeta 测试 597 状态码
-			result := ClassifyHTTPResponseWithMeta(StatusSSEError, nil, tt.responseBody).Level
-			if result != tt.expected {
+			classification := ClassifyHTTPResponseWithMeta(StatusSSEError, nil, tt.responseBody)
+			if classification.Level != tt.expected {
 				t.Errorf("%s\n  期望: %v\n  实际: %v\n  原因: %s",
-					tt.name, tt.expected, result, tt.reason)
+					tt.name, tt.expected, classification.Level, tt.reason)
+			}
+			wantModelScoped := tt.expected == ErrorLevelChannel
+			if classification.ModelScoped != wantModelScoped {
+				t.Errorf("%s: ModelScoped=%v, want %v", tt.name, classification.ModelScoped, wantModelScoped)
 			}
 		})
 	}
 }
 
-func TestClassify400Error(t *testing.T) {
+func TestClassifyHTTPResponse400IsModelScoped(t *testing.T) {
 	tests := []struct {
 		name         string
 		responseBody []byte
-		expected     ErrorLevel
-		reason       string
 	}{
 		{
 			name:         "empty_body",
 			responseBody: []byte{},
-			expected:     ErrorLevelChannel,
-			reason:       "空响应体应判定为上游异常",
 		},
 		{
 			name:         "nil_body",
 			responseBody: nil,
-			expected:     ErrorLevelChannel,
-			reason:       "nil响应体应判定为上游异常",
 		},
 		{
 			name:         "invalid_api_key",
 			responseBody: []byte(`{"error": {"message": "Invalid API Key provided"}}`),
-			expected:     ErrorLevelKey,
-			reason:       "包含 invalid_api_key 特征应判定为 Key 级错误",
 		},
 		{
 			name:         "api_key_error",
 			responseBody: []byte(`{"error": {"message": "The API key you provided is malformed"}}`),
-			expected:     ErrorLevelKey,
-			reason:       "包含 api key 特征应判定为 Key 级错误",
 		},
 		{
 			name:         "gemini_api_key_not_valid",
 			responseBody: []byte(`{"error":{"code":400,"message":"API key not valid. Please pass a valid API key.","status":"INVALID_ARGUMENT"}}`),
-			expected:     ErrorLevelKey,
-			reason:       "Gemini 无效 API Key 应判定为 Key 级错误并触发 Key 冷却",
 		},
 		{
 			name:         "generic_message_mentions_api_key",
 			responseBody: []byte(`{"error": {"message": "Gateway rejected request; check API key configuration in dashboard"}}`),
-			expected:     ErrorLevelChannel,
-			reason:       "泛泛提到 api key 不应误判为 Key 级错误",
 		},
 		{
 			name:         "bad_request_params",
 			responseBody: []byte(`{"error": {"message": "Missing required parameter: 'model'"}}`),
-			expected:     ErrorLevelChannel,
-			reason:       "代理场景下400默认视为上游异常",
 		},
 		{
 			name:         "invalid_json_format",
 			responseBody: []byte(`{"error": {"message": "Invalid JSON format in request body"}}`),
-			expected:     ErrorLevelChannel,
-			reason:       "代理场景下400默认视为上游异常",
 		},
 		{
 			name:         "validation_error",
 			responseBody: []byte(`{"error": {"message": "Validation failed: max_tokens must be positive"}}`),
-			expected:     ErrorLevelChannel,
-			reason:       "代理场景下400默认视为上游异常",
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result := classify400Error(tt.responseBody)
-			if result != tt.expected {
-				t.Errorf("%s\n  期望: %v\n  实际: %v\n  原因: %s\n  响应体: %s",
-					tt.name, tt.expected, result, tt.reason, string(tt.responseBody))
+			classification := ClassifyHTTPResponseWithMeta(400, nil, tt.responseBody)
+			if !classification.ModelScoped {
+				t.Fatalf("400 must be model-scoped, classification=%+v, body=%s", classification, tt.responseBody)
+			}
+		})
+	}
+}
+
+func TestClassifyHTTPResponseContextLengthExceededIsClientError(t *testing.T) {
+	tests := []struct {
+		name string
+		body []byte
+	}{
+		{
+			name: "error_code_context_length_exceeded",
+			body: []byte(`{"type":"error","error":{"type":"invalid_request_error","code":"context_length_exceeded","message":"Your input exceeds the context window of this model."}}`),
+		},
+		{
+			name: "response_failed_code_context_too_large",
+			body: []byte(`{"type":"response.failed","response":{"error":{"code":"context_too_large","message":"Your input exceeds the context window of this model."}}}`),
+		},
+		{
+			name: "invalid_request_message_fallback",
+			body: []byte(`{"error":{"type":"invalid_request_error","message":"Maximum context length exceeded."}}`),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			classification := ClassifyHTTPResponseWithMeta(http.StatusBadRequest, nil, tt.body)
+			if classification.Level != ErrorLevelClient || classification.ModelScoped {
+				t.Fatalf("classification=%+v, want client-level without model scope", classification)
+			}
+		})
+	}
+}
+
+func TestClassifyHTTPResponseContextLengthMessageDoesNotHideServerError(t *testing.T) {
+	tests := []struct {
+		name string
+		body []byte
+	}{
+		{
+			name: "nested_server_error",
+			body: []byte(`{"error":{"type":"server_error","code":"billing_config_error","message":"Documentation mentions too many tokens, but billing configuration failed."}}`),
+		},
+		{
+			name: "top_level_explicit_non_context_code",
+			body: []byte(`{"type":"error","code":"billing_config_error","message":"Documentation mentions too many tokens, but billing configuration failed."}`),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			classification := ClassifyHTTPResponseWithMeta(http.StatusBadRequest, nil, tt.body)
+			if classification.Level == ErrorLevelClient || !classification.ModelScoped {
+				t.Fatalf("classification=%+v, want existing model-scoped handling", classification)
+			}
+		})
+	}
+}
+
+func TestClassifyHTTPResponseStreamFailuresAreModelScoped(t *testing.T) {
+	for _, status := range []int{StatusFirstByteTimeout, StatusStreamIncomplete} {
+		t.Run(strconv.Itoa(status), func(t *testing.T) {
+			classification := ClassifyHTTPResponseWithMeta(status, nil, nil)
+			if classification.Level != ErrorLevelChannel {
+				t.Fatalf("status %d level=%v, want ErrorLevelChannel", status, classification.Level)
+			}
+			if !classification.ModelScoped {
+				t.Fatalf("status %d must be model-scoped", status)
+			}
+		})
+	}
+}
+
+func TestShouldFallbackProtocol(t *testing.T) {
+	tests := []struct {
+		name       string
+		statusCode int
+		body       string
+		want       bool
+	}{
+		{
+			name:       "protocol conversion not implemented",
+			statusCode: http.StatusInternalServerError,
+			body:       `{"error":{"message":"not implemented (request id: req_test)","type":"new_api_error","param":"","code":"convert_request_failed"}}`,
+			want:       true,
+		},
+		{
+			name:       "ordinary server error",
+			statusCode: http.StatusInternalServerError,
+			body:       `{"error":{"message":"upstream failed"}}`,
+		},
+		{
+			name:       "conversion code without unsupported message",
+			statusCode: http.StatusInternalServerError,
+			body:       `{"error":{"message":"conversion failed","code":"convert_request_failed"}}`,
+		},
+		{
+			name:       "unsupported message without conversion code",
+			statusCode: http.StatusInternalServerError,
+			body:       `{"error":{"message":"not implemented","code":"server_error"}}`,
+		},
+		{
+			name:       "malformed server error",
+			statusCode: http.StatusInternalServerError,
+			body:       `{"error":`,
+		},
+		{
+			name:       "non-model endpoint 404",
+			statusCode: http.StatusNotFound,
+			body:       `{"error":{"message":"endpoint not found"}}`,
+			want:       true,
+		},
+		{
+			name:       "model 404",
+			statusCode: http.StatusNotFound,
+			body:       `{"error":{"message":"model gpt-test not found","code":"model_not_found"}}`,
+		},
+		{
+			name:       "method not allowed",
+			statusCode: http.StatusMethodNotAllowed,
+			want:       true,
+		},
+		{
+			name:       "cloudflare block page before origin",
+			statusCode: http.StatusForbidden,
+			body:       `<!DOCTYPE html><html><head><title>Attention Required! | Cloudflare</title></head><body><h1>Sorry, you have been blocked</h1><p>Cloudflare Ray ID: test</p></body></html>`,
+			want:       true,
+		},
+		{
+			name:       "ordinary api forbidden",
+			statusCode: http.StatusForbidden,
+			body:       `{"error":{"message":"forbidden"}}`,
+		},
+		{
+			name:       "unsupported anthropic beta",
+			statusCode: http.StatusBadRequest,
+			body:       `{"type":"error","error":{"type":"invalid_request_error","message":"尚未验证或不支持的 anthropic-beta：claude-code-20250219"}}`,
+			want:       true,
+		},
+		{
+			name:       "responses model not supported",
+			statusCode: http.StatusBadRequest,
+			body:       `{"error":{"message":"当前模型不支持 Responses API：deepseek-v4-flash","type":"invalid_request_error","param":null,"code":"RESPONSES_MODEL_NOT_SUPPORTED"}}`,
+			want:       true,
+		},
+		{
+			name:       "ordinary responses validation error",
+			statusCode: http.StatusBadRequest,
+			body:       `{"error":{"message":"input is required","type":"invalid_request_error","code":"invalid_request_error"}}`,
+			want:       true,
+		},
+		{
+			name:       "ordinary anthropic beta validation error",
+			statusCode: http.StatusBadRequest,
+			body:       `{"type":"error","error":{"type":"invalid_request_error","message":"anthropic-beta must be a string"}}`,
+			want:       true,
+		},
+		{
+			name:       "malformed bad request",
+			statusCode: http.StatusBadRequest,
+			body:       `{"error":`,
+			want:       true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := ShouldFallbackProtocol(tt.statusCode, []byte(tt.body)); got != tt.want {
+				t.Fatalf("ShouldFallbackProtocol(%d, %q)=%v, want %v", tt.statusCode, tt.body, got, tt.want)
 			}
 		})
 	}
@@ -941,8 +1184,8 @@ func TestClassify404Error(t *testing.T) {
 		{
 			name:         "resource_not_exist",
 			responseBody: []byte(`{"error": {"message": "The requested resource does not exist"}}`),
-			expected:     ErrorLevelClient,
-			reason:       "资源不存在应判定为客户端级错误",
+			expected:     ErrorLevelChannel,
+			reason:       "未明确指向模型的资源404应判定为渠道级错误",
 		},
 		{
 			name: "html_error_page",
@@ -1023,6 +1266,33 @@ func TestGetStatusCodeMeta(t *testing.T) {
 			meta := GetStatusCodeMeta(tt.status)
 			if meta.Level != tt.wantLevel {
 				t.Errorf("Level: got %v, want %v", meta.Level, tt.wantLevel)
+			}
+		})
+	}
+}
+
+func TestIsModelScopedHTTPStatus(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		status int
+		want   bool
+	}{
+		{500, true},
+		{520, true},
+		{524, true},
+		{595, true},
+		{StatusQuotaExceeded, false},
+		{StatusSSEError, false},
+		{StatusFirstByteTimeout, false},
+		{StatusStreamIncomplete, false},
+		{499, false},
+	}
+
+	for _, tt := range tests {
+		t.Run(strconv.Itoa(tt.status), func(t *testing.T) {
+			if got := IsModelScopedHTTPStatus(tt.status); got != tt.want {
+				t.Fatalf("IsModelScopedHTTPStatus(%d)=%v, want %v", tt.status, got, tt.want)
 			}
 		})
 	}
@@ -1123,4 +1393,130 @@ func TestClassifyHTTPResponseWithMeta_UsageLimitReached(t *testing.T) {
 			t.Fatalf("cooldown duration=%v, want about 30m", duration)
 		}
 	})
+}
+
+// 上游 WebSocket 连接槽耗尽是瞬时资源竞争：必须切渠道，但不能让健康的 Key
+// 或整个模型背上指数退避冷却。
+func TestClassifyWebsocketConnectionLimitIsShortChannelCooldown(t *testing.T) {
+	now := time.Date(2026, 7, 25, 6, 30, 0, 0, time.UTC)
+
+	tests := []struct {
+		name         string
+		statusCode   int
+		responseBody []byte
+	}{
+		{
+			name:         "error type",
+			statusCode:   429,
+			responseBody: []byte(`{"type":"error","error":{"type":"websocket_connection_limit_reached","message":"too many concurrent connections"}}`),
+		},
+		{
+			name:         "error code",
+			statusCode:   429,
+			responseBody: []byte(`{"error":{"code":"websocket_connection_limit_reached"}}`),
+		},
+		{
+			name:         "top level code",
+			statusCode:   StatusSSEError,
+			responseBody: []byte(`{"code":"websocket_connection_limit_reached"}`),
+		},
+		{
+			name:         "error as string",
+			statusCode:   StatusSSEError,
+			responseBody: []byte(`{"error":"websocket_connection_limit_reached"}`),
+		},
+		{
+			name:         "upstream 503 wrapper",
+			statusCode:   503,
+			responseBody: []byte(`{"status":503,"error":{"type":"WEBSOCKET_CONNECTION_LIMIT_REACHED"}}`),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := classifyHTTPResponseWithMetaAt(tt.statusCode, nil, tt.responseBody, now)
+
+			if got.Level != ErrorLevelChannel {
+				t.Errorf("Level=%v, want ErrorLevelChannel", got.Level)
+			}
+			if !got.HasChannelCooldownUntil {
+				t.Fatal("expected HasChannelCooldownUntil")
+			}
+			if want := now.Add(WebsocketConnectionLimitCooldown); !got.ChannelCooldownUntil.Equal(want) {
+				t.Errorf("ChannelCooldownUntil=%v, want %v", got.ChannelCooldownUntil, want)
+			}
+			if got.ChannelCooldownReason != "websocket_connection_limit" {
+				t.Errorf("ChannelCooldownReason=%q, want websocket_connection_limit", got.ChannelCooldownReason)
+			}
+			if got.ModelScoped {
+				t.Error("connection slot exhaustion must not cool down the model")
+			}
+			if got.HasKeyCooldownUntil {
+				t.Error("connection slot exhaustion must not cool down the key")
+			}
+		})
+	}
+}
+
+// 回归保护：普通限流仍然只冷却当前模型，不被连接槽分支吞掉。
+func TestClassifyOrdinaryRateLimitStillModelScoped(t *testing.T) {
+	now := time.Date(2026, 7, 25, 6, 30, 0, 0, time.UTC)
+	body := []byte(`{"type":"error","error":{"type":"rate_limit_error","message":"slow down"}}`)
+
+	got := classifyHTTPResponseWithMetaAt(429, nil, body, now)
+
+	if got.HasChannelCooldownUntil {
+		t.Fatal("ordinary rate limit must not take the websocket connection limit path")
+	}
+	if !got.ModelScoped {
+		t.Error("ordinary 429 should stay model scoped")
+	}
+	if got.PreventKeyFallback {
+		t.Error("ordinary 429 should preserve independent-key fallback")
+	}
+}
+
+func TestClassifyAnthropicRateLimitUsesUnifiedReset(t *testing.T) {
+	now := time.Date(2026, 8, 11, 12, 43, 49, 0, time.UTC)
+	want := time.Unix(1786462800, 0)
+	body := []byte(`{"type":"error","error":{"type":"rate_limit_error","message":"slow down"}}`)
+	headers := map[string][]string{
+		"anthropic-ratelimit-unified-reset":     {strconv.FormatInt(want.Unix(), 10)},
+		"Anthropic-Ratelimit-Unified-5h-Reset":  {strconv.FormatInt(want.Unix(), 10)},
+		"Anthropic-Ratelimit-Unified-7d-Reset":  {strconv.FormatInt(want.Add(72*time.Hour).Unix(), 10)},
+		"Anthropic-Ratelimit-Unified-7d-Status": {"allowed"},
+		"Retry-After":                           {"30"},
+	}
+
+	got := classifyHTTPResponseWithMetaAt(http.StatusTooManyRequests, headers, body, now)
+
+	if !got.ModelScoped || !got.HasModelCooldownUntil {
+		t.Fatalf("classification=%+v, want fixed model cooldown", got)
+	}
+	if !got.PreventKeyFallback {
+		t.Fatal("Anthropic unified rate limit must not rotate independent keys")
+	}
+	if !got.ModelCooldownUntil.Equal(want) {
+		t.Fatalf("ModelCooldownUntil=%s, want %s", got.ModelCooldownUntil, want)
+	}
+	if got.ModelCooldownReason != "anthropic_unified_reset" {
+		t.Fatalf("ModelCooldownReason=%q, want anthropic_unified_reset", got.ModelCooldownReason)
+	}
+}
+
+func TestIsWebsocketConnectionLimitErrorRejectsUnrelatedBodies(t *testing.T) {
+	bodies := []string{
+		``,
+		`not json`,
+		`{"error":{"type":"rate_limit_error"}}`,
+		`{"error":{"code":1308}}`,
+		`{"code":"websocket_connection_limit"}`,
+		`{"message":"websocket_connection_limit_reached"}`,
+	}
+
+	for _, body := range bodies {
+		if IsWebsocketConnectionLimitError([]byte(body)) {
+			t.Errorf("body %q must not be treated as websocket connection limit", body)
+		}
+	}
 }

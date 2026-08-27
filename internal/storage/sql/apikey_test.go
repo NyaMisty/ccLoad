@@ -2,6 +2,7 @@ package sql_test
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	"ccLoad/internal/model"
@@ -275,11 +276,14 @@ func TestAPIKey_ImportChannelBatch(t *testing.T) {
 		{
 			Config: &model.Config{
 				Name:                  "imported-channel-1",
-				URL:                   "https://api1.example.com",
+				URLs:                  model.ChannelURLs{{URL: "https://api1.example.com"}},
 				Priority:              10,
 				Enabled:               true,
 				ScheduledCheckEnabled: true,
-				ChannelType:           "openai",
+				CooldownDetectionRules: &model.CooldownDetectionRules{Rules: []model.CooldownDetectionRule{{
+					Enabled: true, Name: "Imported cooldown", Priority: 0, StatusCodes: []int{429},
+					Scope: model.CooldownScopeKey, Mode: model.CooldownModeFixed, CooldownSeconds: 90,
+				}}},
 				ModelEntries: []model.ModelEntry{
 					{Model: "gpt-4"},
 					{Model: "gpt-3.5-turbo"},
@@ -293,11 +297,10 @@ func TestAPIKey_ImportChannelBatch(t *testing.T) {
 		{
 			Config: &model.Config{
 				Name:                  "imported-channel-2",
-				URL:                   "https://api2.example.com",
+				URLs:                  model.ChannelURLs{{URL: "https://api2.example.com"}},
 				Priority:              20,
 				Enabled:               true,
 				ScheduledCheckEnabled: false,
-				ChannelType:           "anthropic",
 				ModelEntries: []model.ModelEntry{
 					{Model: "claude-3"},
 				},
@@ -334,6 +337,10 @@ func TestAPIKey_ImportChannelBatch(t *testing.T) {
 	}
 	if !configsByName["imported-channel-1"].ScheduledCheckEnabled {
 		t.Fatalf("expected imported-channel-1 scheduled check enabled")
+	}
+	importedRules := configsByName["imported-channel-1"].CooldownDetectionRules
+	if importedRules == nil || len(importedRules.Rules) != 1 || importedRules.Rules[0].Name != "Imported cooldown" {
+		t.Fatalf("expected imported cooldown detection rules, got %#v", importedRules)
 	}
 	if configsByName["imported-channel-2"].ScheduledCheckEnabled {
 		t.Fatalf("expected imported-channel-2 scheduled check disabled")
@@ -377,6 +384,85 @@ func TestAPIKey_ImportChannelBatch(t *testing.T) {
 	}
 }
 
+func TestAPIKey_ImportChannelBatchCannotReplaceCodexAuthentication(t *testing.T) {
+	store := newTestStore(t, "import-codex-auth-immutable.db")
+	ctx := context.Background()
+	credential := `{"type":"codex","access_token":"at-secret","refresh_token":"rt-secret","expired":"2030-01-01T00:00:00Z"}`
+	created, err := store.CreateConfig(ctx, &model.Config{
+		Name: "codex-immutable", AuthType: model.AuthTypeCodexOAuth, OAuthCredential: credential,
+		URLs:    model.ChannelURLs{{URL: "https://chatgpt.com/backend-api/codex/responses", Exact: true, Protocols: []string{"codex"}}},
+		Enabled: true, Websockets: true, ModelEntries: []model.ModelEntry{{Model: "*"}},
+	})
+	if err != nil {
+		t.Fatalf("CreateConfig() error = %v", err)
+	}
+
+	_, _, err = store.ImportChannelBatch(ctx, []*model.ChannelWithKeys{{
+		Config: &model.Config{
+			Name: created.Name, AuthType: model.AuthTypeAPIKey,
+			URLs: model.ChannelURLs{{URL: "https://api.example.com"}}, Enabled: true,
+			ModelEntries: []model.ModelEntry{{Model: "gpt-test"}},
+		},
+		APIKeys: []model.APIKey{{KeyIndex: 0, APIKey: "must-not-replace-oauth"}},
+	}})
+	if err == nil || !strings.Contains(err.Error(), "auth_type cannot be changed") {
+		t.Fatalf("ImportChannelBatch() error = %v, want immutable auth_type rejection", err)
+	}
+
+	persisted, err := store.GetConfig(ctx, created.ID)
+	if err != nil {
+		t.Fatalf("GetConfig() error = %v", err)
+	}
+	if !persisted.UsesCodexOAuth() || persisted.OAuthCredential != credential {
+		t.Fatalf("Codex channel changed after rejected import: %#v", persisted)
+	}
+	keys, err := store.GetAPIKeys(ctx, created.ID)
+	if err != nil || len(keys) != 0 {
+		t.Fatalf("Codex keys after rejected import = (%#v, %v)", keys, err)
+	}
+}
+
+func TestAPIKey_ImportChannelBatchPreservesExistingOAuthCredential(t *testing.T) {
+	store := newTestStore(t, "import-preserve-oauth-credential.db")
+	ctx := context.Background()
+	winner := `{"type":"codex","access_token":"at-winner","refresh_token":"rt-winner","expired":"2031-01-01T00:00:00Z"}`
+	created, err := store.CreateConfig(ctx, &model.Config{
+		Name: "codex-import-cas", AuthType: model.AuthTypeCodexOAuth, OAuthCredential: winner,
+		URLs:    model.ChannelURLs{{URL: "https://example.com", Protocols: []string{"codex"}}},
+		Enabled: true, ModelEntries: []model.ModelEntry{{Model: "gpt-old"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	stale := `{"type":"codex","access_token":"at-stale","refresh_token":"rt-stale","expired":"2032-01-01T00:00:00Z"}`
+	for _, imported := range []*model.Config{
+		{
+			Name: created.Name, AuthType: model.AuthTypeCodexOAuth, OAuthCredential: stale,
+			URLs:    model.ChannelURLs{{URL: "https://by-name.example.com", Protocols: []string{"codex"}}},
+			Enabled: true, ModelEntries: []model.ModelEntry{{Model: "gpt-by-name"}},
+		},
+		{
+			ID: created.ID, Name: created.Name, AuthType: model.AuthTypeCodexOAuth, OAuthCredential: stale,
+			URLs:    model.ChannelURLs{{URL: "https://by-id.example.com", Protocols: []string{"codex"}}},
+			Enabled: true, ModelEntries: []model.ModelEntry{{Model: "gpt-by-id"}},
+		},
+	} {
+		if _, _, err := store.ImportChannelBatch(ctx, []*model.ChannelWithKeys{{Config: imported}}); err == nil {
+			t.Fatal("ImportChannelBatch() updated an existing OAuth channel")
+		}
+		persisted, err := store.GetConfig(ctx, created.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if persisted.OAuthCredential != winner {
+			t.Fatalf("OAuth credential = %q, want CAS winner", persisted.OAuthCredential)
+		}
+		if !persisted.SupportsModel("gpt-old") || persisted.SupportsModel("gpt-by-name") || persisted.SupportsModel("gpt-by-id") {
+			t.Fatalf("OAuth models changed after rejected import: %v", persisted.GetModels())
+		}
+	}
+}
+
 func TestAPIKey_ImportChannelBatchPreservesScheduledCheckWithExplicitID(t *testing.T) {
 	t.Parallel()
 
@@ -387,11 +473,11 @@ func TestAPIKey_ImportChannelBatchPreservesScheduledCheckWithExplicitID(t *testi
 		Config: &model.Config{
 			ID:                    42,
 			Name:                  "imported-channel-explicit-id",
-			URL:                   "https://api.example.com",
+			URLs:                  model.ChannelURLs{{URL: "https://api.example.com"}},
 			Priority:              5,
 			Enabled:               true,
+			Websockets:            true,
 			ScheduledCheckEnabled: true,
-			ChannelType:           "openai",
 			ModelEntries: []model.ModelEntry{
 				{Model: "gpt-4o-mini"},
 			},
@@ -416,6 +502,9 @@ func TestAPIKey_ImportChannelBatchPreservesScheduledCheckWithExplicitID(t *testi
 	if !config.ScheduledCheckEnabled {
 		t.Fatalf("expected scheduled_check_enabled to persist for explicit id import")
 	}
+	if !config.Websockets {
+		t.Fatalf("expected websockets to persist for explicit id import")
+	}
 }
 
 func TestAPIKey_ImportChannelBatchPreservesModelEntryOrder(t *testing.T) {
@@ -426,11 +515,10 @@ func TestAPIKey_ImportChannelBatchPreservesModelEntryOrder(t *testing.T) {
 
 	channel := &model.ChannelWithKeys{
 		Config: &model.Config{
-			Name:        "imported-channel-order",
-			URL:         "https://api.example.com",
-			Priority:    5,
-			Enabled:     true,
-			ChannelType: "openai",
+			Name:     "imported-channel-order",
+			URLs:     model.ChannelURLs{{URL: "https://api.example.com"}},
+			Priority: 5,
+			Enabled:  true,
 			ModelEntries: []model.ModelEntry{
 				{Model: "z-last"},
 				{Model: "a-first"},

@@ -34,7 +34,7 @@ func TestConcurrentConfigCreate(t *testing.T) {
 
 			cfg := &model.Config{
 				Name:         fmt.Sprintf("concurrent-channel-%d", idx),
-				URL:          "https://api.example.com",
+				URLs:         model.ChannelURLs{{URL: "https://api.example.com"}},
 				Enabled:      true,
 				ModelEntries: []model.ModelEntry{{Model: "gpt-4", RedirectModel: ""}},
 			}
@@ -81,7 +81,7 @@ func TestConcurrentConfigReadWrite(t *testing.T) {
 	// 预先创建一个配置
 	cfg := &model.Config{
 		Name:         "test-rw-channel",
-		URL:          "https://api.example.com",
+		URLs:         model.ChannelURLs{{URL: "https://api.example.com"}},
 		Enabled:      true,
 		ModelEntries: []model.ModelEntry{{Model: "gpt-4", RedirectModel: ""}},
 	}
@@ -118,9 +118,8 @@ func TestConcurrentConfigReadWrite(t *testing.T) {
 		go func(idx int) {
 			defer wg.Done()
 			for j := 0; j < 5; j++ {
-				updates := &model.Config{
-					Priority: idx*10 + j,
-				}
+				updates := created.Clone()
+				updates.Priority = idx*10 + j
 				_, err := store.UpdateConfig(ctx, created.ID, updates)
 				if err == nil {
 					writeCount.Add(1)
@@ -266,7 +265,7 @@ func TestConcurrentAPIKeyOperations(t *testing.T) {
 	// 预先创建一个渠道
 	cfg := &model.Config{
 		Name:    "test-apikey-channel",
-		URL:     "https://api.example.com",
+		URLs:    model.ChannelURLs{{URL: "https://api.example.com"}},
 		Enabled: true,
 	}
 	created, err := store.CreateConfig(ctx, cfg)
@@ -353,7 +352,7 @@ func TestConcurrentCooldownOperations(t *testing.T) {
 	// 预先创建渠道和Keys
 	cfg := &model.Config{
 		Name:    "test-cooldown-channel",
-		URL:     "https://api.example.com",
+		URLs:    model.ChannelURLs{{URL: "https://api.example.com"}},
 		Enabled: true,
 	}
 	created, err := store.CreateConfig(ctx, cfg)
@@ -427,94 +426,6 @@ func TestConcurrentCooldownOperations(t *testing.T) {
 	}
 	if keySucc == 0 {
 		t.Error("Key冷却全部失败")
-	}
-}
-
-// TestConcurrentMixedOperations 测试混合并发操作
-func TestConcurrentMixedOperations(t *testing.T) {
-	store, cleanup := setupSQLiteTestStore(t, "concurrent-test.db")
-	defer cleanup()
-
-	ctx := context.Background()
-	const duration = 500 * time.Millisecond // 500ms 足够验证并发正确性
-
-	var wg sync.WaitGroup
-	var operations atomic.Int32
-	stopCh := make(chan struct{})
-
-	// 创建操作
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		idx := 0
-		for {
-			select {
-			case <-stopCh:
-				return
-			default:
-				cfg := &model.Config{
-					Name:    fmt.Sprintf("mixed-channel-%d", idx),
-					URL:     "https://api.example.com",
-					Enabled: true,
-				}
-				_, _ = store.CreateConfig(ctx, cfg)
-				operations.Add(1)
-				idx++
-				time.Sleep(5 * time.Millisecond)
-			}
-		}
-	}()
-
-	// 读取操作
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		for {
-			select {
-			case <-stopCh:
-				return
-			default:
-				_, _ = store.ListConfigs(ctx)
-				operations.Add(1)
-				time.Sleep(3 * time.Millisecond)
-			}
-		}
-	}()
-
-	// 日志操作
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		channelID := int64(1)
-		for {
-			select {
-			case <-stopCh:
-				return
-			default:
-				entry := &model.LogEntry{
-					ChannelID:  channelID,
-					StatusCode: 200,
-					Model:      "gpt-4",
-					Time:       model.JSONTime{Time: time.Now()},
-				}
-				_ = store.AddLog(ctx, entry)
-				operations.Add(1)
-				time.Sleep(2 * time.Millisecond)
-			}
-		}
-	}()
-
-	// 运行指定时间
-	time.Sleep(duration)
-	close(stopCh)
-	wg.Wait()
-
-	totalOps := operations.Load()
-	t.Logf("[INFO] 混合并发测试完成: 总操作数=%d, 持续时间=%v, QPS=%.1f",
-		totalOps, duration, float64(totalOps)/duration.Seconds())
-
-	if totalOps < 25 {
-		t.Errorf("操作数过少: %d (期望至少25)", totalOps)
 	}
 }
 

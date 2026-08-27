@@ -4,9 +4,10 @@
     window.trendData = null;
     window.currentRange = 'today'; // 默认"本日"
     window.currentTrendType = 'first_byte'; // 默认显示首字响应趋势 (count/rpm/first_byte/duration/tokens/cost)
-    window.currentChannelType = 'all'; // 当前选中的渠道类型
+    window.currentTrendChartType = 'line'; // 默认使用折线图，可切换为柱状图
     window.currentModel = ''; // 当前选中的模型（空字符串表示全部模型）
     window.currentAuthToken = ''; // 当前选中的令牌（空字符串表示全部令牌）
+    window.currentClientProtocol = ''; // 当前选中的客户端入口协议
     window.currentChannelName = ''; // 当前选中的渠道名称
     let currentTrendCustomTimeRange = null;
     window.chartInstance = null;
@@ -76,19 +77,9 @@
           return false;
         }
       },
+      { key: 'clientProtocol', queryKeys: ['client_protocol'], defaultValue: '' },
       { key: 'model', queryKeys: ['model'], defaultValue: '' },
       { key: 'authToken', queryKeys: ['token'], requestKey: 'auth_token_id', defaultValue: '' },
-      {
-        key: 'channelType',
-        queryKeys: ['channel_type'],
-        defaultValue: 'all',
-        includeInQuery(value) {
-          return Boolean(value) && value !== 'all';
-        },
-        includeInRequest(value) {
-          return Boolean(value) && value !== 'all';
-        }
-      },
       {
         key: 'channelName',
         queryKeys: ['channel_name_like'],
@@ -98,9 +89,7 @@
         }
       }
     ];
-    const TREND_MODELS_REQUEST_FIELDS = TREND_FILTER_FIELDS.filter((field) =>
-      field.key === 'range' || field.key === 'channelType'
-    );
+    const TREND_MODELS_REQUEST_FIELDS = TREND_FILTER_FIELDS.filter((field) => field.key === 'range');
 
     function getTrendFilters() {
       const range = window.currentRange || 'today';
@@ -110,9 +99,9 @@
         customStartTime: hasCustomRange ? String(currentTrendCustomTimeRange.startMs) : '',
         customEndTime: hasCustomRange ? String(currentTrendCustomTimeRange.endMs) : '',
         trendType: window.currentTrendType || 'first_byte',
+        clientProtocol: window.currentClientProtocol || '',
         model: window.currentModel || '',
         authToken: window.currentAuthToken || '',
-        channelType: window.currentChannelType || 'all',
         channelName: window.currentChannelName || ''
       };
     }
@@ -162,19 +151,16 @@
       return params;
     }
 
-    // 加载可用模型列表
-    // channelType 参数：渠道类型筛选，空字符串或 'all' 表示全部
-    // range 参数：时间范围，可选，默认使用当前选择的时间范围
-    async function loadModels(channelType, range) {
+    // 加载当前时间范围内的可用模型和渠道列表
+    async function loadModels(range) {
       try {
         const filters = {
           ...getTrendFilters(),
-          range: range || window.currentRange || 'today',
-          channelType: channelType || window.currentChannelType || 'all'
+          range: range || window.currentRange || 'today'
         };
         const params = window.FilterQuery.buildRequestParams(filters, TREND_MODELS_REQUEST_FIELDS);
         appendTrendTimeRangeParams(params, filters);
-        const url = `/admin/models?${params.toString()}`;
+        const url = `/dashboard/models?${params.toString()}`;
 
         const resp = await fetchDataWithAuth(url) || {};
         const rawModels = Array.isArray(resp.models) ? resp.models : [];
@@ -230,6 +216,11 @@
           window.currentModel = modelSelect.value || '';
         }
 
+        const clientProtocolSelect = document.getElementById('f_client_protocol');
+        if (clientProtocolSelect) {
+          window.currentClientProtocol = clientProtocolSelect.value || '';
+        }
+
         const tokenSelect = document.getElementById('f_auth_token');
         if (tokenSelect) {
           window.currentAuthToken = tokenSelect.value || '';
@@ -245,7 +236,7 @@
         const metricsParams = buildTrendRequestParams({
           bucket_min: bucketMin
         });
-        const metrics = await fetchAPIWithAuthRaw('/admin/metrics?' + metricsParams.toString());
+        const metrics = await fetchAPIWithAuthRaw('/dashboard/metrics?' + metricsParams.toString());
 
         if (!metrics.payload.success) {
           throw new Error(metrics.payload.error || t('trend.fetchDataFailed'));
@@ -869,6 +860,7 @@
       const yAxisMax = useLatencyAxis ? latencyAxisMax : null;
       const chartTheme = getTrendChartTheme();
 
+      const chartType = window.currentTrendChartType === 'bar' ? 'bar' : 'line';
       const option = {
         backgroundColor: 'transparent',
         title: {
@@ -885,7 +877,7 @@
             fontSize: 12
           },
           axisPointer: {
-            type: 'cross',
+            type: chartType === 'bar' ? 'shadow' : 'cross',
             crossStyle: {
               color: chartTheme.mutedText,
               width: 1,
@@ -983,7 +975,7 @@
         },
         xAxis: {
           type: 'category',
-          boundaryGap: false,
+          boundaryGap: chartType === 'bar',
           data: timestamps,
           axisLine: {
             lineStyle: {
@@ -1054,7 +1046,7 @@
             }
           }
         },
-        series: applyNoRequestMarkArea(series, markAreaData),
+        series: applyNoRequestMarkArea(applyTrendChartType(series, chartType), markAreaData),
         dataZoom: showZoom ? [
           {
             type: 'inside',
@@ -1088,6 +1080,51 @@
 
       // 设置配置并渲染
       window.chartInstance.setOption(option, true); // true 表示不合并，全量更新
+    }
+
+    function applyTrendChartType(series, chartType) {
+      if (chartType !== 'bar') return series;
+
+      return series.map(item => {
+        const isDashedLine = item.lineStyle && item.lineStyle.type === 'dashed';
+        const next = {
+          ...item,
+          type: 'bar',
+          barMaxWidth: 18,
+          itemStyle: {
+            ...(item.itemStyle || {}),
+            opacity: isDashedLine ? 0.48 : 0.78,
+            borderRadius: [3, 3, 0, 0]
+          }
+        };
+
+        delete next.smooth;
+        delete next.symbol;
+        delete next.symbolSize;
+        delete next.showSymbol;
+        delete next.sampling;
+        delete next.connectNulls;
+        delete next.lineStyle;
+        delete next.areaStyle;
+        return next;
+      });
+    }
+
+    function setTrendChartType(chartType) {
+      if (chartType !== 'line' && chartType !== 'bar') return;
+      if (window.currentTrendChartType === chartType) return;
+
+      window.currentTrendChartType = chartType;
+      updateTrendChartTypeButtons();
+      renderChart();
+    }
+
+    function updateTrendChartTypeButtons() {
+      document.querySelectorAll('.trend-chart-type-btn').forEach(button => {
+        const active = button.dataset.chartType === window.currentTrendChartType;
+        button.classList.toggle('active', active);
+        button.setAttribute('aria-pressed', active ? 'true' : 'false');
+      });
     }
 
     function attachChartResizeObserver(chartDom) {
@@ -1537,17 +1574,9 @@ function shouldShowZoom(points, hours, trendType) {
       // 初始化渠道名 combobox
       initTrendChannelNameCombobox(window.currentChannelName);
 
-      // 并行化：三个独立的初始化请求同时发出，消除串行等待
-      // initChannelTypeFilter / loadModels / initAuthTokenFilter 互不依赖
-      const [, , authTokens] = await Promise.all([
-        window.initChannelTypeFilter('f_channel_type', window.currentChannelType, async (value) => {
-          window.currentChannelType = value;
-          persistState();
-          window.visibleChannels.clear();
-          await loadModels(value);
-          loadData();
-        }),
-        loadModels(window.currentChannelType),
+      // 模型/渠道选项与令牌选项互不依赖
+      const [, authTokens] = await Promise.all([
+        loadModels(),
         window.initAuthTokenFilter({
           selectId: 'f_auth_token',
           value: window.currentAuthToken,
@@ -1581,6 +1610,14 @@ function shouldShowZoom(points, hours, trendType) {
     });
 
     function bindToggles() {
+      const trendChartTypeGroup = document.getElementById('trend-chart-type-group');
+      updateTrendChartTypeButtons();
+      trendChartTypeGroup?.addEventListener('click', (event) => {
+        const button = event.target.closest('.trend-chart-type-btn');
+        if (!button || !trendChartTypeGroup.contains(button)) return;
+        setTrendChartType(button.dataset.chartType);
+      });
+
       // 趋势类型切换
       const trendTypeGroup = document.getElementById('trend-type-group');
       trendTypeGroup.addEventListener('click', (e) => {
@@ -1599,6 +1636,15 @@ function shouldShowZoom(points, hours, trendType) {
       if (modelSelect) {
         modelSelect.addEventListener('change', (e) => {
           window.currentModel = e.target.value || '';
+          persistState();
+          loadData();
+        });
+      }
+
+      const clientProtocolSelect = document.getElementById('f_client_protocol');
+      if (clientProtocolSelect) {
+        clientProtocolSelect.addEventListener('change', (e) => {
+          window.currentClientProtocol = e.target.value || '';
           persistState();
           loadData();
         });
@@ -1639,7 +1685,7 @@ function shouldShowZoom(points, hours, trendType) {
         label.textContent = t('trend.dataDisplay', { range: rangeLabel });
       }
       persistState();
-      await loadModels(window.currentChannelType, range);
+      await loadModels(range);
       loadData();
     }
 
@@ -1691,11 +1737,15 @@ function shouldShowZoom(points, hours, trendType) {
         // 恢复模型选择
         window.currentModel = restoredFilters.model || '';
 
+        // 恢复客户端入口协议
+        window.currentClientProtocol = restoredFilters.clientProtocol || '';
+        const clientProtocolSelect = document.getElementById('f_client_protocol');
+        if (clientProtocolSelect) {
+          clientProtocolSelect.value = window.currentClientProtocol;
+        }
+
         // 恢复令牌选择
         window.currentAuthToken = restoredFilters.authToken || '';
-
-        // 恢复渠道类型
-        window.currentChannelType = restoredFilters.channelType || 'all';
 
         // 恢复渠道名（combobox 初始化时通过 initialValue 恢复）
         window.currentChannelName = restoredFilters.channelName || '';

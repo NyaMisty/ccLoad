@@ -23,6 +23,7 @@
   <script defer src="/web/assets/js/filter-query.js?v=__VERSION__"></script>
   <script defer src="/web/assets/js/page-filters.js?v=__VERSION__"></script>
   <script defer src="/web/assets/js/highlight.min.js?v=__VERSION__"></script>
+  <script defer src="/web/assets/js/web-auth.js?v=__VERSION__"></script>
   <script defer src="/web/assets/js/ui.js?v=__VERSION__"></script>
   <script defer src="/web/assets/js/markdown-renderer.js?v=__VERSION__"></script>
   <script defer src="/web/assets/js/merged-response-client.js?v=__VERSION__"></script>
@@ -67,7 +68,7 @@
                     <th class="logs-col-cache-read" data-i18n="logs.colCacheRead">缓存读</th>
                     <th class="logs-col-cache-write" data-i18n="logs.colCacheWrite">缓存建</th>
                     <th class="logs-col-cache-util" data-i18n="logs.colCacheUtil">缓存命中%</th>
-                    <th class="logs-col-cost" data-i18n="logs.colCost">成本</th>
+                    <th class="logs-col-cost" data-i18n="logs.colCost" data-i18n-title="logs.costTooltipHeader" title="标准成本：单价（美元/百万 Token）× 数量 = 费用">成本</th>
                     <th class="logs-col-message" data-i18n="logs.colMessage">信息</th>
                   </tr>
                 </thead>
@@ -222,18 +223,27 @@
       <div id="debugLogError" style="text-align: center; padding: 2rem; color: var(--danger-600); display: none;"></div>
       <div id="debugLogContent" style="display: none; flex: 1; min-height: 0; flex-direction: column;">
         <div class="upstream-detail-tabs">
-          <button type="button" class="upstream-tab active" data-tab="request" data-i18n="logs.debugRequest">Request</button>
-          <button type="button" class="upstream-tab" data-tab="response" data-i18n="logs.debugResponse">Response</button>
+          <button type="button" id="debugRequestTabBtn" class="upstream-tab active" data-tab="request" data-i18n="logs.debugRequest">Request</button>
+          <button type="button" id="debugTranslatedRequestTabBtn" class="upstream-tab" data-tab="translated-request" data-i18n="logs.debugTranslatedRequest" hidden>Translated Request</button>
+          <button type="button" id="debugResponseTabBtn" class="upstream-tab" data-tab="response" data-i18n="logs.debugResponse">Response</button>
+          <button type="button" id="debugTranslatedResponseTabBtn" class="upstream-tab" data-tab="translated-response" data-i18n="logs.debugTranslatedResponse" hidden>Translated Response</button>
           <button type="button" id="debugWrapBtn" class="upstream-copy-btn upstream-wrap-btn active" data-action="toggle-debug-wrap" data-i18n="logs.debugWrap" aria-pressed="true">换行</button>
           <button type="button" class="upstream-copy-btn upstream-copy-btn--tabs" data-copy-target="debugReqRaw" data-i18n="common.copy">复制</button>
           <button type="button" id="debugMergeBtn" class="upstream-copy-btn upstream-merge-btn" data-action="merge-debug-response" data-i18n="logs.debugMerge" aria-pressed="false" hidden>合并</button>
         </div>
-        <div id="debugTabRequest" class="upstream-tab-panel active">
+        <div id="debugTabRequest" class="upstream-tab-panel active" data-tab="request">
           <pre id="debugReqRaw" class="upstream-pre upstream-pre--full"></pre>
         </div>
-        <div id="debugTabResponse" class="upstream-tab-panel">
+        <div id="debugTabTranslatedRequest" class="upstream-tab-panel" data-tab="translated-request">
+          <pre id="debugTranslatedReqRaw" class="upstream-pre upstream-pre--full"></pre>
+        </div>
+        <div id="debugTabResponse" class="upstream-tab-panel" data-tab="response">
           <pre id="debugRespRaw" class="upstream-pre upstream-pre--full"></pre>
           <div id="debugRespMerged" class="upstream-merged-markdown upstream-pre--full" hidden><div class="chat-message chat-message--assistant"><div class="chat-message-content"></div></div></div>
+        </div>
+        <div id="debugTabTranslatedResponse" class="upstream-tab-panel" data-tab="translated-response">
+          <pre id="debugTranslatedRespRaw" class="upstream-pre upstream-pre--full"></pre>
+          <div id="debugTranslatedRespMerged" class="upstream-merged-markdown upstream-pre--full" hidden><div class="chat-message chat-message--assistant"><div class="chat-message-content"></div></div></div>
         </div>
       </div>
     </div>

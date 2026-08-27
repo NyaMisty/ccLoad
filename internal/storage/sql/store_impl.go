@@ -4,18 +4,19 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
-	"log"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"ccLoad/internal/model"
+	"ccLoad/internal/util"
 )
 
 // SQLStore 通用SQL存储实现
-// 支持 SQLite 和 MySQL（时间/布尔值存储格式完全一致，SQL语法按驱动分支）
+// 支持 SQLite / MySQL / PostgreSQL（时间/布尔值存储格式完全一致，SQL语法按驱动分支）
 type SQLStore struct {
 	db         *sql.DB
-	driverName string // "sqlite" 或 "mysql"
+	driverName string // "sqlite" | "mysql" | "postgres"
 
 	// [FIX] 2025-12：保证 Close 幂等性，防止重复关闭导致 panic
 	closeOnce sync.Once
@@ -23,6 +24,9 @@ type SQLStore struct {
 	// 删除渠道后，异步日志队列里可能还有旧渠道日志等待刷盘。
 	// tombstone 让迟到日志在存储层被丢弃，避免删除后又被插回。
 	deletedChannels sync.Map // map[int64]struct{}
+
+	// 冷却策略归属存储实例，避免多个 Server 并行构造时互相覆盖。
+	cooldownPolicy atomic.Pointer[util.CooldownPolicy]
 }
 
 func (s *SQLStore) markChannelDeleted(id int64) {
@@ -73,7 +77,7 @@ func (s *SQLStore) GetHealthTimeline(ctx context.Context, params model.HealthTim
 		Where("status_code != 499").
 		Where("channel_id > 0")
 
-	_, isEmpty, err := s.applyChannelFilter(ctx, qb, params.Filter)
+	isEmpty, err := s.applyChannelFilter(ctx, qb, params.Filter)
 	if err != nil {
 		return nil, fmt.Errorf("resolve health timeline channel filter: %w", err)
 	}
@@ -85,7 +89,7 @@ func (s *SQLStore) GetHealthTimeline(ctx context.Context, params model.HealthTim
 	query, args := qb.BuildWithSuffix("GROUP BY bucket_ts, channel_id, model ORDER BY bucket_ts ASC")
 	args = append([]any{params.BucketMs, params.BucketMs}, args...)
 
-	rows, err := s.db.QueryContext(ctx, query, args...)
+	rows, err := s.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("query health timeline: %w", err)
 	}
@@ -94,11 +98,13 @@ func (s *SQLStore) GetHealthTimeline(ctx context.Context, params model.HealthTim
 	var result []model.HealthTimelineRow
 	for rows.Next() {
 		var r model.HealthTimelineRow
-		if err := rows.Scan(&r.BucketTs, &r.ChannelID, &r.Model, &r.Success, &r.ErrorCount, &r.RateLimitedCount,
+		var bucketTs float64
+		if err := rows.Scan(&bucketTs, &r.ChannelID, &r.Model, &r.Success, &r.ErrorCount, &r.RateLimitedCount,
 			&r.AvgFirstByteTime, &r.AvgDuration, &r.InputTokens, &r.OutputTokens,
 			&r.CacheReadTokens, &r.CacheCreationTokens, &r.TotalCost, &r.EffectiveCost); err != nil {
-			continue
+			return nil, fmt.Errorf("scan health timeline: %w", err)
 		}
+		r.BucketTs = int64(bucketTs)
 		result = append(result, r)
 	}
 	if err := rows.Err(); err != nil {
@@ -109,17 +115,61 @@ func (s *SQLStore) GetHealthTimeline(ctx context.Context, params model.HealthTim
 
 // NewSQLStore 创建通用SQL存储实例
 // db: 数据库连接（由调用方初始化）
-// driverName: "sqlite" 或 "mysql"
+// driverName: "sqlite" | "mysql" | "postgres"
 func NewSQLStore(db *sql.DB, driverName string) *SQLStore {
-	return &SQLStore{
+	store := &SQLStore{
 		db:         db,
 		driverName: driverName,
 	}
+	store.ConfigureCooldown(util.CooldownSettings{})
+	return store
+}
+
+// DriverName 返回底层驱动名
+func (s *SQLStore) DriverName() string {
+	return s.driverName
 }
 
 // IsSQLite 检查是否为SQLite驱动
 func (s *SQLStore) IsSQLite() bool {
 	return s.driverName == "sqlite"
+}
+
+// IsMySQL 检查是否为MySQL驱动
+func (s *SQLStore) IsMySQL() bool {
+	return s.driverName == "mysql"
+}
+
+// IsPostgres 检查是否为PostgreSQL驱动
+func (s *SQLStore) IsPostgres() bool {
+	return s.driverName == "postgres"
+}
+
+// supportsONConflict SQLite/Postgres 使用标准 UPSERT 语法
+func (s *SQLStore) supportsONConflict() bool {
+	return s.IsSQLite() || s.IsPostgres()
+}
+
+// supportsRowLock MySQL/Postgres 支持 SELECT ... FOR UPDATE
+func (s *SQLStore) supportsRowLock() bool {
+	return s.IsMySQL() || s.IsPostgres()
+}
+
+// q 按驱动 rebind 占位符（Postgres: ? → $n）
+func (s *SQLStore) q(query string) string {
+	if !s.IsPostgres() {
+		return query
+	}
+	return RebindPostgres(query)
+}
+
+// quoteIdent 引用保留字列名（key/value 等）
+// MySQL/SQLite DDL 用反引号；Postgres 用双引号。
+func (s *SQLStore) quoteIdent(name string) string {
+	if s.IsPostgres() {
+		return `"` + name + `"`
+	}
+	return "`" + name + "`"
 }
 
 // Ping 检查数据库连接是否活跃（用于健康检查）
@@ -144,60 +194,27 @@ func (s *SQLStore) CleanupLogsBefore(ctx context.Context, cutoff time.Time) erro
 	// 分批删除避免长时间锁表（P2优化）
 	cutoffMs := cutoff.UnixMilli()
 	const batchSize = 5000
-	var deleted int64
 
 	for {
 		var query string
-		if s.IsSQLite() {
-			// SQLite: 使用子查询实现分批删除（默认不支持 DELETE LIMIT）
-			query = `DELETE FROM logs WHERE id IN (SELECT id FROM logs WHERE time < ? LIMIT ?)`
-		} else {
+		if s.IsMySQL() {
 			// MySQL: 直接使用 LIMIT
 			query = `DELETE FROM logs WHERE time < ? LIMIT ?`
+		} else {
+			// SQLite / Postgres: 子查询 LIMIT（Postgres 无 DELETE ... LIMIT）
+			query = `DELETE FROM logs WHERE id IN (SELECT id FROM logs WHERE time < ? LIMIT ?)`
 		}
 
-		result, err := s.db.ExecContext(ctx, query, cutoffMs, batchSize)
+		result, err := s.ExecContext(ctx, query, cutoffMs, batchSize)
 		if err != nil {
 			return err
 		}
 		affected, _ := result.RowsAffected()
-		deleted += affected
 		if affected < batchSize {
 			break // 已删完
 		}
 	}
-	s.runSQLiteIncrementalVacuum(ctx, deleted)
 	return nil
-}
-
-func (s *SQLStore) runSQLiteIncrementalVacuum(ctx context.Context, deletedRows int64) {
-	if !s.IsSQLite() || deletedRows <= 0 {
-		return
-	}
-
-	var mode int
-	if err := s.db.QueryRowContext(ctx, "PRAGMA auto_vacuum").Scan(&mode); err != nil {
-		log.Printf("[WARN] SQLite 查询 auto_vacuum 失败: %v", err)
-		return
-	}
-	if mode != 2 {
-		return
-	}
-
-	var freePages int64
-	if err := s.db.QueryRowContext(ctx, "PRAGMA freelist_count").Scan(&freePages); err != nil {
-		log.Printf("[WARN] SQLite 查询 freelist_count 失败: %v", err)
-		return
-	}
-	if freePages <= 0 {
-		return
-	}
-
-	const maxIncrementalVacuumPages int64 = 4096
-	pages := min(freePages, maxIncrementalVacuumPages)
-	if _, err := s.db.ExecContext(ctx, fmt.Sprintf("PRAGMA incremental_vacuum(%d)", pages)); err != nil {
-		log.Printf("[WARN] SQLite incremental_vacuum(%d) 失败: %v", pages, err)
-	}
 }
 
 // ============================================================================
@@ -206,20 +223,143 @@ func (s *SQLStore) runSQLiteIncrementalVacuum(ctx context.Context, deletedRows i
 
 // QueryContext 执行查询语句
 func (s *SQLStore) QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error) {
-	return s.db.QueryContext(ctx, query, args...)
+	return s.db.QueryContext(ctx, s.q(query), normalizeSQLArgs(args)...)
 }
 
 // QueryRowContext 执行查询单行
 func (s *SQLStore) QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row {
-	return s.db.QueryRowContext(ctx, query, args...)
+	return s.db.QueryRowContext(ctx, s.q(query), normalizeSQLArgs(args)...)
 }
 
 // ExecContext 执行非查询语句
 func (s *SQLStore) ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error) {
-	return s.db.ExecContext(ctx, query, args...)
+	return s.db.ExecContext(ctx, s.q(query), normalizeSQLArgs(args)...)
 }
 
 // BeginTx 开启事务
 func (s *SQLStore) BeginTx(ctx context.Context, opts *sql.TxOptions) (*sql.Tx, error) {
 	return s.db.BeginTx(ctx, opts)
+}
+
+// execTx 在事务中执行（自动 rebind）
+func (s *SQLStore) execTx(ctx context.Context, tx *sql.Tx, query string, args ...any) (sql.Result, error) {
+	return tx.ExecContext(ctx, s.q(query), normalizeSQLArgs(args)...)
+}
+
+// queryRowTx 在事务中查单行（自动 rebind）
+func (s *SQLStore) queryRowTx(ctx context.Context, tx *sql.Tx, query string, args ...any) *sql.Row {
+	return tx.QueryRowContext(ctx, s.q(query), normalizeSQLArgs(args)...)
+}
+
+// queryTx 在事务中查多行（自动 rebind）
+func (s *SQLStore) queryTx(ctx context.Context, tx *sql.Tx, query string, args ...any) (*sql.Rows, error) {
+	return tx.QueryContext(ctx, s.q(query), normalizeSQLArgs(args)...)
+}
+
+// prepareTx 在事务中预处理（自动 rebind）
+func (s *SQLStore) prepareTx(ctx context.Context, tx *sql.Tx, query string) (*normalizedStmt, error) {
+	stmt, err := tx.PrepareContext(ctx, s.q(query))
+	if err != nil {
+		return nil, err
+	}
+	return &normalizedStmt{Stmt: stmt}, nil
+}
+
+// normalizedStmt keeps prepared statements on the same argument boundary as
+// direct and transactional SQL execution.
+type normalizedStmt struct {
+	*sql.Stmt
+}
+
+func (s *normalizedStmt) ExecContext(ctx context.Context, args ...any) (sql.Result, error) {
+	return s.Stmt.ExecContext(ctx, normalizeSQLArgs(args)...)
+}
+
+func (s *normalizedStmt) QueryContext(ctx context.Context, args ...any) (*sql.Rows, error) {
+	return s.Stmt.QueryContext(ctx, normalizeSQLArgs(args)...)
+}
+
+func (s *normalizedStmt) QueryRowContext(ctx context.Context, args ...any) *sql.Row {
+	return s.Stmt.QueryRowContext(ctx, normalizeSQLArgs(args)...)
+}
+
+type sqlExecutor interface {
+	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
+}
+
+func (s *SQLStore) execWith(ctx context.Context, exec sqlExecutor, query string, args ...any) (sql.Result, error) {
+	return exec.ExecContext(ctx, s.q(query), normalizeSQLArgs(args)...)
+}
+
+// lockPostgresExplicitIDTable serializes explicit-ID writes with normal INSERTs.
+// PostgreSQL sequences are independent from table rows, so inserting an id does
+// not advance the sequence. The table lock closes the race between the explicit
+// write, sequence synchronization, and concurrent auto-ID inserts.
+func (s *SQLStore) lockPostgresExplicitIDTable(ctx context.Context, tx *sql.Tx, table string) error {
+	if !s.IsPostgres() {
+		return nil
+	}
+
+	var query string
+	switch table {
+	case "channels":
+		query = "LOCK TABLE channels IN SHARE ROW EXCLUSIVE MODE"
+	case "auth_tokens":
+		query = "LOCK TABLE auth_tokens IN SHARE ROW EXCLUSIVE MODE"
+	default:
+		return fmt.Errorf("unsupported explicit-id table: %s", table)
+	}
+
+	if _, err := tx.ExecContext(ctx, query); err != nil {
+		return fmt.Errorf("lock %s for explicit id: %w", table, err)
+	}
+	return nil
+}
+
+// syncPostgresIDSequence advances an explicit-ID table's sequence without ever
+// moving it backward. The caller must hold lockPostgresExplicitIDTable's lock.
+func (s *SQLStore) syncPostgresIDSequence(ctx context.Context, tx *sql.Tx, table string) error {
+	if !s.IsPostgres() {
+		return nil
+	}
+
+	var query string
+	switch table {
+	case "channels":
+		query = `
+			SELECT setval(
+				pg_get_serial_sequence('channels', 'id'),
+				GREATEST(COALESCE(MAX(id), 1), nextval(pg_get_serial_sequence('channels', 'id'))),
+				true
+			)
+			FROM channels`
+	case "auth_tokens":
+		query = `
+			SELECT setval(
+				pg_get_serial_sequence('auth_tokens', 'id'),
+				GREATEST(COALESCE(MAX(id), 1), nextval(pg_get_serial_sequence('auth_tokens', 'id'))),
+				true
+			)
+			FROM auth_tokens`
+	default:
+		return fmt.Errorf("unsupported explicit-id table: %s", table)
+	}
+
+	var sequenceValue int64
+	if err := tx.QueryRowContext(ctx, query).Scan(&sequenceValue); err != nil {
+		return fmt.Errorf("sync %s id sequence: %w", table, err)
+	}
+	return nil
+}
+
+func (s *SQLStore) withPostgresExplicitIDTx(ctx context.Context, table string, fn func(*sql.Tx) error) error {
+	return s.WithTransaction(ctx, func(tx *sql.Tx) error {
+		if err := s.lockPostgresExplicitIDTable(ctx, tx, table); err != nil {
+			return err
+		}
+		if err := fn(tx); err != nil {
+			return err
+		}
+		return s.syncPostgresIDSequence(ctx, tx, table)
+	})
 }

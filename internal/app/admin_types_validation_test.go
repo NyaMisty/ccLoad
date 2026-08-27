@@ -18,7 +18,7 @@ func newValidChannelRequest() *ChannelRequest {
 	return &ChannelRequest{
 		Name:   "test-channel",
 		APIKey: "test-key",
-		URL:    "https://example.com",
+		URLs:   model.ChannelURLs{{URL: "https://example.com"}},
 		Models: []model.ModelEntry{{Model: "model-1", RedirectModel: ""}},
 	}
 }
@@ -89,72 +89,6 @@ func runChannelRequestNonNegativeLimitValidation(t *testing.T, fieldName string,
 			t.Fatalf("expected %s error, got %v", fieldName, err)
 		}
 	})
-}
-
-// TestChannelRequestValidation_ChannelType 测试 channel_type 白名单校验
-func TestChannelRequestValidation_ChannelType(t *testing.T) {
-	tests := []channelRequestFieldCase{
-		{
-			name:           "空值应该通过（使用默认值）",
-			input:          "",
-			wantErr:        false,
-			wantNormalized: "",
-		},
-		{
-			name:           "anthropic 小写应该通过",
-			input:          "anthropic",
-			wantErr:        false,
-			wantNormalized: "anthropic",
-		},
-		{
-			name:           "Anthropic 大写应该标准化为小写",
-			input:          "Anthropic",
-			wantErr:        false,
-			wantNormalized: "anthropic",
-		},
-		{
-			name:           "openai 应该通过",
-			input:          "openai",
-			wantErr:        false,
-			wantNormalized: "openai",
-		},
-		{
-			name:           "gemini 应该通过",
-			input:          "gemini",
-			wantErr:        false,
-			wantNormalized: "gemini",
-		},
-		{
-			name:           "codex 应该通过",
-			input:          "codex",
-			wantErr:        false,
-			wantNormalized: "codex",
-		},
-		{
-			name:           "带空格的 anthropic 应该 trim 并通过",
-			input:          "  anthropic  ",
-			wantErr:        false,
-			wantNormalized: "anthropic",
-		},
-		{
-			name:    "非法值应该拒绝",
-			input:   "invalid_type",
-			wantErr: true,
-		},
-		{
-			name:    "垃圾值应该拒绝",
-			input:   "xyz123",
-			wantErr: true,
-		},
-	}
-
-	runChannelRequestFieldValidation(
-		t,
-		tests,
-		func(req *ChannelRequest, v string) { req.ChannelType = v },
-		func(req *ChannelRequest) string { return req.ChannelType },
-		"invalid channel_type",
-	)
 }
 
 // TestChannelRequestValidation_KeyStrategy 测试 key_strategy 白名单校验
@@ -230,51 +164,23 @@ func TestChannelRequestValidation_Combined(t *testing.T) {
 			req: ChannelRequest{
 				Name:        "test-channel",
 				APIKey:      "test-key",
-				URL:         "https://example.com",
+				URLs:        model.ChannelURLs{{URL: "https://example.com"}},
 				Models:      []model.ModelEntry{{Model: "model-1", RedirectModel: ""}},
-				ChannelType: "anthropic",
 				KeyStrategy: "round_robin",
 			},
 			wantErr: false,
-		},
-		{
-			name: "非法 channel_type 应该在第一个被拦截",
-			req: ChannelRequest{
-				Name:        "test-channel",
-				APIKey:      "test-key",
-				URL:         "https://example.com",
-				Models:      []model.ModelEntry{{Model: "model-1", RedirectModel: ""}},
-				ChannelType: "invalid",
-				KeyStrategy: "sequential",
-			},
-			wantErr:     true,
-			errContains: "invalid channel_type",
 		},
 		{
 			name: "非法 key_strategy 应该被拦截",
 			req: ChannelRequest{
 				Name:        "test-channel",
 				APIKey:      "test-key",
-				URL:         "https://example.com",
+				URLs:        model.ChannelURLs{{URL: "https://example.com"}},
 				Models:      []model.ModelEntry{{Model: "model-1", RedirectModel: ""}},
-				ChannelType: "anthropic",
 				KeyStrategy: "invalid",
 			},
 			wantErr:     true,
 			errContains: "invalid key_strategy",
-		},
-		{
-			name: "同时非法应该报第一个错误（channel_type 在前）",
-			req: ChannelRequest{
-				Name:        "test-channel",
-				APIKey:      "test-key",
-				URL:         "https://example.com",
-				Models:      []model.ModelEntry{{Model: "model-1", RedirectModel: ""}},
-				ChannelType: "invalid_type",
-				KeyStrategy: "invalid_strategy",
-			},
-			wantErr:     true,
-			errContains: "invalid channel_type", // channel_type 校验在前
 		},
 	}
 
@@ -399,15 +305,74 @@ func TestChannelRequestValidation_DuplicateModels(t *testing.T) {
 	}
 }
 
-func TestChannelRequestValidation_URLDeduplication(t *testing.T) {
+func TestChannelRequestValidation_RejectsDuplicateURLs(t *testing.T) {
 	req := newValidChannelRequest()
-	req.URL = " https://a.example.com/\nhttps://b.example.com\nhttps://a.example.com \nhttps://b.example.com/ "
-
-	if err := req.Validate(); err != nil {
-		t.Fatalf("Validate() failed: %v", err)
+	req.URLs = model.ChannelURLs{
+		{URL: " https://a.example.com/"},
+		{URL: "https://b.example.com"},
+		{URL: "https://a.example.com "},
 	}
 
-	if req.URL != "https://a.example.com\nhttps://b.example.com" {
-		t.Fatalf("URL dedupe/normalize failed, got %q", req.URL)
+	if err := req.Validate(); err == nil || !strings.Contains(err.Error(), "duplicates") {
+		t.Fatalf("Validate() error=%v, want duplicate URL error", err)
 	}
+}
+
+func TestChannelRequestValidation_CooldownDetectionRules(t *testing.T) {
+	t.Run("sorts rules and copies them into config", func(t *testing.T) {
+		req := newValidChannelRequest()
+		req.CooldownDetectionRules = &model.CooldownDetectionRules{Rules: []model.CooldownDetectionRule{
+			{
+				Enabled: true, Name: "Key rate limit", Priority: 7, StatusCodes: []int{503, 429}, MessagePattern: "rate_limit",
+				Scope: model.CooldownScopeKey, Mode: model.CooldownModeFixed, CooldownSeconds: 90,
+			},
+			{
+				Enabled: true, Name: "Reset time", Priority: 2, MessagePattern: `reset at (?P<until>\d{4}-\d{2}-\d{2})`,
+				Scope: model.CooldownScopeChannel, Mode: model.CooldownModeResetTime,
+				TimeCapture: "until", TimeLayout: "2006-01-02", Timezone: "UTC",
+			},
+		}}
+
+		if err := req.Validate(); err != nil {
+			t.Fatalf("Validate() error = %v", err)
+		}
+		if req.CooldownDetectionRules.Rules[0].Priority != 0 || req.CooldownDetectionRules.Rules[1].Priority != 1 {
+			t.Fatalf("priorities were not normalized: %#v", req.CooldownDetectionRules.Rules)
+		}
+		if req.CooldownDetectionRules.Rules[0].Scope != model.CooldownScopeChannel || req.CooldownDetectionRules.Rules[0].StatusCodes != nil {
+			t.Fatalf("rules were not sorted by submitted priority: %#v", req.CooldownDetectionRules.Rules)
+		}
+
+		cfg := req.ToConfig()
+		req.CooldownDetectionRules.Rules[0].Scope = model.CooldownScopeKey
+		req.CooldownDetectionRules.Rules[0].Name = "mutated"
+		if cfg.CooldownDetectionRules.Rules[0].Scope != model.CooldownScopeChannel || cfg.CooldownDetectionRules.Rules[0].Name != "Reset time" {
+			t.Fatalf("ToConfig() shared mutable cooldown detection rules")
+		}
+	})
+
+	t.Run("rejects reset time rule without referenced capture", func(t *testing.T) {
+		req := newValidChannelRequest()
+		req.CooldownDetectionRules = &model.CooldownDetectionRules{Rules: []model.CooldownDetectionRule{{
+			Enabled: true, Name: "Missing capture", Priority: 0, MessagePattern: `reset at \d+`,
+			Scope: model.CooldownScopeChannel, Mode: model.CooldownModeResetTime,
+			TimeCapture: "until", TimeLayout: "2006-01-02", Timezone: "UTC",
+		}}}
+
+		if err := req.Validate(); err == nil || !strings.Contains(err.Error(), "time_capture") {
+			t.Fatalf("Validate() error = %v, want missing time_capture error", err)
+		}
+	})
+
+	t.Run("rejects rule without a name", func(t *testing.T) {
+		req := newValidChannelRequest()
+		req.CooldownDetectionRules = &model.CooldownDetectionRules{Rules: []model.CooldownDetectionRule{{
+			Enabled: true, Priority: 0, StatusCodes: []int{200},
+			Scope: model.CooldownScopeKey, Mode: model.CooldownModeFixed, CooldownSeconds: 60,
+		}}}
+
+		if err := req.Validate(); err == nil || !strings.Contains(err.Error(), ".name: required") {
+			t.Fatalf("Validate() error = %v, want required name error", err)
+		}
+	})
 }

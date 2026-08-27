@@ -2,8 +2,10 @@
 let channels = [];
 let channelStatsById = {};
 let editingChannelId = null;
+let editingChannelAuthType = 'api_key';
 let deletingChannelRequest = null;
 let testingChannelId = null;
+let testingClientProtocol = 'anthropic';
 let currentChannelKeyCooldowns = []; // 当前编辑渠道的Key冷却信息
 let redirectTableData = []; // 模型重定向表格数据: [{from: '', to: ''}]
 let selectedModelIndices = new Set(); // 选中的模型索引集合
@@ -12,12 +14,35 @@ let defaultTestContent = 'When was Claude 3.5 Sonnet released?'; // Default test
 let channelStatsRange = 'today'; // 渠道统计时间范围（从设置加载）
 let selectedChannelIds = new Set(); // 选中的渠道ID（字符串，避免数字/字符串混用）
 let channelsCurrentPage = 1;
-let channelsPageSize = parseInt(localStorage.getItem('channels.pageSize'), 10) || 20;
+const DEFAULT_CHANNELS_PAGE_SIZE = 20;
+const MAX_CHANNELS_PAGE_SIZE = 1000;
+
+function normalizeChannelsPageSize(value) {
+  const size = Number(String(value ?? '').trim());
+  if (!Number.isInteger(size) || size < 1 || size > MAX_CHANNELS_PAGE_SIZE) {
+    return DEFAULT_CHANNELS_PAGE_SIZE;
+  }
+  return size;
+}
+
+let channelsPageSize = normalizeChannelsPageSize(localStorage.getItem('channels.pageSize'));
 let channelsTotalPages = 1;
 let channelsTotalCount = 0;
 let allAvailableModels = [];
 let allAvailableChannelNames = [];
 let batchRefreshResultsByChannelId = new Map();
+
+if (typeof module !== 'undefined' && module.exports) {
+  module.exports = { normalizeChannelsPageSize };
+}
+
+function isTokenChannelsReadOnly() {
+  return Boolean(window.WebAuth && window.WebAuth.isAPITokenRole(localStorage));
+}
+
+function channelsReadURL(adminPath, dashboardPath) {
+  return isTokenChannelsReadOnly() ? dashboardPath : adminPath;
+}
 
 function normalizeSelectedChannelID(id) {
   const numericID = Number(id);
@@ -31,8 +56,8 @@ function normalizeSelectedChannelID(id) {
 let filters = {
   search: '',
   searchExact: false,
-  channelType: 'all',
   status: 'all',
+  authType: 'all',
   model: 'all',
   modelExact: false
 };
@@ -42,7 +67,7 @@ let inlineKeyTableData = [];
 let inlineKeyVisible = false; // 密码可见性状态
 let selectedKeyIndices = new Set(); // 选中的Key索引集合
 let currentKeyStatusFilter = 'all'; // 当前状态筛选：all/normal/cooldown/disabled
-let inlineURLTableData = []; // API URL 表格数据
+let inlineURLTableData = []; // API URL 表格数据: [{url: '', exact: false, protocols: []}]
 let selectedURLIndices = new Set(); // 选中的 URL 索引集合
 let urlStatsMap = {}; // URL实时状态：{ url: { latency_ms, cooled_down, cooldown_remain_ms } }
 let channelFormDirty = false; // 表单是否有未保存的更改

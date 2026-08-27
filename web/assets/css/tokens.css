@@ -569,6 +569,13 @@
       display: flex;
       flex-direction: column;
       min-height: min(680px, calc(100vh - 32px));
+      max-height: calc(100vh - 32px);
+      margin: 16px auto;
+      overflow: hidden;
+    }
+    .token-edit-modal .modal-header,
+    .token-edit-modal .modal-footer {
+      flex-shrink: 0;
     }
     .token-edit-body {
       padding-top: 12px;
@@ -577,6 +584,7 @@
       flex: 1 1 auto;
       flex-direction: column;
       gap: 12px;
+      min-height: 0;
       overflow: hidden;
     }
     .token-edit-layout {
@@ -584,6 +592,7 @@
       grid-template-columns: 320px minmax(0, 1fr);
       align-items: stretch;
       gap: 12px;
+      min-height: 0;
     }
     .token-edit-sidebar {
       display: flex;
@@ -591,6 +600,8 @@
       gap: 12px;
       min-width: 0;
       min-height: 0;
+      overflow-y: auto;
+      overscroll-behavior: contain;
     }
     .token-edit-main {
       display: grid;
@@ -608,6 +619,14 @@
       border: 1px solid var(--neutral-200);
       border-radius: 10px;
       background: var(--surface-bg-muted);
+    }
+    .token-edit-section--basic,
+    .token-edit-section--quota {
+      gap: 6px;
+    }
+    .token-edit-section--basic .form-group,
+    .token-edit-section--quota .form-group {
+      margin-bottom: 0;
     }
     .token-edit-section--models {
       flex: 1 1 auto;
@@ -733,10 +752,35 @@
     .token-edit-channels-actions .btn {
       white-space: nowrap;
     }
+    .token-edit-restriction-filter {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      color: var(--neutral-600);
+      font-size: 12px;
+      font-weight: 500;
+      white-space: nowrap;
+    }
+    .token-edit-restriction-filter-input {
+      width: 150px;
+      min-width: 120px;
+      height: auto;
+      padding: 5px 8px;
+      font-size: 12px;
+    }
+    .token-edit-channels-mode {
+      width: auto;
+      min-width: 96px;
+      padding: 5px 8px;
+      font-size: 12px;
+      height: auto;
+    }
     .token-edit-channels-table {
       flex: 1 1 auto;
       min-height: 0;
+      max-height: none;
       overflow-y: auto;
+      overscroll-behavior: contain;
       border: 1px solid var(--neutral-200);
       border-radius: 6px;
     }
@@ -775,7 +819,9 @@
     .token-edit-models-table {
       flex: 1 1 auto;
       min-height: 0;
+      max-height: none;
       overflow-y: auto;
+      overscroll-behavior: contain;
       border: 1px solid var(--neutral-200);
       border-radius: 6px;
     }
@@ -792,7 +838,6 @@
     }
     .allowed-channel-col-select-head,
     .allowed-channel-col-name-head,
-    .allowed-channel-col-type-head,
     .allowed-channel-col-actions-head {
       padding: 8px;
     }
@@ -800,8 +845,7 @@
       width: 40px;
       text-align: center;
     }
-    .allowed-channel-col-name-head,
-    .allowed-channel-col-type-head {
+    .allowed-channel-col-name-head {
       text-align: left;
     }
     .allowed-channel-col-actions-head {
@@ -813,7 +857,6 @@
       color: var(--neutral-500);
     }
     .allowed-channel-col-select,
-    .allowed-channel-col-type,
     .allowed-channel-col-actions {
       padding: 8px;
       text-align: center;
@@ -821,10 +864,6 @@
     .allowed-channel-col-name {
       padding: 8px;
       font-weight: 500;
-    }
-    .allowed-channel-col-type {
-      color: var(--neutral-600);
-      font-size: 13px;
     }
     .allowed-channel-remove-btn {
       padding: 2px 8px;
@@ -941,13 +980,7 @@
       margin-right: 8px;
     }
     .channel-select-filter-row {
-      display: grid;
-      grid-template-columns: minmax(0, 1fr) 150px;
-      gap: 8px;
-    }
-    .channel-type-filter-select {
-      min-width: 0;
-      width: 100%;
+      display: block;
     }
     #visibleModelsCount {
       margin-left: 8px;
@@ -989,42 +1022,7 @@
       text-align: center;
       color: var(--neutral-500);
     }
-    .channel-type-group {
-      border-bottom: 1px solid var(--neutral-200);
-    }
-    .channel-type-group:last-child {
-      border-bottom: none;
-    }
-    .channel-type-group-header {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 12px;
-      padding: 9px 12px;
-      background: var(--neutral-50);
-      border-bottom: 1px solid var(--neutral-100);
-    }
-    .channel-type-group-title {
-      display: inline-flex;
-      align-items: center;
-      gap: 6px;
-      min-width: 0;
-      color: var(--neutral-800);
-      font-size: 13px;
-      font-weight: 700;
-    }
-    .channel-type-group-name {
-      overflow: hidden;
-      text-overflow: ellipsis;
-      white-space: nowrap;
-    }
-    .channel-type-group-count {
-      color: var(--neutral-500);
-      font-size: 12px;
-      font-weight: 500;
-      white-space: nowrap;
-    }
-    .channel-type-group-list {
+    .channel-option-list {
       background: var(--table-bg);
     }
     .model-option-item {
@@ -1071,6 +1069,9 @@
     }
     .channel-option-item:hover {
       background: var(--surface-hover);
+    }
+    .channel-option-item:last-child {
+      border-bottom: none;
     }
     .token-model-import-body {
       display: flex;
@@ -1129,6 +1130,15 @@
       width: 8%;
     }
     @media (max-width: 768px) {
+      .token-edit-restriction-filter {
+        flex: 1 1 100%;
+        width: 100%;
+      }
+      .token-edit-restriction-filter-input {
+        flex: 1 1 auto;
+        width: auto;
+        min-width: 0;
+      }
       .token-table {
         overflow: visible;
         background: transparent;
@@ -1313,7 +1323,6 @@
       }
       .allowed-channels-table tbody .mobile-inline-row .allowed-channel-col-select,
       .allowed-channels-table tbody .mobile-inline-row .allowed-channel-col-name,
-      .allowed-channels-table tbody .mobile-inline-row .allowed-channel-col-type,
       .allowed-channels-table tbody .mobile-inline-row .allowed-channel-col-actions {
         grid-column: auto;
       }
@@ -1353,9 +1362,6 @@
       .allowed-channels-table tbody .mobile-inline-row td.allowed-channel-col-name::-webkit-scrollbar {
         display: none;
       }
-      .allowed-channels-table tbody .mobile-inline-row td.allowed-channel-col-type {
-        display: none;
-      }
       .allowed-models-table tbody .mobile-inline-row td.allowed-model-col-actions {
         grid-column: auto;
         display: flex;
@@ -1390,7 +1396,6 @@
         display: none;
       }
       .allowed-channels-table tbody .mobile-inline-row td.allowed-channel-col-name::before,
-      .allowed-channels-table tbody .mobile-inline-row td.allowed-channel-col-type::before,
       .allowed-channels-table tbody .mobile-inline-row td.allowed-channel-col-actions::before {
         content: none;
         display: none;
@@ -1497,9 +1502,6 @@
       .token-limit-input-line .field-grow {
         min-width: 120px;
         width: 100%;
-      }
-      .channel-select-filter-row {
-        grid-template-columns: 1fr;
       }
       .token-edit-models-header {
         align-items: flex-start;

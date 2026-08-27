@@ -6,16 +6,29 @@
 
 **English | [简体中文](README.zh-CN.md)**
 
-[![Go](https://img.shields.io/badge/Go-1.25+-00ADD8.svg)](https://golang.org)
+[![Go](https://img.shields.io/badge/Go-1.26+-00ADD8.svg)](https://golang.org)
 [![Gin](https://img.shields.io/badge/Gin-v1.12+-blue.svg)](https://github.com/gin-gonic/gin)
 [![Docker](https://img.shields.io/badge/Docker-Supported-2496ED.svg)](https://hub.docker.com)
 [![Hugging Face](https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-Spaces-yellow)](https://huggingface.co/spaces)
 [![GitHub Actions](https://img.shields.io/badge/CI%2FCD-GitHub%20Actions-2088FF.svg)](https://github.com/features/actions)
 [![License](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-> Smart routing | Automatic failover | Exponential cooldown | Multi-URL scheduling | Protocol transforms | Live monitoring | Cost control
+> Smart routing | Automatic failover | Model-aware cooldown | Multi-URL scheduling | Protocol transforms | Live monitoring | Cost control
 
 ccLoad removes the operational mess of running multiple AI API upstreams. It keeps Claude Code, Codex, Gemini, and OpenAI-compatible clients on one stable gateway, then handles upstream selection, failover, cooldown, protocol conversion, request visibility, and cost limits in the service instead of in every client script.
+
+## 🤖 Built with Codex and GPT-5.6
+
+During OpenAI Build Week, Codex powered by GPT-5.6 was the primary engineering agent used to:
+
+- Trace request routing, failover, cooldown, protocol conversion, and dashboard flows across the Go backend and embedded web UI.
+- Implement and review model-scoped cooldown handling for upstream `5xx`, key-level `429`, model-unavailable `404`, and explicit model-retirement `410` failures without unnecessarily cooling an entire channel.
+- Refine the model-status and call-statistics UI, update the English and Chinese documentation, and verify the result with focused Go tests, builds, and browser walkthroughs.
+- Prepare the reproducible demo and Devpost submission while keeping architecture, security, and final-review decisions under human control.
+
+GPT-5.6 is also integrated into the product itself: ccLoad exposes GPT-5.6 through OpenAI-compatible and Codex Responses endpoints, includes Sol, Terra, and Luna model presets, calculates their standard, priority, flex, cached-token, and long-context costs, and applies routing and model-scoped cooldown decisions to them like any other configured upstream model.
+
+The repository's `AGENTS.md` and `CLAUDE.md` provide persistent engineering constraints so Codex works against the same KISS-first review and testing rules in every session.
 
 ## 🎯 What ccLoad Solves
 
@@ -30,10 +43,11 @@ Common failure modes when you run several AI API channels:
 ccLoad handles those cases with:
 
 - **Smart routing**: High-priority channels are selected first; channels at the same priority use smooth weighted round-robin.
-- **Automatic failover**: Failed keys, channels, and URLs are skipped according to the classified error type.
-- **Exponential cooldown**: Unhealthy upstreams back off automatically instead of being hammered by retries.
+- **Automatic failover**: Failed keys, models, channels, and URLs are skipped according to the classified error scope.
+- **Model-aware cooldown**: Structured `model_cooldown` responses, upstream HTTP 5xx failures, key-level 429 rate limits, model-unavailable 404 errors, and explicit model-retirement 410 errors all cool only the actual upstream model first; other models on the same channel remain available. The channel is promoted to cooldown only after every configured model or every enabled key is cooling.
 - **Multi-URL scheduling**: A single channel can use multiple upstream URLs, weighted by observed latency and health.
-- **Protocol transforms**: Anthropic, OpenAI, Gemini, and Codex request/response families can be converted at the gateway.
+- **Per-URL protocol routing**: Each URL can declare the upstream wire protocols it accepts. Explicit declarations route directly; an empty declaration tries the client protocol first and caches the working fallback.
+- **Responses WebSocket bridging**: Authenticated Codex clients can keep a downstream WebSocket while each candidate uses native Codex WebSocket or the existing HTTP/SSE transport.
 - **Live monitoring**: Active requests, logs, token usage, TTFB, cost, and upstream details are visible in the web dashboard.
 - **Soft-error detection**: HTTP 200 responses that are actually errors trigger the same failover path as regular upstream failures. Common cases include:
   - JSON responses containing `{"error": {...}}` structure
@@ -45,12 +59,15 @@ ccLoad handles those cases with:
 
 - 🚀 **High-Performance Architecture** - Gin framework, 1000+ concurrent connections, high-performance caching
 - 🧮 **Local Token Counting** - API-compliant local token estimation, <5ms response, 93%+ accuracy, supports large-scale tool scenarios
-- 🎯 **Smart Error Classification** - Distinguishes Key/Channel/Client errors, soft error detection (200 masquerading as error), SSE rate-limit errors as 429, 1308 quota handling
+- 🎯 **Smart Error Classification** - Distinguishes Key/Model/Channel/Client errors, soft error detection (200 masquerading as error), SSE rate-limit errors as 429, 1308 quota handling
 - 🔀 **Smart Routing** - Priority + smooth weighted round-robin channel selection, **pre-filters cooled channels**, multi-key load balancing, **health-based dynamic sorting** (confidence factor prevents small sample over-penalization)
-- 🛡️ **Failover** - Automatic failure detection with exponential backoff cooldown (1s → 2s → 4s → ... → 30min)
+- 🛡️ **Failover** - Key, model, and channel failures share one exponential-backoff policy; explicit upstream reset deadlines take priority, and model-scoped failures switch channels without cooling the whole channel
 - 🔒 **Race-Safe** - Key selector race condition protection, startup config validation, automatic resource cleanup
-- 📊 **Real-time Monitoring** - Built-in trend analysis, logging, and stats dashboard, **Token usage stats** with time range selection and per-token classification
+- 📊 **Real-time Monitoring** - Built-in trend analysis, logging, and stats dashboard, **Token usage stats** with time range selection and per-token classification, runtime status panel with process metrics (CPU, RSS, GC)
 - 🎯 **Transparent Proxy** - Supports Claude Code, Codex, Gemini, and OpenAI compatible APIs with smart auth detection
+- 🔑 **OAuth Channels** - Codex (ChatGPT), Anthropic (Claude), Antigravity, and xAI OAuth credentials with automatic refresh where supported; Codex personal access token (PAT) authorization; and Z.ai Coding Plan (ZCode) browser authorization or API-key import, with batch quota refresh, invalid-credential cleanup, and auto-disable for permanently rejected credentials
+- 📅 **OAuth Quota Cost Tracking** - Per-credential weekly/monthly standard-cost accumulation aligned to upstream quota windows, plus manual Codex quota reset when a reset credit is available
+- 🔌 **Responses WebSocket** - Downstream Codex WebSocket sessions bridge to native Codex WebSocket or HTTP/SSE candidates with transcript-aware failover
 - 📦 **Single Binary Deployment** - No external dependencies, embedded SQLite included
 - 🔒 **Secure Authentication** - Token-based admin interface and API access control
 - 🏷️ **Build Tags** - GOTAGS support, high-performance JSON library enabled by default
@@ -59,77 +76,68 @@ ccLoad handles those cases with:
 - 🤗 **Hugging Face** - One-click deployment to Hugging Face Spaces, free hosting
 - 💰 **Cost Limits** - Per-channel daily cost limits, per-token cost limits
 - 🚦 **Channel RPM Limits** - Per-channel rolling 60-second request caps, 0=unlimited
-- 🚧 **Per-Key Concurrency Limits** - Per-channel setting applied independently to each API key, 0=unlimited
-- 🔐 **Token Restrictions** - API token cost limits + model restrictions for fine-grained access control
+- 🚧 **Channel Concurrency Limits** - Per-channel in-flight request caps, 0=unlimited
+- 🕒 **Channel Time Windows** - Optional HH:MM availability window per channel (server local time, cross-midnight supported); channels outside their window are fully excluded from routing
+- 🔐 **Token Restrictions** - Per-token cost limits, model restrictions, channel allowlist/denylist, and concurrency caps for fine-grained access control
 - ⏱️ **TTFB Monitoring** - Streaming request first byte time tracking for upstream latency diagnosis
 - 🌐 **Multi-URL Load Balancing** - Multiple URLs per channel with latency-weighted random selection
+- 🧭 **Per-Channel Proxy** - Route a channel's upstream traffic through an http/https/socks5/socks5h proxy with isolated connection pools
 - 💵 **service_tier Pricing** - OpenAI priority/flex/default tier multipliers for accurate cost accounting
 - 🖼️ **Image Tool Billing** - Responses image_generation/gpt-image-2 cost accounting
 - 📉 **Tiered Pricing** - GPT-5.4/Qwen-Plus/Gemini long-context step pricing, auto-applies lower rate at token thresholds
-- 🔄 **Protocol Transform** - Anthropic/OpenAI/Gemini/Codex cross-protocol conversion, preserving sampling and thinking parameters so one channel serves multiple client protocols
+- 🔄 **Per-URL Protocol Routing** - Explicit Anthropic/OpenAI/Codex/Gemini capability per URL, with native-first automatic detection when left empty
 - 💬 **Conversational Model Testing** - Channel/model/chat testing modes with image upload, reasoning level, built-in search, and chat export
+- 🎨 **Image Generation Testing** - Dedicated tab that renders generated images through either the Images API or Chat Completions, with size/quality/background/output-format controls
 - 🔍 **Debug Logs** - Upstream request/response raw data capture with sensitive header masking, essential for troubleshooting
 - 🕐 **Scheduled Checks** - Background periodic channel availability probing, auto-detect failed channels
-- 🔄 **Auto Updates** - Checks for new releases every 12 hours by default, configurable from the admin settings page
+- 🔄 **Release Channels** - Stable updates by default, with an opt-in preview channel; check interval is configurable from the admin settings page
 - 🧩 **Custom Request Rules** - Per-channel HTTP header & JSON body rewriting (remove/override/append), with auth header protection, CRLF guard, and capacity caps
 - 🎛️ **Log Column Customization** - Show/hide table columns per preference, settings persist in browser localStorage
 
 ## 🏗️ Architecture Overview
 
+Every channel accepts all four client protocols. Upstream protocol selection is controlled by `protocol_transform_mode` and each structured URL's `protocols` declaration. `upstream` is strict client-protocol passthrough. `auto` tries the client protocol first, then probes OpenAI → Anthropic → Codex → Gemini while skipping the protocol already attempted, and advances only after an uncommitted capability error. `local` prioritizes URLs with explicit declarations and follows each URL's declared order; only when every URL is undeclared does it try Anthropic → Codex → OpenAI → Gemini. Incompatible URLs are skipped without a request or cooldown. Successful automatic detection is cached per URL and request family until restart or channel configuration changes; an all-unsupported result is probed again after 10 minutes.
+
 ```mermaid
 graph TB
     subgraph "Client"
-        A[User App] --> B[ccLoad Proxy]
+        A[Claude Code / Codex / Gemini / OpenAI Client]
     end
 
     subgraph "ccLoad Service"
-        B --> C[Auth Layer]
-        C --> D[Route Dispatcher]
-        D --> E[Channel Selector]
-        E --> F[Load Balancer]
+        B[HTTP Proxy]
+        C[Authentication + Route Dispatch]
+        D[Channel Selector<br/>Priority + Smooth Weighted RR]
+        E[Protocol Registry<br/>Native Bypass / Local Transform]
+        F[URL Selector<br/>Explore + 1/EWMA Weighting]
+        G[(Storage Factory<br/>SQLite / MySQL / PostgreSQL)]
+        H[Logs + Metrics + Cost Control]
 
-        subgraph "Core Components"
-            F --> G[Channel A<br/>Priority:10]
-            F --> H[Channel B<br/>Priority:5]
-            F --> I[Channel C<br/>Priority:5]
-            G --> G1[URL Selector<br/>Weighted Random]
-            H --> H1[URL Selector<br/>Weighted Random]
-            I --> I1[URL Selector<br/>Weighted Random]
-        end
-
-        subgraph "Storage Layer"
-            J[(Storage Factory)]
-            J3[Schema Definition]
-            J4[Unified SQL Layer]
-            J1[(SQLite)]
-            J2[(MySQL)]
-            J --> J3
-            J3 --> J4
-            J4 --> J1
-            J4 --> J2
-        end
-
-        subgraph "Monitoring Layer"
-            K[Log System]
-            L[Stats Analysis]
-            M[Trend Charts]
-        end
+        A --> B --> C --> D --> E --> F
+        D <--> G
+        H <--> G
+        B --> H
     end
 
     subgraph "Upstream Services"
-        G1 --> N[Claude API]
-        H1 --> O[Claude API]
-        I1 --> P[Claude API]
+        U1[Anthropic]
+        U2[OpenAI-compatible]
+        U3[Gemini]
+        U4[Codex Responses]
     end
 
-    E <--> J
-    F <--> J
-    K <--> J
-    L <--> J
-    M <--> J
+    F --> U1
+    F --> U2
+    F --> U3
+    F --> U4
+    U1 -. JSON / SSE .-> E
+    U2 -. JSON / SSE .-> E
+    U3 -. JSON / SSE .-> E
+    U4 -. JSON / SSE .-> E
+    E -. Client Protocol .-> B
 
     style B fill:#4F46E5,stroke:#000,color:#fff
-    style F fill:#059669,stroke:#000,color:#fff
+    style D fill:#059669,stroke:#000,color:#fff
     style E fill:#0EA5E9,stroke:#000,color:#fff
 ```
 
@@ -150,8 +158,8 @@ Choose the deployment method that suits you best:
 ```bash
 # Option 1: Using docker-compose (Simplest)
 curl -o docker-compose.yml https://raw.githubusercontent.com/caidaoli/ccLoad/master/docker-compose.yml
-curl -o .env https://raw.githubusercontent.com/caidaoli/ccLoad/master/.env.example
-# Edit .env file to set password
+curl -o .env https://raw.githubusercontent.com/caidaoli/ccLoad/master/.env.docker.example
+# Edit .env file to set CCLOAD_PASS (required, service exits without it)
 docker-compose up -d
 
 # Option 2: Run image directly
@@ -170,6 +178,7 @@ git clone https://github.com/caidaoli/ccLoad.git
 cd ccLoad
 
 # Build and run with docker-compose
+cp .env.docker.example .env  # edit .env to set CCLOAD_PASS
 docker-compose -f docker-compose.build.yml up -d
 
 # Or build manually
@@ -276,7 +285,7 @@ Hugging Face Spaces provides free container hosting with Docker support, ideal f
 
    | Variable | Value | Required | Description |
    |----------|-------|----------|-------------|
-   | `CCLOAD_PASS` | `your_admin_password` | ✅ **Required** | Admin interface password |
+   | `CCLOAD_PASS` | None | ✅ **Required** | Admin interface password |
    | `CCLOAD_API_TOKENS` | `token1\|production,token2\|development` | Optional | Pre-seed API access tokens on startup |
 
    **Note**: API access tokens can be pre-seeded with `CCLOAD_API_TOKENS` or managed in the Web admin interface `/web/tokens.html`.
@@ -319,28 +328,29 @@ Hugging Face Spaces provides free container hosting with Docker support, ideal f
 
 **Important**: Hugging Face Spaces Storage Policy
 
-Due to Hugging Face Spaces limitations (`/tmp` directory clears on restart), **we strongly recommend using an external MySQL database** for complete data persistence:
+Due to Hugging Face Spaces limitations (`/tmp` directory clears on restart), **we strongly recommend using an external MySQL or PostgreSQL database** for complete data persistence:
 
 **Option 1: Hybrid Storage Mode (Recommended, Best Performance)**
-- ✅ **Ultra-fast queries**: All reads/writes go through local SQLite, latency <1ms (free MySQL has 800ms+ latency)
-- ✅ **Restart-safe**: Async sync to MySQL, auto-restore on startup
+- ✅ **Local authoritative I/O**: Config, credentials, keys, cooldowns, and logs commit to SQLite first, keeping remote latency off the scheduling path
+- ✅ **Eventually consistent primary**: Writes are coalesced by entity and retried every 10 seconds after failure
+- ⚠️ **Single-instance semantics**: Multiple hybrid writers and external primary writes are unsupported; process exit may lose in-memory pending syncs
 - ✅ **Stats caching**: Smart TTL cache reduces repetitive aggregate queries
-- Configuration: Add `CCLOAD_MYSQL` + `CCLOAD_ENABLE_SQLITE_REPLICA=1` in Secrets
+- Configuration: Add one primary DSN (`CCLOAD_MYSQL` or `CCLOAD_POSTGRES`) plus `CCLOAD_ENABLE_SQLITE_REPLICA=1` in Secrets
 
 **Dockerfile Example (Hybrid Mode)**:
 ```dockerfile
 FROM ghcr.io/caidaoli/ccload:latest
 ENV TZ=Asia/Shanghai
 ENV PORT=7860
-# Configure in Secrets: CCLOAD_MYSQL + CCLOAD_ENABLE_SQLITE_REPLICA=1
+# Configure in Secrets: CCLOAD_MYSQL or CCLOAD_POSTGRES, plus CCLOAD_ENABLE_SQLITE_REPLICA=1
 EXPOSE 7860
 ```
 
-**Option 2: Pure MySQL Mode**
+**Option 2: Pure External Database Mode**
 - ✅ **Complete Persistence**: Channel configs, logs, and stats all preserved
 - ✅ **Restart-Safe**: Data stored externally, unaffected by Space restarts
-- ⚠️ **Slower Queries**: Free MySQL has higher latency, stats pages respond slowly
-- Configuration: Add `CCLOAD_MYSQL` environment variable in Secrets
+- ⚠️ **Database Latency**: Stats page latency depends on the remote database and region
+- Configuration: Add exactly one of `CCLOAD_MYSQL` or `CCLOAD_POSTGRES` in Secrets
 
 **Recommended Free MySQL Services**:
 - [TiDB Cloud Serverless](https://tidbcloud.com/) - Free 5GB storage, MySQL compatible, no connection limits, recommended first choice
@@ -354,12 +364,19 @@ EXPOSE 7860
 5. **(Optional) Enable Hybrid Mode**: Add `CCLOAD_ENABLE_SQLITE_REPLICA=1` for best performance
 6. Restart Space, all data will auto-persist to MySQL
 
-**Dockerfile Example (Pure MySQL)**:
+**PostgreSQL Configuration Example**:
+```bash
+CCLOAD_POSTGRES=postgres://user:password@host:5432/ccload?sslmode=require
+```
+
+URL and libpq keyword DSNs are supported. Do not set `CCLOAD_MYSQL` and `CCLOAD_POSTGRES` at the same time.
+
+**Dockerfile Example (Pure External Database)**:
 ```dockerfile
 FROM ghcr.io/caidaoli/ccload:latest
 ENV TZ=Asia/Shanghai
 ENV PORT=7860
-# No SQLITE_PATH needed, uses CCLOAD_MYSQL environment variable
+# Configure CCLOAD_MYSQL or CCLOAD_POSTGRES in Secrets; SQLITE_PATH is not required
 EXPOSE 7860
 ```
 
@@ -396,6 +413,8 @@ EXPOSE 7860
 
 ### Basic Configuration
 
+Choose SQLite, MySQL, or PostgreSQL based on the deployment shape. MySQL and PostgreSQL are mutually exclusive.
+
 **SQLite Mode (Default)**:
 ```bash
 # Set environment variables
@@ -428,6 +447,19 @@ echo "CCLOAD_MYSQL=user:password@tcp(localhost:3306)/ccload?charset=utf8mb4" >> 
 echo "PORT=8080" >> .env
 
 # 3. Start service (auto-creates tables)
+./ccload
+```
+
+**PostgreSQL Mode**:
+```bash
+# 1. Create the database and user in PostgreSQL
+
+# 2. Set environment variables
+export CCLOAD_PASS=your_admin_password
+export CCLOAD_POSTGRES="postgres://user:password@localhost:5432/ccload?sslmode=disable"
+export PORT=8080
+
+# 3. Start service (auto-creates and migrates tables)
 ./ccload
 ```
 
@@ -480,6 +512,15 @@ docker run -d --name ccload \
   ghcr.io/caidaoli/ccload:latest
 ```
 
+**Docker + PostgreSQL** (requires an existing PostgreSQL service):
+```bash
+docker run -d --name ccload \
+  -p 8080:8080 \
+  -e CCLOAD_PASS=your_admin_password \
+  -e CCLOAD_POSTGRES="postgres://user:pass@postgres_host:5432/ccload?sslmode=require" \
+  ghcr.io/caidaoli/ccload:latest
+```
+
 After service starts, access:
 - Admin Interface: `http://localhost:8080/web/`
 - API Proxy: `POST http://localhost:8080/v1/messages`
@@ -528,6 +569,73 @@ curl -X POST http://localhost:8080/v1/chat/completions \
   }'
 ```
 
+**Codex Responses WebSocket**:
+
+The downstream and upstream WebSockets are independent. Authenticated clients can always upgrade `GET /v1/responses` or the Codex direct-route alias `GET /backend-api/codex/responses`; a channel's `websockets` field only controls whether ccLoad tries a native Codex upstream WebSocket. Channels without that field still participate through the HTTP/SSE bridge and remain eligible for failover.
+
+In `/web/channels.html`, select a channel with a Codex-capable URL, enable **Native WebSocket**, and run **Probe**. For the Admin API, the relevant fields are shown below. Keep the URL as an `http://` or `https://` URL; ccLoad converts the scheme to `ws://` or `wss://` for native upstream WebSocket requests:
+
+```json
+{
+  "urls": [{"url": "https://upstream.example.com", "protocols": ["codex"]}],
+  "websockets": true
+}
+```
+
+For example, connect to the downstream endpoint with `websocat`:
+
+```bash
+websocat \
+  -H='Authorization: Bearer your-api-token' \
+  -H='Session-Id: stable-conversation-id' \
+  ws://localhost:8080/v1/responses
+```
+
+Send text frames after connecting. The first turn must use `response.create` and include `model`; later turns may use `response.append` with the previous response's `response.id`:
+
+```json
+{"type":"response.create","model":"your-model","input":[{"type":"message","role":"user","content":"Hello"}]}
+```
+
+```json
+{"type":"response.append","previous_response_id":"resp_xxx","input":[{"type":"message","role":"user","content":"Continue"}]}
+```
+
+Read Responses events until `response.completed`, `response.done`, `response.incomplete`, `response.failed`, or `error`. Only text frames are accepted; binary frames receive an `unsupported_frame` error.
+
+Failover applies only to upstream errors classified as retryable key-, model-, or channel-level failures. Client input errors, unrepresentable protocol conversions, and oversized messages do not fail over. Switching across keys, URLs, channels, or transports occurs only before any visible non-heartbeat event has been committed downstream. One same-upstream native WebSocket reconnect uses the separate semantic boundary described below.
+
+| Current upstream | Next action | ccLoad behavior | Client behavior |
+|---|---|---|---|
+| HTTP/SSE fails before a visible event is committed | Try another HTTP/SSE candidate | Switches internally and replays the complete transcript | None |
+| Native WS disconnect or `previous_response_not_found` before a semantic event | Reconnect the same upstream | Reconnects once internally and replays the complete transcript | None |
+| Native WS fails before a visible event is committed | Switch to HTTP/SSE or another native WS candidate | Switches internally and replays the complete transcript | None |
+| Native WS handshake rejection or EOF | Fall back to HTTP/SSE on the same channel, key, and URL | Falls back internally and replays the complete transcript | None |
+| HTTP/SSE | The next candidate is native WS | Sends `502/server_error/upstream_unavailable`, then closes downstream with code `1011` | Reconnect with the same session hint and send the complete conversation input without `previous_response_id` |
+
+For the same-upstream native WebSocket reconnect, `response.created`, `response.queued`, and `response.in_progress` are non-semantic, so ccLoad may still reconnect once after those events; every other event crosses that reconnect boundary. Those three lifecycle events are still visible events committed downstream, so they do not imply that cross-candidate failover remains available. Once text, reasoning, a tool call, or another actual output has been forwarded, ccLoad does not switch or replay, avoiding duplicate output, tool calls, and charges. Oversized messages close with code `1009` and do not fail over.
+
+`upstream_connection_reuse_limit_seconds` limits how long upstream HTTP/1.1, HTTP/2, and WebSocket connections remain reusable, including connections in channel proxy pools. The default `0` leaves reuse unlimited. When a connection reaches a positive limit, it stops accepting new requests; an idle connection closes immediately, while an active request or turn finishes before closure. The next request opens a new physical connection. A native WebSocket reconnect replays the complete session transcript because an upstream Response ID is scoped to the physical WebSocket connection; this planned rotation is not reported as a request failure and does not cool down the channel.
+
+Reconnects must use the same API token and stable execution headers. `Session-Id` identifies the top-level Codex session; when `Thread-Id` is present, ccLoad combines both headers so the parent and every subagent thread own independent transcripts, Response IDs, and turn locks. Clients without `Thread-Id` retain the `Session-Id`-only contract. `prompt_cache_key`, body `session_id`, and other cache-routing hints do not identify an execution session and never serialize or share local conversation state. An execution session is in-memory and process-local: new installations retain at most 256 sessions with a process-wide transcript payload budget of 256 MiB. Existing database records are not migrated. The idle TTL remains 15 minutes by default (10 minutes is suitable for small-memory hosts). After all downstream attachments have been gone for five minutes, the one-minute cleanup loop closes the physical upstream connection, so actual reclamation takes about 5–6 minutes while the transcript remains until the session TTL. A stable session and its committed transcript are never evicted by session-capacity or memory-budget pressure before that TTL expires. When the session ceiling is full, only a new session identity is rejected; an existing stable session may continue. Once the committed payload is over budget, every new turn, including turns on existing sessions, is rejected before upstream work starts. Both limits use a WebSocket `429/rate_limit_error/rate_limit` event; retry after TTL reclamation, or change the setting and restart. A restart loses in-memory sessions, so the client must then resend the complete conversation input without `previous_response_id`.
+
+The transcript budget is an admission threshold, not a strict allocation cap: turns already admitted are allowed to complete and commit. The finite worst-case overshoot is `responses_ws_max_sessions × max_body_bytes` in addition to the configured budget. Process restarts do not restore sessions or cumulative session metrics. Multi-instance deployments need sticky routing so reconnects reach the same instance. Otherwise, the client must send the complete conversation input without `previous_response_id`. Adjust session count, TTL, and transcript budget with `responses_ws_max_sessions`, `responses_ws_session_ttl_minutes`, and `responses_ws_max_transcript_bytes` in system settings. `GET /admin/runtime-metrics` reports the current effective payload as `transcript_bytes`; it excludes the Go runtime, WebSocket buffers, and temporary request-processing objects. The same response exposes WebSocket rejection counters, log queue/drop/persistence-failure counters, and—when hybrid storage is enabled—primary-sync backlog, failures, dropped tasks, and the last successful sync time.
+
+**Codex Alpha Search (Native Passthrough Only)**:
+
+`POST /v1/alpha/search` accepts the native Codex search payload. The `model` field is optional. This request family has no local conversion path: ccLoad tries the native endpoint, caches endpoint-missing responses per URL, and moves to the next URL or channel.
+
+```bash
+curl -X POST http://localhost:8080/v1/alpha/search \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer your-api-token" \
+  -d '{
+    "query": "golang channels"
+  }'
+```
+
+For a regular channel base URL, ccLoad appends `/v1/alpha/search`. For an exact URL, set `exact: true` and make `url` point to the complete endpoint, for example `{"url":"https://upstream.example.com/v1/alpha/search","exact":true,"protocols":["codex"]}`. Responses-only fields `prompt_cache_key` and `prompt_cache_retention` are removed before forwarding.
+
 ### Local Token Counting
 
 Quickly estimate request token consumption (no upstream API call needed):
@@ -561,26 +669,65 @@ curl -X POST http://localhost:8080/v1/messages/count_tokens \
 Manage channels via Web interface `/web/channels.html` or API:
 
 ```bash
-# Add channel (supports multiple URLs, comma-separated)
+# Add a channel with per-URL protocol capabilities
 curl -X POST http://localhost:8080/admin/channels \
   -H "Content-Type: application/json" \
   -d '{
     "name": "Claude-API",
     "api_key": "sk-ant-api03-xxx",
-    "url": "https://api.anthropic.com,https://api2.anthropic.com",
+    "urls": [
+      {"url": "https://api.anthropic.com", "protocols": ["anthropic"]},
+      {"url": "https://api2.anthropic.com"}
+    ],
+    "protocol_transform_mode": "auto",
     "priority": 10,
     "rpm_limit": 0,
     "max_concurrency": 0,
-    "models": ["claude-sonnet-4-6", "claude-opus-4-6"],
+    "models": [{"model": "claude-sonnet-4-6"}, {"model": "claude-opus-4-6"}],
     "enabled": true
   }'
 ```
 
-> **Multi-URL Note**: The `url` field supports comma-separated multiple URLs. The system uses latency-weighted random selection for optimal URL choice, with automatic cooldown for failed URLs, enabling URL-level load balancing and failover within a single channel.
+**OpenAI-compatible upstream example**:
+
+```bash
+# Add a channel using the OpenAI wire protocol
+curl -X POST http://localhost:8080/admin/channels \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "OpenAI-Compatible",
+    "api_key": "sk-xxx",
+    "urls": [
+      {"url": "https://api.openai.com", "protocols": ["openai"]}
+    ],
+    "protocol_transform_mode": "auto",
+    "priority": 10,
+    "rpm_limit": 0,
+    "max_concurrency": 0,
+    "models": [{"model": "gpt-4o"}],
+    "enabled": true
+  }'
+```
+
+> This works with any OpenAI-compatible provider by changing `urls[].url` to its API base URL. Omit `/v1` and endpoint paths because ccLoad appends them for the selected protocol. The `protocols: ["openai"]` declaration routes the channel as an OpenAI upstream.
+
+> **Protocol behavior**: Each `urls` entry may list `protocols` (`anthropic`, `codex`, `openai`, `gemini`). A non-empty list is authoritative. `upstream` only passes through the client protocol; `auto` starts with the client protocol, then detects OpenAI → Anthropic → Codex → Gemini without retrying the client protocol; `local` prefers declared URLs and their configured protocol order. If every URL is undeclared in `local` mode, ccLoad tries Anthropic → Codex → OpenAI → Gemini.
+
+> **Multi-URL Note**: `urls` is an ordered array of `{url, exact, protocols}` objects. `exact: true` means the URL is already the complete upstream request URL. The system uses latency-weighted selection and independent URL cooldown; local mode first partitions explicitly declared URLs ahead of automatic ones while preserving order inside each group.
+
+> **Model Entry Note**: each `models` element is `{model, redirect_model, disabled}`. `redirect_model` rewrites the model name sent upstream while clients keep requesting the original name. `disabled: true` removes that model from the channel entirely — it stops being advertised, matched (exact or fuzzy), and cooled down, without deleting the entry. When you refresh the model list in `replace` mode, existing disabled flags are carried over to the newly fetched entries by original name, normalized alias, and redirect target, so a refresh does not silently re-enable models you turned off.
+
+> **Independent-key relay fallback**: In the channel editor, open **Advanced → Other** and enable **Try another key on failure** only when the channel's Keys reach independent upstream providers behind the same relay. For retryable model- or channel-level upstream failures (such as 5xx, connection errors, and first-byte timeouts), ccLoad then cools the current Key and tries another Key in that channel before moving to another channel. The option is off by default, preserving the normal model/channel cooldown behavior.
 
 > **RPM Limit Note**: `rpm_limit` is a per-channel request cap over a rolling 60-second window; `0` means unlimited. Proxy forwarding, manual tests, single-URL tests, and scheduled checks all count toward the cap. Multi-URL failover counts each actual upstream HTTP request. The counter is in-memory: restart clears it, and multiple instances count independently.
 
-> **Concurrency Limit Note**: `max_concurrency` caps simultaneous in-flight requests independently for each API key in the channel; `0` means unlimited. A slot is acquired before the upstream request starts and released when the response body is closed, so streaming requests hold the slot until the stream ends. When one key is full, another key in the same channel is tried; the channel is skipped without cooldown only when all available keys are full. A multi-key channel can therefore reach up to `available key count × max_concurrency` total in-flight requests. Counters are in-memory and per instance.
+> **Concurrency Limit Note**: `max_concurrency` is a per-channel cap on simultaneous in-flight upstream requests; `0` means unlimited. A slot is acquired before the upstream request starts and released when the response body is closed, so streaming requests hold the slot until the stream ends. Over-limit channels are skipped without cooldown. The counter is in-memory and per instance.
+
+#### Z.ai Coding Plan (ZCode)
+
+In the channel manager, choose **Z.ai Coding Plan** and either complete the browser authorization flow or import an existing Coding Plan API key. API-key import remains available when the provider's browser OAuth flow is unavailable.
+
+ccLoad loads the Coding Plan model catalog from the account when creating or refreshing the channel, falls back to models.dev, then uses its built-in list only as a last resort. The channel card can also refresh and show the Coding Plan quota windows.
 
 ### Custom Request Rules (Advanced)
 
@@ -646,9 +793,9 @@ curl -X POST -H "Authorization: Bearer your_token" \
 
 **CSV Format Example**:
 ```csv
-name,api_key,url,priority,models,enabled
-Claude-API-1,sk-ant-xxx,https://api.anthropic.com,10,"[\"claude-sonnet-4-6\"]",true
-Claude-API-2,sk-ant-yyy,https://api.anthropic.com,5,"[\"claude-opus-4-6\"]",true
+name,api_key,urls,priority,models,enabled
+Claude-API-1,sk-ant-xxx,"[{""url"":""https://api.anthropic.com"",""protocols"":[""anthropic""]}]",10,claude-sonnet-4-6,true
+Claude-API-2,sk-ant-yyy,"[{""url"":""https://api.anthropic.com""}]",5,claude-opus-4-6,true
 ```
 
 **Features**:
@@ -673,6 +820,7 @@ Check out the awesome admin dashboard 👇
   - Upload or paste images in chat mode to verify multimodal requests directly
   - Toggle reasoning level, built-in search, and streaming to inspect transformed upstream behavior
   - Export conversations as Markdown or HTML for review, incident notes, or regression records
+  - Generate images in a dedicated tab via the Images API or Chat Completions, with the prompt preserved across page reloads
 - ⚡ **Performance Metrics** - Latency, success rates, and bottleneck detection
 - 💰 **Token Usage Stats** - Know exactly where your budget goes:
   - Custom time range selector for flexible analysis
@@ -695,11 +843,13 @@ Check out the awesome admin dashboard 👇
 
 | Component | Version | Purpose | Performance Advantage |
 |-----------|---------|---------|----------------------|
-| **Go** | 1.25.0+ | Runtime | Native concurrency, built-in min function |
+| **Go** | 1.26.0+ | Runtime | Native concurrency, modern toolchain |
 | **Gin** | v1.12.0 | Web Framework | High-performance HTTP routing |
-| **modernc/sqlite** | v1.51.0 | Embedded Database | Pure Go, zero CGO dependency, single file (default) |
+| **modernc/sqlite** | v1.54.0 | Embedded Database | Pure Go, zero CGO dependency, single file (default) |
 | **MySQL** | v1.10.0 | RDBMS | Optional, for high-concurrency production |
-| **Sonic** | v1.15.1 | JSON Library | 2-3x faster than stdlib |
+| **PostgreSQL (pgx)** | v5.10.0 | RDBMS | Optional, supports URL and libpq DSNs |
+| **Sonic** | v1.15.2 | JSON Library | 2-3x faster than stdlib |
+| **gjson / sjson** | v1.19.0 / v1.2.5 | Protocol JSON transforms | Targeted reads and writes without generic map conversion |
 | **godotenv** | v1.5.1 | Env Config | Simplified config management |
 
 ### Architecture Features
@@ -720,42 +870,47 @@ Check out the awesome admin dashboard 👇
   - `admin_cooldown.go`: Cooldown management API
   - `admin_csv.go`: CSV import/export
   - `admin_types.go`: Admin API type definitions
-  - `admin_auth_tokens.go`: API access token CRUD (with token stats, cost limits, model restrictions)
+  - `admin_auth_tokens.go`: API access token CRUD (with token stats, cost limits, model/channel restrictions, concurrency limits)
   - `admin_settings.go`: System settings management
   - `admin_models.go`: Model list management
-  - `admin_testing.go`: Channel testing (with protocol transform testing)
+  - `admin_testing.go`: Channel testing with an explicit client request protocol
   - `admin_debug_log.go`: Debug log API (sensitive header masking + base64 binary encoding)
   - `channel_check_scheduler.go`: Scheduled channel check scheduler
   - `detection_log.go`: Detection result to LogEntry builder
-- **Protocol Transform System** (2026-04 new):
+- **Protocol Transform System**:
   - `protocol/types.go`: Four protocol definitions (Anthropic/OpenAI/Gemini/Codex)
-  - `protocol/registry.go`: Request/response transformer registry
-  - `protocol/builtin/`: 18 built-in transform implementations (streaming and non-streaming)
-  - Preserves sampling/limit/stop/seed parameters; Gemini `thinkingConfig.thinkingLevel` maps to the target protocol's reasoning/thinking config
-  - Two modes: `upstream` (default, handled natively by upstream) / `local` (local translation)
-  - Channel config: `ProtocolTransformMode` + `ProtocolTransforms`
+  - `protocol/registry.go`: Contract boundary for request, streaming response, and non-stream response transforms; same-protocol traffic bypasses conversion
+  - `protocol/builtin/register.go`: Registers all 12 directed cross-protocol pairs
+  - `protocol/builtin/cliproxy_adapter.go`: ccLoad-owned request validation, JSON/SSE normalization, and stream framing
+  - `protocol/cliproxy/`: In-tree snapshot boundary for the pure [CLIProxyAPI](https://github.com/caidaoli/CLIProxyAPI) four-protocol core and allowlisted provider request/response adapters; [`UPSTREAM.md`](internal/protocol/cliproxy/UPSTREAM.md) records provenance, synchronization rules, and which provider adapters are actually present
+  - Upstream refresh workflow: invoke `$sync-cliproxy-core` in Codex or `/sync-cliproxy-core` in Claude Code; one atomic operation pins one commit and synchronizes both the core and every registered provider adapter
+  - Requests that cannot be represented in the selected upstream protocol return `400 Bad Request`; they do not trigger channel failover or cooldown
+  - Every channel accepts Anthropic, Codex, OpenAI, and Gemini clients; upstream protocol capability belongs to each structured URL
+  - Explicit protocol declarations route directly and skip incompatible URLs without request or cooldown; automatic mode starts with the client protocol, then falls back through OpenAI → Anthropic → Codex → Gemini without retrying it, while local mode falls back through Anthropic → Codex → OpenAI → Gemini only when all URLs are undeclared
+  - Automatic detection translates only after an uncommitted HTTP 400, a non-model 404/405, a structured `convert_request_failed` + `not implemented` 500, or a Cloudflare 403 block page returned before the API origin; exact URLs without declarations translate directly across protocols
 - **Cooldown Manager** (DRY):
   - `cooldown/manager.go`: Unified cooldown decision engine
   - Eliminates duplicate code, unified cooldown logic
   - Distinguishes network vs HTTP error classification
-  - Recognizes structured quota/model cooldown responses and cools down until the upstream reset time
-  - Built-in single-key channel auto-upgrade logic
+  - Uses separate Key/Model/Channel actions; `ActionRetryModel` does not retry another Key or URL in the same channel
+  - Persists structured `model_cooldown` responses, upstream HTTP 5xx failures, key-level 429 rate limits, model-unavailable 404 errors, and explicit model-retirement 410 errors by `(channel_id, actual upstream model)`; other models on that channel stay eligible
+  - Automatically promotes to channel cooldown only when all configured models or all enabled keys are cooling
 - **Multi-URL Selector** (URLSelector):
   - `url_selector.go`: Smart URL selection within a single channel
   - Explore-first: Unvisited URLs get priority to collect latency data
   - Weighted random: Weight = 1/EWMA latency, lower latency = higher selection probability
   - Independent cooldown: Failed URLs cool down independently without affecting other URLs
   - BaseURL tracking: Active requests, logs, and UI carry upstream URL throughout
-- **Storage Layer Refactor** (2025-12 optimization, eliminated 467 lines of duplicate code):
-  - `storage/schema/`: Unified schema definition (supports SQLite/MySQL differences)
-  - `storage/sql/`: Common SQL implementation layer (SQLite/MySQL shared)
+- **Storage Layer Refactor** (eliminated 467 lines of duplicate code):
+  - `storage/schema/`: Unified schema definition (supports SQLite/MySQL/PostgreSQL differences)
+  - `storage/sql/`: Common SQL implementation layer shared by SQLite, MySQL, and PostgreSQL
   - `storage/factory.go`: Factory pattern auto-selects database
   - Composite index optimization, stats query performance improved
-- **OpenAI service_tier Pricing** (2026-03 new):
+- **OpenAI service_tier Pricing**:
   - `util.OpenAIServiceTierMultiplier()`: Returns multiplier for priority/flex/default tiers
   - `LogEntry.ServiceTier`: Persisted to database, log cost column shows tier annotation
   - Supports GPT-5.4, GPT-5.4-pro, and other latest model pricing
-- **Responses image_generation Tool Billing** (2026-05 new):
+- **Responses image_generation Tool Billing**:
   - Parses Responses API `tool_usage.image_gen` and the `image_generation` tool model
   - Bills `gpt-image-2` by text input, image input, and image output tokens
   - Streaming/non-streaming proxy paths and channel tests share the same usage parser to keep cost accounting consistent
@@ -768,7 +923,7 @@ Check out the awesome admin dashboard 👇
 **Multi-level Cache System**:
 - Channel config cache (60s TTL)
 - Round-robin pointer cache (in-memory)
-- Cooldown state inline (channels/api_keys tables store directly)
+- Channel/Key cooldown state inline (`channels` / `api_keys`); model cooldown state in `channel_model_cooldowns`
 - Error classification cache (1000 capacity)
 
 **Async Processing Architecture**:
@@ -789,65 +944,84 @@ Check out the awesome admin dashboard 👇
 
 ### Environment Variables
 
+Environment variables cover bootstrap configuration only — the values ccLoad needs before a database connection exists. Everything the gateway consumes after startup (limits, cooldown durations, timeouts, health scoring) is a system setting managed from the admin console. In particular, `SQLITE_PATH`, `SQLITE_JOURNAL_MODE`, `CCLOAD_MYSQL`, `CCLOAD_POSTGRES`, `CCLOAD_ENABLE_SQLITE_REPLICA`, and `CCLOAD_SQLITE_LOG_DAYS` decide *how the database is opened*, so they cannot be stored in that same database and will stay environment variables.
+
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `CCLOAD_PASS` | None | Admin password (**Required**, exits if not set) |
 | `CCLOAD_API_TOKENS` | None | Pre-seed API access tokens on startup. Format: `token1,token2` or `token1\|production,token2\|development`; existing tokens are not overwritten |
 | `API_TOKENS` | None | Compatibility alias for `CCLOAD_API_TOKENS`; startup fails if both variables are set with different values |
-| `CCLOAD_MYSQL` | None | MySQL DSN (optional, format: `user:pass@tcp(host:port)/db?charset=utf8mb4`)<br/>**If set uses MySQL, otherwise SQLite** |
-| `CCLOAD_ENABLE_SQLITE_REPLICA` | `0` | Hybrid storage mode switch (`1`=enable, see below) |
-| `CCLOAD_SQLITE_LOG_DAYS` | `7` | Days of logs to restore from MySQL on startup in hybrid mode (-1=all, 0=no logs) |
+| `CCLOAD_MYSQL` | None | MySQL DSN (optional, format: `user:pass@tcp(host:port)/db?charset=utf8mb4`)<br/>**Mutually exclusive with `CCLOAD_POSTGRES`** |
+| `CCLOAD_POSTGRES` | None | PostgreSQL DSN (optional, URL or libpq keywords, e.g. `postgres://user:pass@host:5432/db?sslmode=disable`)<br/>**Mutually exclusive with `CCLOAD_MYSQL`** |
+| `CCLOAD_ENABLE_SQLITE_REPLICA` | `0` | Hybrid storage mode switch (`1`=enable, needs MySQL or Postgres primary DSN) |
+| `CCLOAD_SQLITE_LOG_DAYS` | `7` | Initial log window when hybrid SQLite has no logs (-1=all); `0` disables all startup log imports, while other values make later startups import only logs after SQLite's latest timestamp |
 | `CCLOAD_ALLOW_INSECURE_TLS` | `0` | Disable upstream TLS cert validation (`1`=enable; ⚠️for troubleshooting/controlled intranet only) |
 | `PORT` | `8080` | Service port |
 | `GIN_MODE` | `release` | Run mode (`debug`/`release`) |
 | `GIN_LOG` | `true` | Gin access log switch (`false`/`0`/`no`/`off` to disable) |
 | `TRUSTED_PROXIES` | Private ranges + Loopback + `100.64.0.0/10` | Trusted proxy CIDRs (comma-separated); `none` = trust no proxies |
-| `SQLITE_PATH` | `data/ccload.db` | SQLite database file path (SQLite mode only) |
+| `SQLITE_PATH` | `data/ccload.db` | SQLite database file path (pure SQLite and hybrid modes) |
 | `SQLITE_JOURNAL_MODE` | `WAL` | SQLite Journal mode (WAL/TRUNCATE/DELETE, recommend TRUNCATE for containers) |
-| `CCLOAD_MAX_CONCURRENCY` | `1000` | Max concurrent requests (limits simultaneous proxy requests) |
-| `CCLOAD_MAX_BODY_BYTES` | `10485760` | Max request body bytes (10MB, Images API auto-expands to 20MB) |
-| `CCLOAD_COOLDOWN_AUTH_SEC` | `300` | Auth error (401/402/403) initial cooldown (seconds) |
-| `CCLOAD_COOLDOWN_SERVER_SEC` | `120` | Server error (5xx) initial cooldown (seconds) |
-| `CCLOAD_COOLDOWN_TIMEOUT_SEC` | `60` | Timeout error (597/598) initial cooldown (seconds) |
-| `CCLOAD_COOLDOWN_RATE_LIMIT_SEC` | `60` | Rate limit error (429) initial cooldown (seconds) |
-| `CCLOAD_COOLDOWN_MAX_SEC` | `1800` | Exponential backoff cooldown max (seconds, 30 minutes) |
-| `CCLOAD_COOLDOWN_MIN_SEC` | `10` | Exponential backoff cooldown min (seconds) |
 | `CCLOAD_HOST_OVERRIDES` | None | DNS override: pin upstream domains to fixed IPs, bypassing DNS resolution. Format: `host1=ip1,host2=ip2`, e.g. `anyrouter.top=47.246.23.200`. TLS SNI/cert/Host header unaffected |
 
 > If the service sits behind a reverse proxy or load balancer, set `TRUSTED_PROXIES` explicitly so spoofed `X-Forwarded-For` values cannot affect client IP detection or login rate limiting.
+> Responses WebSocket runtime usage and limits are available from `GET /admin/runtime-metrics`.
 
-#### Hybrid Storage Mode (MySQL Primary + SQLite Cache)
+#### Hybrid Storage Mode (Authoritative SQLite + Async Primary Replica)
 
-HuggingFace Spaces and similar environments lose local data on restart, but free MySQL has high query latency (800ms+). Hybrid mode offers the best of both worlds:
+HuggingFace Spaces and similar environments lose local data on restart, but remote MySQL/Postgres can have high query latency. Hybrid mode offers the best of both worlds:
 
-- **MySQL Primary Storage**: Write operations go to MySQL first, ensuring data persistence
-- **SQLite Local Cache**: Read operations go through local SQLite, latency <1ms
-- **Startup Recovery**: Restore data from MySQL to SQLite, supports restoring logs by days
-- **Log Special Handling**: Write to SQLite first (fast), then async sync to MySQL (backup)
+- **Authoritative SQLite**: Configuration, credentials, keys, cooldowns, settings, and logs are synchronously read and written locally; a successful SQLite commit completes the request
+- **Async Primary Replica**: An in-memory worker coalesces final state by entity and retries failures after 10 seconds, so primary latency does not block requests; excessive distinct dirty entities collapse into one full-state reconciliation instead of growing memory without bound
+- **Startup Semantics**: A newly created SQLite file imports configuration from primary; `CCLOAD_SQLITE_LOG_DAYS=0` disables startup log imports, otherwise every startup requires primary to be available, imports only logs newer than `MAX(sqlite.logs.time)` when SQLite already has logs, and uses the configured window only when SQLite logs are empty; existing SQLite configuration and logs are never replaced
+- **Log Semantics**: Primary log writes and cleanup are attempted once, best-effort, and do not enter the 10-second retry loop; newer batches replace older pending batches and increment the dropped metric
+- **Health**: Readiness checks authoritative SQLite only; primary sync health is exposed by runtime metrics
+- **Local-only Data**: Web sessions and raw DebugData remain process-local in SQLite
+- **Boundary**: This is a single-instance, single-writer design. Pending in-memory work is lost on process restart; there is no outbox and no multi-instance write coordination
 
 ```bash
-# Enable hybrid mode
+# Enable hybrid mode (MySQL primary)
 export CCLOAD_MYSQL="user:pass@tcp(host:3306)/db?charset=utf8mb4"
 export CCLOAD_ENABLE_SQLITE_REPLICA=1
-export CCLOAD_SQLITE_LOG_DAYS=7  # Restore last 7 days of logs (optional)
+export CCLOAD_SQLITE_LOG_DAYS=7  # Seed the last 7 days when SQLite is empty, then import only the tail
+
+# Or PostgreSQL primary
+export CCLOAD_POSTGRES="postgres://user:pass@host:5432/db?sslmode=disable"
+export CCLOAD_ENABLE_SQLITE_REPLICA=1
 ```
 
-**Three Storage Modes**:
+**Storage Modes**:
 | Mode | Configuration | Use Case |
 |------|---------------|----------|
-| Pure SQLite | Don't set `CCLOAD_MYSQL` | Local dev, single instance |
+| Pure SQLite | Don't set primary DSN | Local dev, single instance |
 | Pure MySQL | Set `CCLOAD_MYSQL` | Standard production |
-| Hybrid Mode | Set `CCLOAD_MYSQL` + `CCLOAD_ENABLE_SQLITE_REPLICA=1` | HuggingFace Spaces |
+| Pure PostgreSQL | Set `CCLOAD_POSTGRES` | Standard production (PG) |
+| Hybrid Mode | Primary DSN + `CCLOAD_ENABLE_SQLITE_REPLICA=1` | HuggingFace Spaces / high-latency primary |
 
-### Web Admin Configuration (Hot Reload Supported)
+### Web Admin Configuration (Database-backed, Auto Restart)
 
-These settings have been migrated to database, managed via Web interface `/web/settings.html`, changes take effect immediately without restart:
+These settings live in the database and are managed from `/web/settings.html`. Saving a change writes it to the database and restarts the process about two seconds later; the restart is what applies the new value, so in-flight requests finish first and there is no hot reload:
 
 | Setting | Default | Description |
 |---------|---------|-------------|
 | `log_retention_days` | `7` | Log retention days (-1 for permanent, 1-365 days) |
 | `max_key_retries` | `3` | Max key retries within single channel |
+| `max_concurrency` | `1000` | Max concurrent proxy requests |
+| `http_read_timeout_seconds` | `0` | Downstream request read timeout in seconds; `0` uses the built-in 120-second default. It covers the complete request header/body read, returns 408 on timeout, and is independent of body-size limits. |
+| `max_body_bytes` | `10485760` | Max request body bytes, 10MB by default |
+| `max_image_body_bytes` | `20971520` | Max Images API request body bytes, 20MB by default |
+| `cooldown_auth_seconds` | `300` | Auth error (401/402/403) initial cooldown in seconds |
+| `cooldown_server_seconds` | `120` | Server error (5xx) initial cooldown in seconds |
+| `cooldown_timeout_seconds` | `60` | Timeout error (597/598) initial cooldown in seconds |
+| `cooldown_rate_limit_seconds` | `60` | Rate limit error (429) initial cooldown in seconds |
+| `codex_map_429_to_503` | `false` | Map the final upstream 429 returned to official Codex clients to 503 so they retry it as a 5xx; other Responses clients and ccLoad's own limits are unaffected |
+| `cooldown_min_seconds` | `10` | Exponential backoff cooldown floor in seconds |
+| `cooldown_max_seconds` | `1800` | Exponential backoff cooldown ceiling in seconds (an inverted floor/ceiling pair falls back to both defaults) |
+| `cooldown_fallback_enabled` | `true` | When every channel is cooling down, fall back to the channel that recovers soonest instead of failing (keys follow the same earliest-recovery rule); set to `false` to reject the request outright |
+| `global_cooldown_detection_rules` | `{}` | Global cooldown detection rules, inherited by channels that define no `cooldown_detection_rules` of their own |
+| `upstream_connection_reuse_limit_seconds` | `0` | Maximum upstream connection reuse time in seconds (`0` = unlimited); applies to HTTP/1.1, HTTP/2, and WebSocket, drains active requests, then reconnects on demand |
 | `upstream_first_byte_timeout` | `0` | Upstream first valid stream content timeout (seconds, 0=disabled, stream only) |
+| `stream_timeout` | `0` | Stream request total timeout (seconds, 0=disabled) |
 | `non_stream_timeout` | `120` | Non-stream request timeout (seconds, 0=disabled) |
 | `anthropic_first_byte_timeout` | `0` | Anthropic first valid stream content timeout (seconds, 0=use global `upstream_first_byte_timeout`) |
 | `anthropic_non_stream_timeout` | `0` | Anthropic non-stream request timeout (seconds, 0=use global `non_stream_timeout`) |
@@ -862,27 +1036,53 @@ These settings have been migrated to database, managed via Web interface `/web/s
 | `health_score_window_minutes` | `30` | Success rate stats time window (minutes) |
 | `health_score_update_interval` | `30` | Success rate cache update interval (seconds) |
 | `health_min_confident_sample` | `20` | Confidence sample threshold (full penalty at this sample size) |
-| `channel_check_interval_hours` | `0` | Scheduled channel check interval (hours, 0=disabled) |
-| `auto_update_interval_hours` | `12` | Auto-update check interval (hours, 0=disabled, minimum enabled value is 1) |
+| `enable_ttfb_score` | `false` | Enable relative first-byte latency penalty; requires `enable_health_score` |
+| `ttfb_penalty_weight` | `20` | TTFB penalty when average first-byte latency is 2× the candidate median at full confidence |
+| `ttfb_max_slow_ratio` | `2` | Upper bound for relative TTFB slowness (`avg_ttfb / median_ttfb - 1`) |
+| `ttfb_min_confident_sample` | `10` | TTFB confidence sample threshold |
+| `channel_check_interval_hours` | `5` | Scheduled channel check interval (hours, supports decimals, 0=disabled) |
+| `model_catalog_sync_interval_hours` | `6` | Syncs the models.dev catalog every 6 hours; `0` disables network sync. At startup, the last-good cache is used, with the embedded catalog as fallback; channel `cost_multiplier` still applies. |
+| `auto_update_interval_hours` | `12` | Non-container release check interval (hours, 0=disabled, minimum enabled value is 1); unavailable in containers |
+| `auto_update_channel` | `stable` | Non-container release channel: `stable` accepts stable releases only; `preview` accepts stable and prerelease versions and selects the highest SemVer; unavailable in containers |
+| `model_fuzzy_match` | `false` | When an exact model name misses, fall back to substring matching plus version sorting |
+| `responses_ws_max_connections` | `128` | Max concurrent downstream Responses WebSocket connections across the process; `0` uses the built-in default |
+| `responses_ws_max_connections_per_token` | `64` | Max concurrent downstream Responses WebSocket connections per auth token; `0` uses the built-in default |
+| `responses_ws_max_sessions` | `256` | Max retained Responses WebSocket execution sessions across the process; `0` uses the built-in default |
+| `responses_ws_session_ttl_minutes` | `15` | Idle execution-session retention in minutes; `0` uses the built-in default |
+| `responses_ws_max_transcript_bytes` | `268435456` | Process-wide retained transcript payload budget (256 MiB); `0` uses the built-in default |
+| `debug_log_enabled` | `false` | Capture upstream request/response debug logs |
+| `debug_log_retention_minutes` | `2` | Debug log retention in minutes |
 
 Per-protocol timeouts apply to the runtime upstream protocol: if a transformed request is forwarded to OpenAI, ccLoad reads `openai_*_timeout`; when that value is `0`, it falls back to the global timeout.
 
 #### Auto Updates
 
-ccLoad supports in-process auto updates. It checks GitHub Releases every 12 hours by default and prepares a verified newer binary when available. The interval can be changed from the Web admin settings page via `auto_update_interval_hours`; set it to `0` to disable automatic update checks.
+For non-container deployments, one update manager owns release checks, version notifications, and optional in-process updates. It checks once at startup and every 12 hours by default. `auto_update_channel=stable` accepts stable releases only; `preview` considers stable and prerelease versions and selects the highest valid SemVer without downgrading the running or pending version. Change both settings from the Web admin settings page. Set `auto_update_interval_hours=0` to disable all release checks.
 
-#### Health Score Sorting
+Stable metadata is resolved through the configured release sources. Preview discovery reads GitHub's Releases Atom feed, which includes stable and prerelease entries without using the rate-limited REST API. After resolving an exact Tag, ccLoad downloads that Tag's binary and checksum from the configured download sources—by default `gh.monlor.com`, `fastgit.cc`, `ghfast.top`, then GitHub; SHA256 must match before replacement.
 
-When `enable_health_score` is enabled, the system dynamically adjusts priority based on channel success rate:
+Official containers do not run the release check or in-process update loop. Every stable and Beta image contains the exact binary produced by the matching GitHub Release. Stable releases publish an exact version Tag plus `latest`; Beta releases publish an exact prerelease Tag plus the rolling `beta` alias. Switch the image Tag in Compose, then pull and recreate the container.
+
+To use a private release mirror, set `CCLOAD_RELEASE_BASE_URL` to a complete latest-download base such as `https://mirror.example/caidaoli/ccLoad/releases/latest/download`. An explicit value disables built-in fallback sources for stable metadata and all asset downloads. Preview metadata still comes from GitHub's Releases Atom feed. This setting does not configure `HTTP_PROXY` or `HTTPS_PROXY` for upstream API traffic.
+
+#### Dynamic Channel Sorting
+
+When `enable_health_score` is enabled, ccLoad calculates an effective priority from recent channel health. The success-rate penalty is always active; the relative first-byte latency penalty is added only when `enable_ttfb_score=true`:
 
 ```
-confidence = min(1.0, sample_count / health_min_confident_sample)
-effective_priority = base_priority - (failure_rate × success_rate_penalty_weight × confidence)
+failure_confidence = min(1.0, sample_count / health_min_confident_sample)
+failure_penalty = failure_rate × success_rate_penalty_weight × failure_confidence
+
+relative_slowness = clamp(avg_ttfb / candidate_median_ttfb - 1, 0, ttfb_max_slow_ratio)
+ttfb_confidence = min(1.0, ttfb_sample_count / ttfb_min_confident_sample)
+ttfb_penalty = relative_slowness × ttfb_penalty_weight × ttfb_confidence
+
+effective_priority = base_priority - failure_penalty - ttfb_penalty
 ```
 
-**Confidence Factor**: Solves over-penalization of new or low-traffic channels due to small sample sizes. Smaller samples = lower confidence = more penalty discount.
+**Confidence factors** prevent new or low-traffic channels from receiving a full penalty from a few samples. TTFB scoring compares successful first-byte samples against the median of the current candidate channels. Channels at or faster than the median receive no TTFB penalty, and scoring is skipped when fewer than two candidates have valid TTFB data.
 
-**Example** (`success_rate_penalty_weight = 100`, `health_min_confident_sample = 20`):
+**Success-rate-only example** (`enable_ttfb_score=false`, `success_rate_penalty_weight = 100`, `health_min_confident_sample = 20`):
 
 | Channel | Base Priority | Success Rate | Samples | Confidence | Penalty | Effective Priority |
 |---------|---------------|--------------|---------|------------|---------|-------------------|
@@ -912,9 +1112,11 @@ Base priority order: A > B > C > D
 - After provisioning, remove `CCLOAD_API_TOKENS` from deployment config if automatic recovery is no longer needed
 - Restrict access to container inspect output, orchestration dashboards, and deployment configuration
 
-**Advanced Token Features** (2026-01 New):
-- **Cost Limits**: Set cost limits per token (USD), requests rejected with 429 when exceeded
+**Advanced Token Features**:
+- **Cost Limits**: Set independent total, daily, and monthly USD limits with `cost_limit_usd`, `cost_daily_limit_usd`, and `cost_monthly_limit_usd`; `0` means unlimited. A request is rejected with 429 when any enabled limit is reached. Cost-limited tokens also require `max_concurrency > 0`.
 - **Model Restrictions**: Restrict which models a token can access for fine-grained access control
+- **Channel Restrictions**: Combine `allowed_channel_ids` with `channel_restriction_mode` — `allow` treats the list as an allowlist, `deny` as a denylist; an empty list is unrestricted in either mode
+- **Concurrency Limit**: `max_concurrency` caps a token's simultaneous in-flight requests (`0` = unlimited)
 - **First Byte Time**: Records streaming request TTFB (milliseconds) for upstream latency diagnosis
 
 #### Behavior Summary
@@ -931,9 +1133,11 @@ Project supports multi-arch Docker images:
 - **Image Registry**: `ghcr.io/caidaoli/ccload`
 - **Available Tags**:
   - `latest` - Latest stable version
-  - `v2.44.1` - Specific release tag, matching the GitHub Release tag
+  - `beta` - Latest Beta version
+  - `v2.44.1` - Exact stable version, matching the GitHub Release tag
+  - `vX.Y.Z-beta.N` - Exact Beta version, matching the GitHub prerelease tag
 
-The official GHCR runtime image is Alpine-based. On container startup, it downloads the latest Linux release binary from GitHub Releases; after ccLoad starts, further update checks are handled by ccLoad's own auto-update mechanism. The default check interval is 12 hours and can be changed with `auto_update_interval_hours` in the Web admin settings.
+The official GHCR runtime image is Alpine-based and immutable: every release packages the already-tested `ccload-linux-amd64` and `ccload-linux-arm64` GitHub Release binaries into the matching multi-arch image. Exact version Tags are immutable release references; `latest` and `beta` are rolling aliases for the newest stable and Beta images. Containers do not check for releases or replace their binary in process; pull an exact Tag or the desired rolling alias and recreate the container.
 
 ### Image Tag Guide
 
@@ -943,6 +1147,13 @@ docker pull ghcr.io/caidaoli/ccload:latest
 
 # Pull specific version
 docker pull ghcr.io/caidaoli/ccload:v2.44.1
+
+# Pull latest Beta; replace beta with a published vX.Y.Z-beta.N Tag to pin it
+docker pull ghcr.io/caidaoli/ccload:beta
+
+# With Compose, set image to :latest or :beta, then apply the change
+docker compose pull
+docker compose up -d
 
 # Specify architecture (Docker usually auto-selects)
 docker pull --platform linux/amd64 ghcr.io/caidaoli/ccload:latest
@@ -956,10 +1167,10 @@ docker pull --platform linux/arm64 ghcr.io/caidaoli/ccload:latest
 storage/
 ├── store.go         # Store interface (unified contract)
 ├── factory.go       # NewStore() auto-selects database
-├── schema/          # Unified schema definition layer (2025-12 new)
+├── schema/          # Unified schema definition layer
 │   ├── tables.go    # Table definitions (DefineXxxTable functions)
-│   └── builder.go   # Schema builder (supports SQLite/MySQL differences)
-├── sql/             # Common SQL implementation layer (2025-12 refactor, eliminated 467 lines)
+│   └── builder.go   # Schema builder (supports SQLite/MySQL/PostgreSQL differences)
+├── sql/             # Common SQL implementation layer (eliminated 467 lines)
 │   ├── store_impl.go      # SQLStore core implementation
 │   ├── config.go          # Channel config CRUD
 │   ├── apikey.go          # API key CRUD
@@ -971,31 +1182,34 @@ storage/
 │   ├── metrics_finalize.go    # Finalization processing
 │   ├── auth_tokens.go         # API access tokens
 │   ├── auth_token_stats.go    # Token statistics
-│   ├── admin_sessions.go  # Admin sessions
+│   ├── web_sessions.go    # Role-aware Web sessions
 │   ├── system_settings.go # System settings
 │   └── helpers.go         # Helper functions
 └── sqlite/          # SQLite specific (test files only)
 ```
 
 **Database Selection Logic**:
-- `CCLOAD_MYSQL` environment variable set → Uses MySQL
-- Not set → Uses SQLite (default)
+- `CCLOAD_MYSQL` set → MySQL primary (fatal if also set with `CCLOAD_POSTGRES`)
+- `CCLOAD_POSTGRES` set → PostgreSQL primary
+- Neither set → SQLite (default)
+- Primary DSN + `CCLOAD_ENABLE_SQLITE_REPLICA=1` → Hybrid (authoritative SQLite + async primary replica)
 
-**Core Table Structure** (SQLite and MySQL shared):
-- `channels` - Channel config (cooldown data inline, UNIQUE constraint on name, with protocol transform config, scheduled check config, RPM/concurrency limit config)
+**Core Table Structure** (SQLite / MySQL / PostgreSQL shared):
+- `channels` - Channel config (channel-level cooldown inline, UNIQUE constraint on name, with multi-protocol handling config, scheduled check config, RPM/concurrency limit config)
 - `api_keys` - API keys (key-level cooldown inline, multi-key strategies)
+- `channel_model_cooldowns` - Model-level runtime cooldown keyed by channel and actual upstream model
 - `logs` - Request logs (with base_url upstream URL tracking)
 - `debug_logs` - Debug logs (upstream request/response raw data, independent cleanup policy)
 - `key_rr` - Round-robin pointers (channel_id → idx)
-- `auth_tokens` - Auth tokens (with cost limits, model restrictions, first byte time tracking)
-- `admin_sessions` - Admin sessions
-- `system_settings` - System config (hot reload support)
+- `auth_tokens` - Auth tokens (with cost limits, model/channel restrictions, concurrency limits, first byte time tracking)
+- `web_sessions` - Role-aware Web sessions bound to an optional API token
+- `system_settings` - System config (database-backed, applied after automatic restart)
 
-**Architecture Features** (✅ 2025-12 through 2026-04 continuous improvements):
-- ✅ **Unified SQL Layer** (refactor): SQLite/MySQL share `storage/sql/` implementation, eliminated 467 lines of duplicate code
+**Architecture Features**:
+- ✅ **Unified SQL Layer** (refactor): SQLite, MySQL, and PostgreSQL share `storage/sql/` implementation
 - ✅ **Unified Schema Definition** (new): `storage/schema/` defines table structures, supports database differences
 - ✅ Factory pattern unified interface (OCP, easy to extend new storage)
-- ✅ Cooldown data inline (deprecated separate cooldowns table, reduces JOIN overhead)
+- ✅ Channel/Key cooldown data inline; model-scoped cooldown stored separately so one unavailable model does not disable the whole channel
 - ✅ Performance index optimization (channel selection latency ↓30-50%, key lookup latency ↓40-60%)
 - ✅ Composite index optimization (stats query performance improved)
 - ✅ Foreign key constraints (cascade delete, ensures data consistency)
@@ -1006,11 +1220,11 @@ storage/
 - ✅ **Responses image tool cost tracking**: `image_generation` tool costs are included in logs, stats, and cost limit accounting
 - ✅ **Tiered pricing engine**: GPT-5.4/Qwen-Plus/Gemini long-context step billing
 - ✅ **Log UX improvements**: Cost column formats to 3 decimal places (empty for zero), IP column shows full address on hover
-- ✅ **Protocol transform system**: Anthropic/OpenAI/Gemini/Codex four-protocol cross-conversion, upstream/local modes
+- ✅ **Automatic protocol fallback**: client-native routing first, then OpenAI → Anthropic → Codex → Gemini fallback with the native protocol skipped and family-aware capability caching
 - ✅ **Debug logs**: Upstream request/response raw data capture, sensitive header masking, independent cleanup policy
 - ✅ **Scheduled channel checks**: Background periodic channel availability probing, configurable check model per channel
 - ✅ **Channel RPM limits**: Per-channel rolling 60-second request caps, `0` means unlimited, over-limit channels are skipped
-- ✅ **Per-key concurrency limits**: Each API key has an independent in-flight cap, `0` means unlimited, and full keys are skipped
+- ✅ **Channel concurrency limits**: Per-channel in-flight request caps, `0` means unlimited, over-limit channels are skipped
 
 **Backward Compatible Migration**:
 - Auto-detects and fixes duplicate channel names
@@ -1023,7 +1237,7 @@ storage/
 - Production must set strong password `CCLOAD_PASS`
 - Configure API access tokens via Web admin `/web/tokens.html` to protect API endpoint access
 - API keys used only in memory, not logged
-- Tokens stored in client localStorage, 24-hour expiry
+- Only random Web-session tokens are stored in client localStorage, with a 24-hour expiry
 - Recommend using HTTPS reverse proxy
 - Docker images run as non-root user for enhanced security
 
@@ -1032,21 +1246,21 @@ storage/
 ccLoad uses token-based authentication for simple and efficient secure access control.
 
 **Auth Methods**:
-- **Admin Interface**: Login gets 24-hour token, stored in `localStorage`
+- **Web Interface**: Login with an admin password or API token and receive a 24-hour Web-session token
 - **API Endpoints**: Support `Authorization: Bearer <token>` header auth
 
 **Core Features**:
-- ✅ **Stateless Auth**: Tokens don't depend on server sessions, naturally supports horizontal scaling
-- ✅ **Unified Auth System**: API and admin interface use same token mechanism
-- ✅ **Simple Architecture**: Pure token auth, simple reliable code (KISS principle)
-- ✅ **CORS Support**: Token stored in localStorage, fully supports cross-origin access
+- ✅ **Scoped Web Sessions**: API-token sessions are read-only and server-bound to their own usage data
+- ✅ **Immediate Revocation**: Disabling, deleting, or expiring an API token invalidates its Web session
+- ✅ **Credential Isolation**: Plaintext API tokens are never stored in browser storage
+- ✅ **Server-side Authorization**: Channel management, token management, settings, and debug data remain admin-only
 
 **Usage Example**:
 ```bash
 # 1. Login to get token
 curl -X POST http://localhost:8080/login \
   -H "Content-Type: application/json" \
-  -d '{"password":"your_admin_password"}' | jq
+  -d '{"mode":"admin","password":"your_admin_password"}' | jq
 
 # Response example:
 # {
@@ -1082,6 +1296,7 @@ Issues and Pull Requests welcome!
 Use `sonic` for Go commands. Before sending a change, run the checks that match the touched area:
 
 ```bash
+bash .agents/skills/sync-cliproxy-core/scripts/verify.sh --tests  # snapshot audit + focused protocol tests
 go test -tags sonic ./internal/...
 make race-fast      # high-value race subset
 make race           # full race suite
@@ -1089,7 +1304,7 @@ make verify-web     # frontend node:test checks
 golangci-lint run ./...
 ```
 
-`make race-fast` keeps the common race-sensitive packages fast enough for local iteration; use `make race` before larger or concurrency-sensitive changes. Override `RACE_P` or `RACE_PARALLEL` only when the machine needs a different parallelism cap.
+When protocol translation changes, run the snapshot audit before the full internal test suite. `make race-fast` keeps the common race-sensitive packages fast enough for local iteration; use `make race` before larger or concurrency-sensitive changes. Override `RACE_P` or `RACE_PARALLEL` only when the machine needs a different parallelism cap.
 
 ### Troubleshooting
 
@@ -1119,4 +1334,4 @@ env | grep CCLOAD
 
 ## 📄 License
 
-MIT License
+MIT License. The synchronized translator snapshot under `internal/protocol/cliproxy` retains its upstream [MIT notice](internal/protocol/cliproxy/LICENSE) and [provenance record](internal/protocol/cliproxy/UPSTREAM.md).

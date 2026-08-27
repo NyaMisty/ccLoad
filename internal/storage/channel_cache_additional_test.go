@@ -3,12 +3,29 @@ package storage_test
 import (
 	"context"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
 	"ccLoad/internal/model"
 	"ccLoad/internal/storage"
 )
+
+type blockingAPIKeyStore struct {
+	storage.Store
+	loaded  chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (s *blockingAPIKeyStore) GetAPIKeys(ctx context.Context, channelID int64) ([]*model.APIKey, error) {
+	keys, err := s.Store.GetAPIKeys(ctx, channelID)
+	s.once.Do(func() {
+		close(s.loaded)
+		<-s.release
+	})
+	return keys, err
+}
 
 func TestChannelCache_GetConfig(t *testing.T) {
 	ctx := context.Background()
@@ -22,7 +39,7 @@ func TestChannelCache_GetConfig(t *testing.T) {
 
 	created, err := store.CreateConfig(ctx, &model.Config{
 		Name:         "ch",
-		URL:          "https://api.example.com",
+		URLs:         model.ChannelURLs{{URL: "https://api.example.com"}},
 		Priority:     1,
 		ModelEntries: []model.ModelEntry{{Model: "m1"}},
 		Enabled:      true,
@@ -56,7 +73,7 @@ func TestChannelCache_InvalidateCache_ForcesRefresh(t *testing.T) {
 	// 第一次创建并填充缓存
 	if _, err := store.CreateConfig(ctx, &model.Config{
 		Name:         "ch1",
-		URL:          "https://api.example.com",
+		URLs:         model.ChannelURLs{{URL: "https://api.example.com"}},
 		Priority:     1,
 		ModelEntries: []model.ModelEntry{{Model: "m1"}},
 		Enabled:      true,
@@ -74,7 +91,7 @@ func TestChannelCache_InvalidateCache_ForcesRefresh(t *testing.T) {
 	// 数据库新增一个渠道，但缓存未失效时不应看见
 	if _, err := store.CreateConfig(ctx, &model.Config{
 		Name:         "ch2",
-		URL:          "https://api.example.com",
+		URLs:         model.ChannelURLs{{URL: "https://api.example.com"}},
 		Priority:     1,
 		ModelEntries: []model.ModelEntry{{Model: "m1"}},
 		Enabled:      true,
@@ -112,7 +129,7 @@ func TestChannelCache_APIKeysCacheAndInvalidation(t *testing.T) {
 
 	created, err := store.CreateConfig(ctx, &model.Config{
 		Name:         "ch",
-		URL:          "https://api.example.com",
+		URLs:         model.ChannelURLs{{URL: "https://api.example.com"}},
 		Priority:     1,
 		ModelEntries: []model.ModelEntry{{Model: "m1"}},
 		Enabled:      true,
@@ -180,6 +197,83 @@ func TestChannelCache_APIKeysCacheAndInvalidation(t *testing.T) {
 	}
 }
 
+func TestChannelCache_APIKeysCacheExpires(t *testing.T) {
+	ctx := context.Background()
+	store, err := storage.CreateSQLiteStore(filepath.Join(t.TempDir(), "cache_apikey_ttl.db"))
+	if err != nil {
+		t.Fatalf("CreateSQLiteStore failed: %v", err)
+	}
+	defer func() { _ = store.Close() }()
+
+	channel, err := store.CreateConfig(ctx, &model.Config{
+		Name: "ttl-channel", URLs: model.ChannelURLs{{URL: "https://api.example.com"}}, Enabled: true,
+	})
+	if err != nil {
+		t.Fatalf("CreateConfig failed: %v", err)
+	}
+	if err := store.CreateAPIKeysBatch(ctx, []*model.APIKey{{
+		ChannelID: channel.ID, KeyIndex: 0, APIKey: "sk-0", KeyStrategy: model.KeyStrategySequential, //nolint:gosec
+	}}); err != nil {
+		t.Fatalf("CreateAPIKeysBatch failed: %v", err)
+	}
+
+	cache := storage.NewChannelCache(store, 0)
+	if keys, err := cache.GetAPIKeys(ctx, channel.ID); err != nil || len(keys) != 1 {
+		t.Fatalf("initial GetAPIKeys = (%+v, %v)", keys, err)
+	}
+	if err := store.CreateAPIKeysBatch(ctx, []*model.APIKey{{
+		ChannelID: channel.ID, KeyIndex: 1, APIKey: "sk-1", KeyStrategy: model.KeyStrategySequential, //nolint:gosec
+	}}); err != nil {
+		t.Fatalf("CreateAPIKeysBatch second key failed: %v", err)
+	}
+	if keys, err := cache.GetAPIKeys(ctx, channel.ID); err != nil || len(keys) != 2 {
+		t.Fatalf("expired GetAPIKeys = (%+v, %v), want two fresh keys", keys, err)
+	}
+}
+
+func TestChannelCache_APIKeyInvalidationRejectsInFlightStaleFill(t *testing.T) {
+	ctx := context.Background()
+	store, err := storage.CreateSQLiteStore(filepath.Join(t.TempDir(), "cache_apikey_generation.db"))
+	if err != nil {
+		t.Fatalf("CreateSQLiteStore failed: %v", err)
+	}
+	defer func() { _ = store.Close() }()
+	channel, err := store.CreateConfig(ctx, &model.Config{
+		Name: "generation-channel", URLs: model.ChannelURLs{{URL: "https://api.example.com"}}, Enabled: true,
+	})
+	if err != nil {
+		t.Fatalf("CreateConfig failed: %v", err)
+	}
+	if err := store.CreateAPIKeysBatch(ctx, []*model.APIKey{{
+		ChannelID: channel.ID, KeyIndex: 0, APIKey: "sk-old", KeyStrategy: model.KeyStrategySequential, //nolint:gosec
+	}}); err != nil {
+		t.Fatalf("CreateAPIKeysBatch initial: %v", err)
+	}
+
+	blocking := &blockingAPIKeyStore{Store: store, loaded: make(chan struct{}), release: make(chan struct{})}
+	cache := storage.NewChannelCache(blocking, time.Minute)
+	result := make(chan []*model.APIKey, 1)
+	go func() {
+		keys, _ := cache.GetAPIKeys(ctx, channel.ID)
+		result <- keys
+	}()
+	<-blocking.loaded
+	if err := store.CreateAPIKeysBatch(ctx, []*model.APIKey{{
+		ChannelID: channel.ID, KeyIndex: 1, APIKey: "sk-new", KeyStrategy: model.KeyStrategySequential, //nolint:gosec
+	}}); err != nil {
+		t.Fatalf("CreateAPIKeysBatch updated: %v", err)
+	}
+	cache.InvalidateAPIKeysCache(channel.ID)
+	close(blocking.release)
+	if keys := <-result; len(keys) != 1 {
+		t.Fatalf("in-flight caller keys=%d, want its original snapshot", len(keys))
+	}
+	keys, err := cache.GetAPIKeys(ctx, channel.ID)
+	if err != nil || len(keys) != 2 {
+		t.Fatalf("post-invalidation GetAPIKeys = (%+v, %v), want fresh two-key snapshot", keys, err)
+	}
+}
+
 func TestChannelCache_CooldownCacheAndInvalidation(t *testing.T) {
 	ctx := context.Background()
 	tmpDir := t.TempDir()
@@ -192,7 +286,7 @@ func TestChannelCache_CooldownCacheAndInvalidation(t *testing.T) {
 
 	created, err := store.CreateConfig(ctx, &model.Config{
 		Name:         "ch",
-		URL:          "https://api.example.com",
+		URLs:         model.ChannelURLs{{URL: "https://api.example.com"}},
 		Priority:     1,
 		ModelEntries: []model.ModelEntry{{Model: "m1"}},
 		Enabled:      true,
@@ -277,6 +371,40 @@ func TestChannelCache_CooldownCacheAndInvalidation(t *testing.T) {
 	if got := k3[created.ID][0]; got.Unix() != keyUntil2.Unix() {
 		t.Fatalf("expected refreshed key cooldown=%v, got %v", keyUntil2, got)
 	}
+
+	// 模型冷却：与渠道/Key 冷却共用失效入口，但缓存时间戳必须独立。
+	modelUntil1 := now.Add(5 * time.Minute)
+	modelUntil2 := now.Add(6 * time.Minute)
+	if err := store.SetModelCooldown(ctx, created.ID, "model-a", modelUntil1); err != nil {
+		t.Fatalf("SetModelCooldown #1 failed: %v", err)
+	}
+	md1, err := cache.GetAllModelCooldowns(ctx)
+	if err != nil {
+		t.Fatalf("GetAllModelCooldowns #1 failed: %v", err)
+	}
+	if got := md1[created.ID]["model-a"]; got.Unix() != modelUntil1.Unix() {
+		t.Fatalf("model cooldown #1=%v, want %v", got, modelUntil1)
+	}
+
+	if err := store.SetModelCooldown(ctx, created.ID, "model-a", modelUntil2); err != nil {
+		t.Fatalf("SetModelCooldown #2 failed: %v", err)
+	}
+	md2, err := cache.GetAllModelCooldowns(ctx)
+	if err != nil {
+		t.Fatalf("GetAllModelCooldowns #2 failed: %v", err)
+	}
+	if got := md2[created.ID]["model-a"]; got.Unix() != modelUntil1.Unix() {
+		t.Fatalf("expected cached model cooldown=%v, got %v", modelUntil1, got)
+	}
+
+	cache.InvalidateCooldownCache()
+	md3, err := cache.GetAllModelCooldowns(ctx)
+	if err != nil {
+		t.Fatalf("GetAllModelCooldowns after invalidate failed: %v", err)
+	}
+	if got := md3[created.ID]["model-a"]; got.Unix() != modelUntil2.Unix() {
+		t.Fatalf("expected refreshed model cooldown=%v, got %v", modelUntil2, got)
+	}
 }
 
 // TestChannelCache_DeepCopyPreservesCostMultiplier 锁定 deepCopyConfig 必须保留成本倍率与自定义规则，
@@ -293,7 +421,7 @@ func TestChannelCache_DeepCopyPreservesCostMultiplier(t *testing.T) {
 
 	created, err := store.CreateConfig(ctx, &model.Config{
 		Name:           "multi",
-		URL:            "https://api.example.com",
+		URLs:           model.ChannelURLs{{URL: "https://api.example.com"}},
 		Priority:       1,
 		ModelEntries:   []model.ModelEntry{{Model: "m1"}},
 		Enabled:        true,
@@ -301,6 +429,10 @@ func TestChannelCache_DeepCopyPreservesCostMultiplier(t *testing.T) {
 		CustomRequestRules: &model.CustomRequestRules{
 			Headers: []model.CustomHeaderRule{{Action: model.RuleActionOverride, Name: "X-Test", Value: "v"}},
 		},
+		CooldownDetectionRules: &model.CooldownDetectionRules{Rules: []model.CooldownDetectionRule{{
+			Enabled: true, Name: "Rate limit", Priority: 0, StatusCodes: []int{429},
+			Scope: model.CooldownScopeKey, Mode: model.CooldownModeFixed, CooldownSeconds: 90,
+		}}},
 	})
 	if err != nil {
 		t.Fatalf("CreateConfig failed: %v", err)
@@ -318,6 +450,12 @@ func TestChannelCache_DeepCopyPreservesCostMultiplier(t *testing.T) {
 	if byID.CustomRequestRules == nil || len(byID.CustomRequestRules.Headers) != 1 {
 		t.Fatalf("GetConfig CustomRequestRules not preserved: %+v", byID.CustomRequestRules)
 	}
+	if byID.CooldownDetectionRules == nil || len(byID.CooldownDetectionRules.Rules) != 1 {
+		t.Fatalf("GetConfig CooldownDetectionRules not preserved: %+v", byID.CooldownDetectionRules)
+	}
+	if got := byID.CooldownDetectionRules.Rules[0].Name; got != "Rate limit" {
+		t.Fatalf("GetConfig cooldown detection rule name = %q, want Rate limit", got)
+	}
 
 	byModel, err := cache.GetEnabledChannelsByModel(ctx, "m1")
 	if err != nil || len(byModel) != 1 {
@@ -328,5 +466,16 @@ func TestChannelCache_DeepCopyPreservesCostMultiplier(t *testing.T) {
 	}
 	if byModel[0].CustomRequestRules == nil {
 		t.Fatalf("GetEnabledChannelsByModel CustomRequestRules is nil")
+	}
+	if byModel[0].CooldownDetectionRules == nil {
+		t.Fatalf("GetEnabledChannelsByModel CooldownDetectionRules is nil")
+	}
+	byModel[0].CooldownDetectionRules.Rules[0].StatusCodes[0] = 503
+	byModelAgain, err := cache.GetEnabledChannelsByModel(ctx, "m1")
+	if err != nil || len(byModelAgain) != 1 {
+		t.Fatalf("GetEnabledChannelsByModel second read failed: err=%v len=%d", err, len(byModelAgain))
+	}
+	if got := byModelAgain[0].CooldownDetectionRules.Rules[0].StatusCodes[0]; got != 429 {
+		t.Fatalf("cache leaked mutable cooldown detection rules: got status %d, want 429", got)
 	}
 }

@@ -63,9 +63,8 @@ func TestStatsCache_HashFilter(t *testing.T) {
 	// 带字段的 filter
 	channelID := int64(123)
 	filter := &model.LogFilter{
-		ChannelID:   &channelID,
-		ChannelType: "openai",
-		Model:       "gpt-4",
+		ChannelID: &channelID,
+		Model:     "gpt-4",
 	}
 	hash2 := hashFilter(filter)
 	if len(hash2) != 16 {
@@ -80,9 +79,10 @@ func TestStatsCache_HashFilter(t *testing.T) {
 	statusCode := 200
 	filterWithName := &model.LogFilter{ChannelName: "primary"}
 	filterWithStatus := &model.LogFilter{StatusCode: &statusCode}
+	filterWithClientProtocol := &model.LogFilter{ClientProtocol: "openai"}
 	filterWithSource := &model.LogFilter{LogSource: model.LogSourceManualTest}
 	seen := map[string]bool{hash1: true}
-	for _, h := range []string{hashFilter(filterWithName), hashFilter(filterWithStatus), hashFilter(filterWithSource)} {
+	for _, h := range []string{hashFilter(filterWithName), hashFilter(filterWithStatus), hashFilter(filterWithClientProtocol), hashFilter(filterWithSource)} {
 		if seen[h] {
 			t.Fatalf("影响统计结果的 filter 字段未进入 hash: %s", h)
 		}

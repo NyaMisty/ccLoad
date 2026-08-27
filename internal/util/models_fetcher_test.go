@@ -35,35 +35,6 @@ func newJSONResponse(status int, body string) *http.Response {
 // 模型获取器工厂测试
 // ============================================================
 
-func TestNewModelsFetcher(t *testing.T) {
-	tests := []struct {
-		name         string
-		channelType  string
-		expectedType string
-	}{
-		{"Anthropic渠道", "anthropic", "*util.AnthropicModelsFetcher"},
-		{"OpenAI渠道", "openai", "*util.OpenAIModelsFetcher"},
-		{"Gemini渠道", "gemini", "*util.GeminiModelsFetcher"},
-		{"Codex渠道", "codex", "*util.CodexModelsFetcher"},
-		{"空值默认", "", "*util.AnthropicModelsFetcher"},
-		{"未知类型默认", "unknown", "*util.AnthropicModelsFetcher"},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			fetcher := NewModelsFetcher(tt.channelType)
-			if fetcher == nil {
-				t.Fatal("fetcher不应为nil")
-			}
-			// 类型断言验证
-			typeName := getTypeName(fetcher)
-			if typeName != tt.expectedType {
-				t.Errorf("期望类型 %s, 实际类型 %s", tt.expectedType, typeName)
-			}
-		})
-	}
-}
-
 // ============================================================
 // Anthropic 模型获取器测试
 // ============================================================
@@ -229,11 +200,11 @@ func TestGeminiModelsFetcher(t *testing.T) {
 			if r.URL.Path != "/v1beta/models" {
 				t.Fatalf("期望路径 /v1beta/models, 实际 %s", r.URL.Path)
 			}
-			if r.URL.Query().Get("key") != apiKey {
-				t.Fatalf("URL应包含API key参数, 实际 query=%s", r.URL.RawQuery)
+			if r.URL.RawQuery != "" {
+				t.Fatalf("URL不应包含API key, 实际 query=%s", r.URL.RawQuery)
 			}
-			if r.URL.Query().Get("scope") != "" {
-				t.Fatalf("API key 中的 & 不应生成额外 query 参数, 实际 query=%s", r.URL.RawQuery)
+			if got := r.Header.Get("X-Goog-Api-Key"); got != apiKey {
+				t.Fatalf("X-Goog-Api-Key=%q, want %q", got, apiKey)
 			}
 			return newJSONResponse(http.StatusOK, `{
 				"models": [
@@ -274,68 +245,25 @@ func TestGeminiModelsFetcher(t *testing.T) {
 	}
 }
 
-// ============================================================
-// Codex 模型获取器测试
-// ============================================================
-
-func TestCodexModelsFetcher(t *testing.T) {
-	responseBody, err := json.Marshal(map[string]any{
-		"data": []map[string]any{
-			{"id": "gpt-4"},
-			{"id": "gpt-3.5-turbo"},
-			{"id": "text-davinci-003"},
-		},
-	})
-	if err != nil {
-		t.Fatalf("marshal 响应失败: %v", err)
-	}
-
-	fetcher := &CodexModelsFetcher{
+func TestGeminiModelsFetcherTransportErrorDoesNotLeakAPIKey(t *testing.T) {
+	const apiKey = "gemini-secret-that-must-not-leak"
+	fetcher := &GeminiModelsFetcher{
 		client: newTestModelsFetcherClient(func(r *http.Request) (*http.Response, error) {
-			if r.URL.Path != "/v1/models" {
-				t.Fatalf("期望路径 /v1/models, 实际 %s", r.URL.Path)
-			}
-			return newJSONResponse(http.StatusOK, string(responseBody)), nil
+			return nil, context.DeadlineExceeded
 		}),
 	}
-	ctx := context.Background()
 
-	models, err := fetcher.FetchModels(ctx, "https://codex.test", "dummy-key")
-	if err != nil {
-		t.Fatalf("获取失败: %v", err)
+	_, err := fetcher.FetchModels(context.Background(), "https://gemini.test", apiKey)
+	if err == nil {
+		t.Fatal("expected transport error")
 	}
-
-	if len(models) == 0 {
-		t.Fatal("Codex应返回模型列表")
-	}
-
-	// 验证返回的模型
-	expectedModels := []string{"gpt-4", "gpt-3.5-turbo", "text-davinci-003"}
-	if len(models) != len(expectedModels) {
-		t.Errorf("期望 %d 个模型, 实际获取 %d 个", len(expectedModels), len(models))
-	}
-
-	for _, expected := range expectedModels {
-		found := false
-		for _, model := range models {
-			if model == expected {
-				found = true
-				break
-			}
-		}
-		if !found {
-			t.Errorf("未找到期望的模型: %s", expected)
-		}
+	if strings.Contains(err.Error(), apiKey) {
+		t.Fatalf("错误信息泄漏 API key: %v", err)
 	}
 }
 
-// ============================================================
 // 辅助函数
 // ============================================================
-
-func getTypeName(v any) string {
-	return fmt.Sprintf("%T", v)
-}
 
 func containsString(s, substr string) bool {
 	return len(s) >= len(substr) && (s == substr || len(substr) == 0 ||

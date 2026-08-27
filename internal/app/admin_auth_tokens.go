@@ -153,13 +153,16 @@ func (s *Server) HandleListAuthTokens(c *gin.Context) {
 // POST /admin/auth-tokens
 func (s *Server) HandleCreateAuthToken(c *gin.Context) {
 	var req struct {
-		Description       string   `json:"description" binding:"required"`
-		ExpiresAt         *int64   `json:"expires_at"`          // Unix毫秒时间戳，nil表示永不过期
-		IsActive          *bool    `json:"is_active"`           // nil表示默认启用
-		AllowedModels     []string `json:"allowed_models"`      // 允许的模型列表，空表示无限制
-		AllowedChannelIDs []int64  `json:"allowed_channel_ids"` // 允许的渠道ID列表，空表示无限制
-		CostLimitUSD      *float64 `json:"cost_limit_usd"`      // 费用上限（0=无限制）
-		MaxConcurrency    *int     `json:"max_concurrency"`     // 最大并发请求数（0=无限制）
+		Description            string   `json:"description" binding:"required"`
+		ExpiresAt              *int64   `json:"expires_at"`               // Unix毫秒时间戳，nil表示永不过期
+		IsActive               *bool    `json:"is_active"`                // nil表示默认启用
+		AllowedModels          []string `json:"allowed_models"`           // 允许的模型列表，空表示无限制
+		AllowedChannelIDs      []int64  `json:"allowed_channel_ids"`      // 渠道限制列表，空表示无限制
+		ChannelRestrictionMode string   `json:"channel_restriction_mode"` // allow|deny，默认 allow
+		CostLimitUSD           *float64 `json:"cost_limit_usd"`           // 总限额（0=无限制）
+		CostDailyLimitUSD      *float64 `json:"cost_daily_limit_usd"`     // 日限额（0=无限制）
+		CostMonthlyLimitUSD    *float64 `json:"cost_monthly_limit_usd"`   // 月限额（0=无限制）
+		MaxConcurrency         *int     `json:"max_concurrency"`          // 最大并发请求数（0=无限制）
 	}
 
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -170,8 +173,21 @@ func (s *Server) HandleCreateAuthToken(c *gin.Context) {
 		RespondErrorMsg(c, http.StatusBadRequest, "cost_limit_usd must be >= 0")
 		return
 	}
+	if req.CostDailyLimitUSD != nil && *req.CostDailyLimitUSD < 0 {
+		RespondErrorMsg(c, http.StatusBadRequest, "cost_daily_limit_usd must be >= 0")
+		return
+	}
+	if req.CostMonthlyLimitUSD != nil && *req.CostMonthlyLimitUSD < 0 {
+		RespondErrorMsg(c, http.StatusBadRequest, "cost_monthly_limit_usd must be >= 0")
+		return
+	}
 	if req.MaxConcurrency != nil && *req.MaxConcurrency < 0 {
 		RespondErrorMsg(c, http.StatusBadRequest, "max_concurrency must be >= 0")
+		return
+	}
+	channelRestrictionMode, err := model.NormalizeChannelRestrictionMode(req.ChannelRestrictionMode)
+	if err != nil {
+		RespondErrorMsg(c, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -193,15 +209,22 @@ func (s *Server) HandleCreateAuthToken(c *gin.Context) {
 	}
 
 	authToken := &model.AuthToken{
-		Token:             tokenHash,
-		Description:       req.Description,
-		ExpiresAt:         req.ExpiresAt,
-		IsActive:          isActive,
-		AllowedModels:     req.AllowedModels,
-		AllowedChannelIDs: req.AllowedChannelIDs,
+		Token:                  tokenHash,
+		Description:            req.Description,
+		ExpiresAt:              req.ExpiresAt,
+		IsActive:               isActive,
+		AllowedModels:          req.AllowedModels,
+		AllowedChannelIDs:      req.AllowedChannelIDs,
+		ChannelRestrictionMode: channelRestrictionMode,
 	}
 	if req.CostLimitUSD != nil {
 		authToken.SetCostLimitUSD(*req.CostLimitUSD)
+	}
+	if req.CostDailyLimitUSD != nil {
+		authToken.SetCostDailyLimitUSD(*req.CostDailyLimitUSD)
+	}
+	if req.CostMonthlyLimitUSD != nil {
+		authToken.SetCostMonthlyLimitUSD(*req.CostMonthlyLimitUSD)
 	}
 	if req.MaxConcurrency != nil {
 		authToken.MaxConcurrency = *req.MaxConcurrency
@@ -229,15 +252,16 @@ func (s *Server) HandleCreateAuthToken(c *gin.Context) {
 
 	// 返回明文令牌（仅此一次机会）
 	RespondJSON(c, http.StatusOK, gin.H{
-		"id":                  authToken.ID,
-		"token":               tokenPlain, // 明文令牌，仅创建时返回
-		"description":         authToken.Description,
-		"created_at":          authToken.CreatedAt,
-		"expires_at":          authToken.ExpiresAt,
-		"is_active":           authToken.IsActive,
-		"allowed_models":      authToken.AllowedModels,
-		"allowed_channel_ids": authToken.AllowedChannelIDs,
-		"max_concurrency":     authToken.MaxConcurrency,
+		"id":                       authToken.ID,
+		"token":                    tokenPlain, // 明文令牌，仅创建时返回
+		"description":              authToken.Description,
+		"created_at":               authToken.CreatedAt,
+		"expires_at":               authToken.ExpiresAt,
+		"is_active":                authToken.IsActive,
+		"allowed_models":           authToken.AllowedModels,
+		"allowed_channel_ids":      authToken.AllowedChannelIDs,
+		"channel_restriction_mode": authToken.ChannelRestrictionMode,
+		"max_concurrency":          authToken.MaxConcurrency,
 	})
 }
 
@@ -251,13 +275,16 @@ func (s *Server) HandleUpdateAuthToken(c *gin.Context) {
 	}
 
 	var req struct {
-		Description       *string           `json:"description"`
-		IsActive          *bool             `json:"is_active"`
-		ExpiresAt         optionalInt64JSON `json:"expires_at"`
-		AllowedModels     *[]string         `json:"allowed_models"`      // nil=不更新，空数组=清除限制
-		AllowedChannelIDs *[]int64          `json:"allowed_channel_ids"` // nil=不更新，空数组=清除限制
-		CostLimitUSD      *float64          `json:"cost_limit_usd"`      // 费用上限（0=无限制）
-		MaxConcurrency    *int              `json:"max_concurrency"`     // 最大并发请求数（0=无限制）
+		Description            *string           `json:"description"`
+		IsActive               *bool             `json:"is_active"`
+		ExpiresAt              optionalInt64JSON `json:"expires_at"`
+		AllowedModels          *[]string         `json:"allowed_models"`           // nil=不更新，空数组=清除限制
+		AllowedChannelIDs      *[]int64          `json:"allowed_channel_ids"`      // nil=不更新，空数组=清除限制
+		ChannelRestrictionMode *string           `json:"channel_restriction_mode"` // nil=不更新
+		CostLimitUSD           *float64          `json:"cost_limit_usd"`           // 总限额（0=无限制）
+		CostDailyLimitUSD      *float64          `json:"cost_daily_limit_usd"`     // 日限额（0=无限制）
+		CostMonthlyLimitUSD    *float64          `json:"cost_monthly_limit_usd"`   // 月限额（0=无限制）
+		MaxConcurrency         *int              `json:"max_concurrency"`          // 最大并发请求数（0=无限制）
 	}
 
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -268,9 +295,25 @@ func (s *Server) HandleUpdateAuthToken(c *gin.Context) {
 		RespondErrorMsg(c, http.StatusBadRequest, "cost_limit_usd must be >= 0")
 		return
 	}
+	if req.CostDailyLimitUSD != nil && *req.CostDailyLimitUSD < 0 {
+		RespondErrorMsg(c, http.StatusBadRequest, "cost_daily_limit_usd must be >= 0")
+		return
+	}
+	if req.CostMonthlyLimitUSD != nil && *req.CostMonthlyLimitUSD < 0 {
+		RespondErrorMsg(c, http.StatusBadRequest, "cost_monthly_limit_usd must be >= 0")
+		return
+	}
 	if req.MaxConcurrency != nil && *req.MaxConcurrency < 0 {
 		RespondErrorMsg(c, http.StatusBadRequest, "max_concurrency must be >= 0")
 		return
+	}
+	var channelRestrictionMode string
+	if req.ChannelRestrictionMode != nil {
+		channelRestrictionMode, err = model.NormalizeChannelRestrictionMode(*req.ChannelRestrictionMode)
+		if err != nil {
+			RespondErrorMsg(c, http.StatusBadRequest, err.Error())
+			return
+		}
 	}
 
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 10*time.Second)
@@ -299,9 +342,18 @@ func (s *Server) HandleUpdateAuthToken(c *gin.Context) {
 	if req.AllowedChannelIDs != nil {
 		token.AllowedChannelIDs = *req.AllowedChannelIDs
 	}
-	// cost_limit_usd 只有传入时才更新
+	if req.ChannelRestrictionMode != nil {
+		token.ChannelRestrictionMode = channelRestrictionMode
+	}
+	// cost_*_limit_usd 只有传入时才更新
 	if req.CostLimitUSD != nil {
 		token.SetCostLimitUSD(*req.CostLimitUSD)
+	}
+	if req.CostDailyLimitUSD != nil {
+		token.SetCostDailyLimitUSD(*req.CostDailyLimitUSD)
+	}
+	if req.CostMonthlyLimitUSD != nil {
+		token.SetCostMonthlyLimitUSD(*req.CostMonthlyLimitUSD)
 	}
 	if req.MaxConcurrency != nil {
 		token.MaxConcurrency = *req.MaxConcurrency
@@ -319,7 +371,9 @@ func (s *Server) HandleUpdateAuthToken(c *gin.Context) {
 
 	// 触发热更新
 	if err := s.authService.ReloadAuthTokens(); err != nil {
-		log.Print("[WARN]  热更新失败: " + err.Error())
+		log.Print("[ERROR] 令牌已更新，但运行时热更新失败: " + err.Error())
+		RespondError(c, http.StatusServiceUnavailable, err)
+		return
 	}
 
 	RespondJSON(c, http.StatusOK, token)
@@ -345,7 +399,9 @@ func (s *Server) HandleDeleteAuthToken(c *gin.Context) {
 
 	// 触发热更新
 	if err := s.authService.ReloadAuthTokens(); err != nil {
-		log.Print("[WARN]  热更新失败: " + err.Error())
+		log.Print("[ERROR] 令牌已删除，但运行时热更新失败: " + err.Error())
+		RespondError(c, http.StatusServiceUnavailable, err)
+		return
 	}
 
 	log.Printf("[INFO] 删除API令牌: ID=%d", id)

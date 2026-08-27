@@ -21,7 +21,10 @@ const authTokenSelectColumns = `
 	id, token, description, created_at, expires_at, last_used_at, is_active,
 	success_count, failure_count, stream_avg_ttfb, non_stream_avg_rt, stream_count, non_stream_count,
 	prompt_tokens_total, completion_tokens_total, cache_read_tokens_total, cache_creation_tokens_total, total_cost_usd, effective_cost_usd,
-	cost_used_microusd, cost_limit_microusd, allowed_models, allowed_channel_ids, max_concurrency
+	cost_used_microusd, cost_limit_microusd,
+	cost_daily_used_microusd, cost_daily_limit_microusd, cost_daily_period_start,
+	cost_monthly_used_microusd, cost_monthly_limit_microusd, cost_monthly_period_start,
+	allowed_models, allowed_channel_ids, channel_restriction_mode, max_concurrency
 `
 
 func marshalJSONList[T any](field string, values []T) (string, error) {
@@ -43,6 +46,15 @@ func marshalAllowedChannelIDs(channelIDs []int64) (string, error) {
 	return marshalJSONList("allowed_channel_ids", channelIDs)
 }
 
+func normalizeAuthTokenChannelRestrictionMode(token *model.AuthToken) (string, error) {
+	mode, err := model.NormalizeChannelRestrictionMode(token.ChannelRestrictionMode)
+	if err != nil {
+		return "", err
+	}
+	token.ChannelRestrictionMode = mode
+	return mode, nil
+}
+
 //nolint:gosec // SQL查询模板包含"token"字段名，并非硬编码凭据
 const updateTokenStatsQuery = `
 	UPDATE auth_tokens
@@ -58,6 +70,30 @@ const updateTokenStatsQuery = `
 		total_cost_usd = total_cost_usd + CASE WHEN ? = 1 THEN ? ELSE 0 END,
 		effective_cost_usd = effective_cost_usd + CASE WHEN ? = 1 THEN ? ELSE 0 END,
 		cost_used_microusd = cost_used_microusd + CASE WHEN ? = 1 THEN ? ELSE 0 END,
+		cost_daily_used_microusd = CASE
+			WHEN ? = 1 THEN CASE
+				WHEN cost_daily_period_start = ? THEN cost_daily_used_microusd + ?
+				WHEN cost_daily_period_start < ? THEN ?
+				ELSE cost_daily_used_microusd
+			END
+			ELSE cost_daily_used_microusd
+		END,
+		cost_daily_period_start = CASE
+			WHEN ? = 1 AND cost_daily_period_start < ? THEN ?
+			ELSE cost_daily_period_start
+		END,
+		cost_monthly_used_microusd = CASE
+			WHEN ? = 1 THEN CASE
+				WHEN cost_monthly_period_start = ? THEN cost_monthly_used_microusd + ?
+				WHEN cost_monthly_period_start < ? THEN ?
+				ELSE cost_monthly_used_microusd
+			END
+			ELSE cost_monthly_used_microusd
+		END,
+		cost_monthly_period_start = CASE
+			WHEN ? = 1 AND cost_monthly_period_start < ? THEN ?
+			ELSE cost_monthly_period_start
+		END,
 
 		-- 增量更新平均值（new_avg = (old_avg*old_count + v)/(old_count+1)）
 		stream_avg_ttfb = CASE
@@ -71,7 +107,10 @@ const updateTokenStatsQuery = `
 		END,
 		non_stream_count = non_stream_count + CASE WHEN ? = 1 THEN 1 ELSE 0 END,
 
-		last_used_at = ?
+		last_used_at = CASE
+			WHEN last_used_at IS NULL OR last_used_at < ? THEN ?
+			ELSE last_used_at
+		END
 	WHERE token = ?
 `
 
@@ -84,6 +123,7 @@ func scanAuthToken(scanner interface {
 	var isActive int
 	var allowedModelsJSON string
 	var allowedChannelIDsJSON string
+	var channelRestrictionMode string
 	var costUsedMicroUSD int64
 	var costLimitMicroUSD int64
 
@@ -109,8 +149,15 @@ func scanAuthToken(scanner interface {
 		&token.EffectiveCostUSD,
 		&costUsedMicroUSD,
 		&costLimitMicroUSD,
+		&token.CostDailyUsedMicroUSD,
+		&token.CostDailyLimitMicroUSD,
+		&token.CostDailyPeriodStart,
+		&token.CostMonthlyUsedMicroUSD,
+		&token.CostMonthlyLimitMicroUSD,
+		&token.CostMonthlyPeriodStart,
 		&allowedModelsJSON,
 		&allowedChannelIDsJSON,
+		&channelRestrictionMode,
 		&token.MaxConcurrency,
 	); err != nil {
 		return nil, err
@@ -145,6 +192,10 @@ func scanAuthToken(scanner interface {
 		if err := json.Unmarshal([]byte(allowedChannelIDsJSON), &token.AllowedChannelIDs); err != nil {
 			return nil, fmt.Errorf("invalid allowed_channel_ids json: %w", err)
 		}
+	}
+	token.ChannelRestrictionMode = channelRestrictionMode
+	if _, err := normalizeAuthTokenChannelRestrictionMode(token); err != nil {
+		return nil, err
 	}
 	if err := token.ValidateUsageLimits(); err != nil {
 		return nil, err
@@ -186,16 +237,22 @@ func (s *SQLStore) UpsertAuthTokenAllFields(ctx context.Context, token *model.Au
 	if err != nil {
 		return err
 	}
-
-	if s.IsSQLite() {
-		_, err := s.db.ExecContext(ctx, `
+	channelRestrictionMode, err := normalizeAuthTokenChannelRestrictionMode(token)
+	if err != nil {
+		return err
+	}
+	if s.supportsONConflict() {
+		query := `
 			INSERT INTO auth_tokens (
 				id, token, description, created_at, expires_at, last_used_at, is_active,
 				success_count, failure_count, stream_avg_ttfb, non_stream_avg_rt, stream_count, non_stream_count,
 				prompt_tokens_total, completion_tokens_total, cache_read_tokens_total, cache_creation_tokens_total, total_cost_usd, effective_cost_usd,
-				cost_used_microusd, cost_limit_microusd, allowed_models, allowed_channel_ids, max_concurrency
+				cost_used_microusd, cost_limit_microusd,
+				cost_daily_used_microusd, cost_daily_limit_microusd, cost_daily_period_start,
+				cost_monthly_used_microusd, cost_monthly_limit_microusd, cost_monthly_period_start,
+				allowed_models, allowed_channel_ids, channel_restriction_mode, max_concurrency
 			)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 			ON CONFLICT(id) DO UPDATE SET
 				token = excluded.token,
 				description = excluded.description,
@@ -217,17 +274,24 @@ func (s *SQLStore) UpsertAuthTokenAllFields(ctx context.Context, token *model.Au
 				effective_cost_usd = excluded.effective_cost_usd,
 				cost_used_microusd = excluded.cost_used_microusd,
 				cost_limit_microusd = excluded.cost_limit_microusd,
+				cost_daily_used_microusd = excluded.cost_daily_used_microusd,
+				cost_daily_limit_microusd = excluded.cost_daily_limit_microusd,
+				cost_daily_period_start = excluded.cost_daily_period_start,
+				cost_monthly_used_microusd = excluded.cost_monthly_used_microusd,
+				cost_monthly_limit_microusd = excluded.cost_monthly_limit_microusd,
+				cost_monthly_period_start = excluded.cost_monthly_period_start,
 				allowed_models = excluded.allowed_models,
 				allowed_channel_ids = excluded.allowed_channel_ids,
-				max_concurrency = excluded.max_concurrency
-		`,
+				channel_restriction_mode = excluded.channel_restriction_mode,
+				max_concurrency = excluded.max_concurrency`
+		args := []any{
 			token.ID,
 			token.Token,
 			token.Description,
 			token.CreatedAt.UnixMilli(),
 			expiresAt,
 			lastUsedAt,
-			boolToInt(token.IsActive),
+			token.IsActive,
 			token.SuccessCount,
 			token.FailureCount,
 			token.StreamAvgTTFB,
@@ -242,24 +306,55 @@ func (s *SQLStore) UpsertAuthTokenAllFields(ctx context.Context, token *model.Au
 			token.EffectiveCostUSD,
 			token.CostUsedMicroUSD,
 			token.CostLimitMicroUSD,
+			token.CostDailyUsedMicroUSD,
+			token.CostDailyLimitMicroUSD,
+			token.CostDailyPeriodStart,
+			token.CostMonthlyUsedMicroUSD,
+			token.CostMonthlyLimitMicroUSD,
+			token.CostMonthlyPeriodStart,
 			allowedModelsJSON,
 			allowedChannelIDsJSON,
+			channelRestrictionMode,
 			token.MaxConcurrency,
-		)
+		}
+		if s.IsPostgres() {
+			err = s.withPostgresExplicitIDTx(ctx, "auth_tokens", func(tx *sql.Tx) error {
+				if _, deleteErr := s.execTx(ctx, tx, `DELETE FROM auth_tokens WHERE token = ? AND id <> ?`, token.Token, token.ID); deleteErr != nil {
+					return deleteErr
+				}
+				_, execErr := s.execTx(ctx, tx, query, args...)
+				return execErr
+			})
+		} else {
+			err = s.WithTransaction(ctx, func(tx *sql.Tx) error {
+				if _, deleteErr := s.execTx(ctx, tx, `DELETE FROM auth_tokens WHERE token = ? AND id <> ?`, token.Token, token.ID); deleteErr != nil {
+					return deleteErr
+				}
+				_, execErr := s.execTx(ctx, tx, query, args...)
+				return execErr
+			})
+		}
 		if err != nil {
 			return fmt.Errorf("upsert auth token all fields: %w", err)
 		}
 		return nil
 	}
 
-	_, err = s.db.ExecContext(ctx, `
+	err = s.WithTransaction(ctx, func(tx *sql.Tx) error {
+		if _, deleteErr := s.execTx(ctx, tx, `DELETE FROM auth_tokens WHERE token = ? AND id <> ?`, token.Token, token.ID); deleteErr != nil {
+			return deleteErr
+		}
+		_, execErr := s.execTx(ctx, tx, `
 		INSERT INTO auth_tokens (
 			id, token, description, created_at, expires_at, last_used_at, is_active,
 			success_count, failure_count, stream_avg_ttfb, non_stream_avg_rt, stream_count, non_stream_count,
 			prompt_tokens_total, completion_tokens_total, cache_read_tokens_total, cache_creation_tokens_total, total_cost_usd, effective_cost_usd,
-			cost_used_microusd, cost_limit_microusd, allowed_models, allowed_channel_ids, max_concurrency
+			cost_used_microusd, cost_limit_microusd,
+			cost_daily_used_microusd, cost_daily_limit_microusd, cost_daily_period_start,
+			cost_monthly_used_microusd, cost_monthly_limit_microusd, cost_monthly_period_start,
+			allowed_models, allowed_channel_ids, channel_restriction_mode, max_concurrency
 		)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON DUPLICATE KEY UPDATE
 			token = VALUES(token),
 			description = VALUES(description),
@@ -281,35 +376,51 @@ func (s *SQLStore) UpsertAuthTokenAllFields(ctx context.Context, token *model.Au
 			effective_cost_usd = VALUES(effective_cost_usd),
 			cost_used_microusd = VALUES(cost_used_microusd),
 			cost_limit_microusd = VALUES(cost_limit_microusd),
+			cost_daily_used_microusd = VALUES(cost_daily_used_microusd),
+			cost_daily_limit_microusd = VALUES(cost_daily_limit_microusd),
+			cost_daily_period_start = VALUES(cost_daily_period_start),
+			cost_monthly_used_microusd = VALUES(cost_monthly_used_microusd),
+			cost_monthly_limit_microusd = VALUES(cost_monthly_limit_microusd),
+			cost_monthly_period_start = VALUES(cost_monthly_period_start),
 			allowed_models = VALUES(allowed_models),
 			allowed_channel_ids = VALUES(allowed_channel_ids),
+			channel_restriction_mode = VALUES(channel_restriction_mode),
 			max_concurrency = VALUES(max_concurrency)
 	`,
-		token.ID,
-		token.Token,
-		token.Description,
-		token.CreatedAt.UnixMilli(),
-		expiresAt,
-		lastUsedAt,
-		boolToInt(token.IsActive),
-		token.SuccessCount,
-		token.FailureCount,
-		token.StreamAvgTTFB,
-		token.NonStreamAvgRT,
-		token.StreamCount,
-		token.NonStreamCount,
-		token.PromptTokensTotal,
-		token.CompletionTokensTotal,
-		token.CacheReadTokensTotal,
-		token.CacheCreationTokensTotal,
-		token.TotalCostUSD,
-		token.EffectiveCostUSD,
-		token.CostUsedMicroUSD,
-		token.CostLimitMicroUSD,
-		allowedModelsJSON,
-		allowedChannelIDsJSON,
-		token.MaxConcurrency,
-	)
+			token.ID,
+			token.Token,
+			token.Description,
+			token.CreatedAt.UnixMilli(),
+			expiresAt,
+			lastUsedAt,
+			token.IsActive,
+			token.SuccessCount,
+			token.FailureCount,
+			token.StreamAvgTTFB,
+			token.NonStreamAvgRT,
+			token.StreamCount,
+			token.NonStreamCount,
+			token.PromptTokensTotal,
+			token.CompletionTokensTotal,
+			token.CacheReadTokensTotal,
+			token.CacheCreationTokensTotal,
+			token.TotalCostUSD,
+			token.EffectiveCostUSD,
+			token.CostUsedMicroUSD,
+			token.CostLimitMicroUSD,
+			token.CostDailyUsedMicroUSD,
+			token.CostDailyLimitMicroUSD,
+			token.CostDailyPeriodStart,
+			token.CostMonthlyUsedMicroUSD,
+			token.CostMonthlyLimitMicroUSD,
+			token.CostMonthlyPeriodStart,
+			allowedModelsJSON,
+			allowedChannelIDsJSON,
+			channelRestrictionMode,
+			token.MaxConcurrency,
+		)
+		return execErr
+	})
 	if err != nil {
 		return fmt.Errorf("upsert auth token all fields: %w", err)
 	}
@@ -326,9 +437,10 @@ const (
 	authTokenInsertCommonCols = `token, description, created_at, expires_at, last_used_at, is_active,
 		success_count, failure_count, stream_avg_ttfb, non_stream_avg_rt, stream_count, non_stream_count,
 		prompt_tokens_total, completion_tokens_total, total_cost_usd, effective_cost_usd, allowed_models, allowed_channel_ids,
-		cost_used_microusd, cost_limit_microusd, max_concurrency`
+		channel_restriction_mode, cost_used_microusd, cost_limit_microusd,
+		cost_daily_limit_microusd, cost_monthly_limit_microusd, max_concurrency`
 
-	authTokenInsertCommonValues = `?, ?, ?, ?, ?, ?, 0, 0, 0.0, 0.0, 0, 0, 0, 0, 0.0, 0.0, ?, ?, 0, ?, ?`
+	authTokenInsertCommonValues = `?, ?, ?, ?, ?, ?, 0, 0, 0.0, 0.0, 0, 0, 0, 0, 0.0, 0.0, ?, ?, ?, 0, ?, ?, ?, ?`
 )
 
 // authTokenInsertCommonArgs builds auth_tokens INSERT arguments.
@@ -366,12 +478,17 @@ func authTokenInsertCommonArgs(token *model.AuthToken) ([]any, error) {
 	if err != nil {
 		return nil, err
 	}
+	channelRestrictionMode, err := normalizeAuthTokenChannelRestrictionMode(token)
+	if err != nil {
+		return nil, err
+	}
 
 	return []any{
 		token.Token, token.Description, token.CreatedAt.UnixMilli(),
-		expiresAt, lastUsedAt, boolToInt(token.IsActive),
+		expiresAt, lastUsedAt, token.IsActive,
 		allowedModelsJSON, allowedChannelIDsJSON,
-		token.CostLimitMicroUSD, token.MaxConcurrency,
+		channelRestrictionMode,
+		token.CostLimitMicroUSD, token.CostDailyLimitMicroUSD, token.CostMonthlyLimitMicroUSD, token.MaxConcurrency,
 	}, nil
 }
 
@@ -385,17 +502,40 @@ func (s *SQLStore) CreateAuthToken(ctx context.Context, token *model.AuthToken) 
 	if token.ID != 0 {
 		query := `INSERT INTO auth_tokens (id, ` + authTokenInsertCommonCols + `)
 			VALUES (?, ` + authTokenInsertCommonValues + `)`
-		if !s.IsSQLite() {
+		if s.IsMySQL() {
 			query += " ON DUPLICATE KEY UPDATE id = id"
 		}
 		args := append([]any{token.ID}, commonArgs...)
-		if _, err := s.db.ExecContext(ctx, query, args...); err != nil {
+		if s.IsPostgres() {
+			err := s.withPostgresExplicitIDTx(ctx, "auth_tokens", func(tx *sql.Tx) error {
+				_, execErr := s.execTx(ctx, tx, query, args...)
+				return execErr
+			})
+			if err != nil {
+				return fmt.Errorf("create auth token: %w", err)
+			}
+			return nil
+		}
+		if _, err := s.ExecContext(ctx, query, args...); err != nil {
 			return fmt.Errorf("create auth token: %w", err)
 		}
 		return nil
 	}
 
-	result, err := s.db.ExecContext(ctx,
+	if s.IsPostgres() {
+		var id int64
+		err := s.QueryRowContext(ctx,
+			`INSERT INTO auth_tokens (`+authTokenInsertCommonCols+`)
+			VALUES (`+authTokenInsertCommonValues+`) RETURNING id`,
+			commonArgs...).Scan(&id)
+		if err != nil {
+			return fmt.Errorf("create auth token: %w", err)
+		}
+		token.ID = id
+		return nil
+	}
+
+	result, err := s.ExecContext(ctx,
 		`INSERT INTO auth_tokens (`+authTokenInsertCommonCols+`)
 			VALUES (`+authTokenInsertCommonValues+`)`,
 		commonArgs...)
@@ -418,15 +558,39 @@ func (s *SQLStore) EnsureAuthToken(ctx context.Context, token *model.AuthToken) 
 		return false, err
 	}
 
-	if !s.IsSQLite() {
+	if s.IsMySQL() {
 		return s.ensureAuthTokenMySQL(ctx, token, commonArgs)
 	}
 
-	query := `INSERT INTO auth_tokens (` + authTokenInsertCommonCols + `)
-		VALUES (` + authTokenInsertCommonValues + `)`
-	query += " ON CONFLICT(token) DO NOTHING"
+	// SQLite / Postgres：ON CONFLICT DO NOTHING
+	// Postgres 无可靠 LastInsertId，用 RETURNING；冲突时无行 → 再查回填
+	if s.IsPostgres() {
+		var id int64
+		err := s.QueryRowContext(ctx,
+			`INSERT INTO auth_tokens (`+authTokenInsertCommonCols+`)
+			VALUES (`+authTokenInsertCommonValues+`)
+			ON CONFLICT(token) DO NOTHING
+			RETURNING id`,
+			commonArgs...).Scan(&id)
+		if err == nil {
+			token.ID = id
+			return true, nil
+		}
+		if err != sql.ErrNoRows {
+			return false, fmt.Errorf("ensure auth token: %w", err)
+		}
+		existing, getErr := s.GetAuthTokenByValue(ctx, token.Token)
+		if getErr != nil {
+			return false, fmt.Errorf("get ensured auth token: %w", getErr)
+		}
+		*token = *existing
+		return false, nil
+	}
 
-	result, err := s.db.ExecContext(ctx, query, commonArgs...)
+	query := `INSERT INTO auth_tokens (` + authTokenInsertCommonCols + `)
+		VALUES (` + authTokenInsertCommonValues + `) ON CONFLICT(token) DO NOTHING`
+
+	result, err := s.ExecContext(ctx, query, commonArgs...)
 	if err != nil {
 		return false, fmt.Errorf("ensure auth token: %w", err)
 	}
@@ -453,7 +617,7 @@ func (s *SQLStore) EnsureAuthToken(ctx context.Context, token *model.AuthToken) 
 }
 
 func (s *SQLStore) ensureAuthTokenMySQL(ctx context.Context, token *model.AuthToken, commonArgs []any) (bool, error) {
-	result, err := s.db.ExecContext(ctx,
+	result, err := s.ExecContext(ctx,
 		`INSERT INTO auth_tokens (`+authTokenInsertCommonCols+`)
 			VALUES (`+authTokenInsertCommonValues+`)`,
 		commonArgs...)
@@ -490,14 +654,14 @@ func isMySQLDuplicateEntryError(err error) bool {
 
 // GetAuthToken 根据ID获取令牌
 func (s *SQLStore) GetAuthToken(ctx context.Context, id int64) (*model.AuthToken, error) {
-	token, err := scanAuthToken(s.db.QueryRowContext(
+	token, err := scanAuthToken(s.QueryRowContext(
 		ctx,
 		fmt.Sprintf("SELECT %s FROM auth_tokens WHERE id = ?", authTokenSelectColumns),
 		id,
 	))
 
 	if errors.Is(err, sql.ErrNoRows) {
-		return nil, fmt.Errorf("auth token not found")
+		return nil, model.ErrAuthTokenNotFound
 	}
 	if err != nil {
 		return nil, fmt.Errorf("get auth token: %w", err)
@@ -509,14 +673,14 @@ func (s *SQLStore) GetAuthToken(ctx context.Context, id int64) (*model.AuthToken
 // GetAuthTokenByValue 根据令牌哈希值获取令牌信息
 // 用于认证时快速查找令牌
 func (s *SQLStore) GetAuthTokenByValue(ctx context.Context, tokenHash string) (*model.AuthToken, error) {
-	token, err := scanAuthToken(s.db.QueryRowContext(
+	token, err := scanAuthToken(s.QueryRowContext(
 		ctx,
 		fmt.Sprintf("SELECT %s FROM auth_tokens WHERE token = ?", authTokenSelectColumns),
 		tokenHash,
 	))
 
 	if errors.Is(err, sql.ErrNoRows) {
-		return nil, fmt.Errorf("auth token not found")
+		return nil, model.ErrAuthTokenNotFound
 	}
 	if err != nil {
 		return nil, fmt.Errorf("get auth token by value: %w", err)
@@ -527,7 +691,7 @@ func (s *SQLStore) GetAuthTokenByValue(ctx context.Context, tokenHash string) (*
 
 // ListAuthTokens 列出所有令牌
 func (s *SQLStore) ListAuthTokens(ctx context.Context) ([]*model.AuthToken, error) {
-	rows, err := s.db.QueryContext(ctx, fmt.Sprintf(
+	rows, err := s.QueryContext(ctx, fmt.Sprintf(
 		"SELECT %s FROM auth_tokens ORDER BY created_at DESC",
 		authTokenSelectColumns,
 	))
@@ -554,7 +718,7 @@ func (s *SQLStore) ListAuthTokens(ctx context.Context) ([]*model.AuthToken, erro
 func (s *SQLStore) ListActiveAuthTokens(ctx context.Context) ([]*model.AuthToken, error) {
 	now := time.Now().UnixMilli()
 
-	rows, err := s.db.QueryContext(ctx, fmt.Sprintf(
+	rows, err := s.QueryContext(ctx, fmt.Sprintf(
 		"SELECT %s FROM auth_tokens WHERE is_active = 1 AND (expires_at = 0 OR expires_at > ?) ORDER BY created_at DESC",
 		authTokenSelectColumns,
 	), now)
@@ -603,19 +767,26 @@ func (s *SQLStore) UpdateAuthToken(ctx context.Context, token *model.AuthToken) 
 	if err != nil {
 		return err
 	}
+	channelRestrictionMode, err := normalizeAuthTokenChannelRestrictionMode(token)
+	if err != nil {
+		return err
+	}
 
-	result, err := s.db.ExecContext(ctx, `
+	result, err := s.ExecContext(ctx, `
 		UPDATE auth_tokens
 		SET description = ?,
 		    expires_at = ?,
 		    last_used_at = ?,
 		    is_active = ?,
 		    cost_limit_microusd = ?,
+		    cost_daily_limit_microusd = ?,
+		    cost_monthly_limit_microusd = ?,
 		    allowed_models = ?,
 		    allowed_channel_ids = ?,
+		    channel_restriction_mode = ?,
 		    max_concurrency = ?
 		WHERE id = ?
-	`, token.Description, expiresAt, lastUsedAt, boolToInt(token.IsActive), token.CostLimitMicroUSD, allowedModelsJSON, allowedChannelIDsJSON, token.MaxConcurrency, token.ID)
+	`, token.Description, expiresAt, lastUsedAt, token.IsActive, token.CostLimitMicroUSD, token.CostDailyLimitMicroUSD, token.CostMonthlyLimitMicroUSD, allowedModelsJSON, allowedChannelIDsJSON, channelRestrictionMode, token.MaxConcurrency, token.ID)
 
 	if err != nil {
 		return fmt.Errorf("update auth token: %w", err)
@@ -635,7 +806,7 @@ func (s *SQLStore) UpdateAuthToken(ctx context.Context, token *model.AuthToken) 
 
 // DeleteAuthToken 删除令牌
 func (s *SQLStore) DeleteAuthToken(ctx context.Context, id int64) error {
-	result, err := s.db.ExecContext(ctx, `
+	result, err := s.ExecContext(ctx, `
 		DELETE FROM auth_tokens WHERE id = ?
 	`, id)
 
@@ -655,10 +826,18 @@ func (s *SQLStore) DeleteAuthToken(ctx context.Context, id int64) error {
 	return nil
 }
 
+// DeleteAuthTokenReplica is the idempotent tombstone form used by write-behind.
+func (s *SQLStore) DeleteAuthTokenReplica(ctx context.Context, id int64) error {
+	if _, err := s.ExecContext(ctx, `DELETE FROM auth_tokens WHERE id = ?`, id); err != nil {
+		return fmt.Errorf("delete auth token replica: %w", err)
+	}
+	return nil
+}
+
 // UpdateTokenLastUsed 更新令牌最后使用时间
 // 异步调用，性能优化
 func (s *SQLStore) UpdateTokenLastUsed(ctx context.Context, tokenHash string, now time.Time) error {
-	_, err := s.db.ExecContext(ctx, `
+	_, err := s.ExecContext(ctx, `
 		UPDATE auth_tokens
 		SET last_used_at = ?
 		WHERE token = ?
@@ -695,17 +874,18 @@ func (s *SQLStore) UpdateTokenStats(
 	cacheCreationTokens int64,
 	costUSD float64,
 	effectiveCostUSD float64,
+	completedAt time.Time,
 ) error {
 	// 单条 UPDATE 保证原子性：避免每次请求都做 BEGIN+SELECT+UPDATE+COMMIT
 	// 这对 SQLite（减少写锁持有时间/往返）和 MySQL（减少往返/行锁竞争）都更友好。
-	successFlag := boolToInt(isSuccess)
-	failureFlag := boolToInt(!isSuccess)
-	streamUpdateFlag := boolToInt(isStreaming && firstByteTime > 0)
-	nonStreamUpdateFlag := boolToInt(!isStreaming)
-	nowMs := time.Now().UnixMilli()
+	successFlag := isSuccess
+	failureFlag := !isSuccess
+	streamUpdateFlag := isStreaming && firstByteTime > 0
+	nonStreamUpdateFlag := !isStreaming
 	costMicroUSD := util.USDToMicroUSD(effectiveCostUSD)
+	dayStartMs, monthStartMs := model.AuthTokenCostPeriodStarts(completedAt)
 
-	result, err := s.db.ExecContext(ctx, updateTokenStatsQuery,
+	result, err := s.ExecContext(ctx, updateTokenStatsQuery,
 		successFlag,
 		failureFlag,
 		successFlag, promptTokens,
@@ -715,11 +895,15 @@ func (s *SQLStore) UpdateTokenStats(
 		successFlag, costUSD,
 		successFlag, effectiveCostUSD,
 		successFlag, costMicroUSD,
+		successFlag, dayStartMs, costMicroUSD, dayStartMs, costMicroUSD,
+		successFlag, dayStartMs, dayStartMs,
+		successFlag, monthStartMs, costMicroUSD, monthStartMs, costMicroUSD,
+		successFlag, monthStartMs, monthStartMs,
 		streamUpdateFlag, firstByteTime,
 		streamUpdateFlag,
 		nonStreamUpdateFlag, duration,
 		nonStreamUpdateFlag,
-		nowMs,
+		completedAt.UnixMilli(), completedAt.UnixMilli(),
 		tokenHash,
 	)
 	if err != nil {

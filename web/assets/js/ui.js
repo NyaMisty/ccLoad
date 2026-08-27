@@ -1,3 +1,16 @@
+// 保持公共 UI 在独立加载或旧缓存混用时可用；完整实现由 web-auth.js 覆盖。
+window.WebAuth = window.WebAuth || {
+  ROLE_KEY: 'ccload_web_role',
+  clearWebSession(storage) {
+    storage.removeItem('ccload_token');
+    storage.removeItem('ccload_token_expiry');
+    storage.removeItem('ccload_web_role');
+  },
+  getWebRole() { return 'admin'; },
+  isAPITokenRole() { return false; },
+  filterNavigation(keys) { return [...keys]; }
+};
+
 // ============================================================
 // Token认证工具（统一API调用，替代Cookie Session）
 // ============================================================
@@ -30,8 +43,7 @@
 
     // 检查Token过期（静默跳转，不显示错误提示）
     if (!token || (expiry && Date.now() > parseInt(expiry))) {
-      localStorage.removeItem('ccload_token');
-      localStorage.removeItem('ccload_token_expiry');
+      window.WebAuth.clearWebSession(localStorage);
       window.location.href = getLoginUrl();
       throw new Error('Token expired');
     }
@@ -46,8 +58,7 @@
 
     // 处理401未授权（静默跳转，不显示错误提示）
     if (response.status === 401) {
-      localStorage.removeItem('ccload_token');
-      localStorage.removeItem('ccload_token_expiry');
+      window.WebAuth.clearWebSession(localStorage);
       window.location.href = getLoginUrl();
       throw new Error('Unauthorized');
     }
@@ -57,6 +68,8 @@
 
   // 导出到全局作用域
   window.fetchWithAuth = fetchWithAuth;
+  window.getWebRole = () => window.WebAuth.getWebRole(localStorage);
+  window.isAPITokenRole = () => window.WebAuth.isAPITokenRole(localStorage);
 })();
 
 // ============================================================
@@ -367,7 +380,7 @@
   let _activeWrap = null;        // .brand-icon-wrap 元素
   let _activeBadge = null;       // .brand-badge 元素
   let _faviconBase = null;       // 预加载的 favicon 底图 Image
-  let _origFaviconHref = null;   // 原始 favicon href（用于归零恢复）
+  let _origFaviconLinks = null;  // 页面初始 favicon 集合快照（用于完整恢复）
   let _lastBadgeCount = -1;      // 去重：仅数量变化时重绘 favicon
   const _activeDataListeners = [];  // 订阅者回调列表
   let _lastActiveData = null;       // 最近一次推送的数据（新订阅者立即获得，规避时序竞争）
@@ -376,6 +389,7 @@
   let _activeTitleTimer = null;
   let _activeTitleVisible = false;
   let _activeTitleCount = 0;
+  let _activeTitleEnabled = false;
   let _faviconPulseOn = false;
 
   function brandBadgeLabel(count) {
@@ -386,17 +400,73 @@
     return count > 9 ? '9+' : String(count);
   }
 
-  function getFaviconLink() {
-    let link = document.querySelector('link[rel~="icon"]');
-    if (!link) {
-      link = document.createElement('link');
-      link.rel = 'icon';
-      document.head.appendChild(link);
+  function listFaviconLinks() {
+    if (typeof document.querySelectorAll === 'function') {
+      return Array.from(document.querySelectorAll('link[rel~="icon"]'));
     }
-    if (_origFaviconHref === null) {
-      _origFaviconHref = link.getAttribute('href') || '/web/favicon.svg';
+    const link = typeof document.querySelector === 'function'
+      ? document.querySelector('link[rel~="icon"]')
+      : null;
+    return link ? [link] : [];
+  }
+
+  function snapshotFaviconLink(link) {
+    const href = (link && (link.getAttribute('href') || link.href)) || '';
+    const rel = (link && (link.getAttribute('rel') || link.rel)) || 'icon';
+    const type = link ? (link.getAttribute('type') || link.type || '') : '';
+    const sizes = link ? (link.getAttribute('sizes') || link.sizes || '') : '';
+    return { rel, href, type, sizes };
+  }
+
+  function rememberOriginalFavicons() {
+    if (_origFaviconLinks !== null) return;
+    const links = listFaviconLinks().filter((link) => link.getAttribute('data-dynamic-favicon') !== '1');
+    _origFaviconLinks = links.map(snapshotFaviconLink);
+    if (_origFaviconLinks.length === 0) {
+      _origFaviconLinks = [{ rel: 'icon', href: '/web/favicon.svg', type: 'image/svg+xml', sizes: '' }];
     }
+  }
+
+  function removeFaviconLinks(links) {
+    for (const link of links) {
+      if (!link) continue;
+      if (typeof link.remove === 'function') {
+        link.remove();
+        continue;
+      }
+      if (link.parentNode && typeof link.parentNode.removeChild === 'function') {
+        link.parentNode.removeChild(link);
+      }
+    }
+  }
+
+  function createFaviconLink(descriptor, dynamic = false) {
+    const link = document.createElement('link');
+    link.rel = descriptor.rel || 'icon';
+    if (dynamic) link.setAttribute('data-dynamic-favicon', '1');
+    if (descriptor.type) link.setAttribute('type', descriptor.type);
+    else link.removeAttribute('type');
+    if (descriptor.sizes) link.setAttribute('sizes', descriptor.sizes);
+    else link.removeAttribute('sizes');
+    link.href = descriptor.href;
+    document.head.appendChild(link);
     return link;
+  }
+
+  function replaceFaviconSet(descriptors, dynamic = false) {
+    const existing = listFaviconLinks();
+    removeFaviconLinks(existing);
+    for (const descriptor of descriptors) {
+      createFaviconLink(descriptor, dynamic);
+    }
+  }
+
+  function replaceDynamicFavicon(href, type) {
+    rememberOriginalFavicons();
+    replaceFaviconSet([
+      { rel: 'shortcut icon', href, type, sizes: '' },
+      { rel: 'icon', href, type, sizes: '' }
+    ], true);
   }
 
   // 预加载 favicon 底图（首次异步，之后同步回调）
@@ -441,14 +511,15 @@
     ctx.fillText(text, cx, cy + 1);
 
     try {
-      const link = getFaviconLink();
-      link.removeAttribute('type'); // dataURL 是 PNG，移除原 image/x-icon 声明，交给浏览器内容嗅探
-      link.href = canvas.toDataURL('image/png');
+      replaceDynamicFavicon(canvas.toDataURL('image/png'), 'image/png');
     } catch (_) { /* 编码失败：保持原 favicon */ }
   }
 
   function restoreFavicon() {
-    if (_origFaviconHref !== null) getFaviconLink().href = _origFaviconHref;
+    rememberOriginalFavicons();
+    replaceFaviconSet(_origFaviconLinks || [
+      { rel: 'icon', href: '/web/favicon.svg', type: 'image/svg+xml', sizes: '' }
+    ], false);
   }
 
   function redrawActiveFavicon() {
@@ -485,22 +556,28 @@
     if (_activeTitleBase) document.title = _activeTitleBase;
   }
 
-  function updateActiveTitle(count) {
+  function updateActiveTitle(count, enabled) {
     if (_activeTitleTimer === null) {
       _activeTitleBase = document.title || _activeTitleBase || '';
     }
     _activeTitleCount = count;
+    _activeTitleEnabled = enabled === true;
 
     if (count <= 0) {
       restoreActiveTitle();
       return;
     }
+    if (!_activeTitleEnabled && _activeTitleVisible) {
+      document.title = _activeTitleBase;
+      _activeTitleVisible = false;
+    }
 
     if (_activeTitleTimer === null) {
-      showActiveTitle();
+      if (_activeTitleEnabled) showActiveTitle();
       _activeTitleTimer = setInterval(() => {
         _faviconPulseOn = !_faviconPulseOn;
         redrawActiveFavicon();
+        if (!_activeTitleEnabled) return;
         if (_activeTitleVisible) {
           document.title = _activeTitleBase;
           _activeTitleVisible = false;
@@ -511,10 +588,10 @@
       return;
     }
 
-    if (_activeTitleVisible) showActiveTitle();
+    if (_activeTitleEnabled && _activeTitleVisible) showActiveTitle();
   }
 
-  function updateActiveIndicator(count) {
+  function updateActiveIndicator(count, titleEnabled) {
     _activeTitleCount = count;
     // 页面内 logo：脉冲 + 角标
     if (_activeWrap) {
@@ -532,14 +609,14 @@
         restoreFavicon();
       }
     }
-    updateActiveTitle(count);
+    updateActiveTitle(count, titleEnabled);
   }
 
   async function pollActiveRequests() {
     try {
       const payload = await fetchAPIWithAuth('/admin/active-requests');
       const count = typeof payload.count === 'number' ? payload.count : 0;
-      updateActiveIndicator(count);
+      updateActiveIndicator(count, payload.active_request_title_enabled === true);
       // 推送完整数据给订阅者
       const data = (payload.success && Array.isArray(payload.data)) ? payload.data : [];
       _lastActiveData = data;
@@ -584,13 +661,33 @@
     }
   }
 
+  function createBrandWordmark() {
+    const el = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+    const use = document.createElementNS('http://www.w3.org/2000/svg', 'use');
+    el.setAttribute('viewBox', '0 0 132 36');
+    el.setAttribute('aria-hidden', 'true');
+    el.classList.add('brand-wordmark');
+    use.setAttribute('href', '/web/brand-wordmark.svg#brand-wordmark');
+    use.setAttribute('width', '132');
+    use.setAttribute('height', '36');
+    el.appendChild(use);
+    return el;
+  }
+
   function buildTopbar(active) {
     const bar = h('header', { class: 'topbar' });
 
-    // CC 图标 + 脉冲/角标包装
-    const iconImg = h('img', { class: 'brand-icon', src: '/web/favicon.svg', alt: 'Logo' });
+    // 图标与字标独立复用；活动动画层只属于图标
+    const iconImg = h('img', { class: 'brand-mark', src: '/web/brand-mark.svg', alt: '' });
+    const wordmark = createBrandWordmark();
+    const speedLines = h('span', { class: 'brand-speed-lines', 'aria-hidden': 'true' }, [
+      h('i'), h('i'), h('i'), h('i'), h('i')
+    ]);
+    const flowDots = h('span', { class: 'brand-flow-dots', 'aria-hidden': 'true' }, [
+      h('i'), h('i'), h('i')
+    ]);
     _activeBadge = h('span', { class: 'brand-badge' }, '0');
-    _activeWrap = h('div', { class: 'brand-icon-wrap' }, [iconImg, _activeBadge]);
+    _activeWrap = h('span', { class: 'brand-icon-wrap' }, [speedLines, iconImg, flowDots, _activeBadge]);
 
     const left = h('div', { class: 'topbar-left' }, [
       h('a', {
@@ -598,14 +695,17 @@
         href: GITHUB_REPO_URL,
         target: '_blank',
         rel: 'noopener noreferrer',
-        title: t('nav.githubRepo')
+        title: t('nav.githubRepo'),
+        'aria-label': 'ccLoad — API Load Balancer & Proxy'
       }, [
         _activeWrap,
-        h('div', { class: 'brand-text' }, 'Claude Code & Codex Proxy')
+        wordmark
       ])
     ]);
+    const role = window.getWebRole();
+    const visibleNavKeys = new Set(window.WebAuth.filterNavigation(NAVS.map((item) => item.key), role));
     const nav = h('nav', { class: 'topnav' }, [
-      ...NAVS.map(n => h('a', {
+      ...NAVS.filter((item) => visibleNavKeys.has(item.key)).map(n => h('a', {
         class: `topnav-link ${n.key === active ? 'active' : ''}`,
         href: n.href,
         'data-nav-key': n.key
@@ -707,8 +807,7 @@
 
     // 先清理本地Token，避免后续请求触发token检查
     const token = localStorage.getItem('ccload_token');
-    localStorage.removeItem('ccload_token');
-    localStorage.removeItem('ccload_token_expiry');
+    window.WebAuth.clearWebSession(localStorage);
 
     // 如果有token，尝试调用后端登出接口（使用普通fetch，不触发token检查）
     if (token) {
@@ -749,6 +848,7 @@
 
   window.initTopbar = function initTopbar(activeKey) {
     document.body.classList.add('top-layout');
+    document.body.classList.toggle('web-role-api-token', window.isAPITokenRole());
     const app = document.querySelector('.app-container') || document.body;
     // 隐藏侧边栏与移动按钮
     const sidebar = document.getElementById('sidebar');
@@ -767,7 +867,7 @@
     initVersionDisplay();
 
     // 启动活动请求指示器轮询
-    if (isLoggedIn()) startActiveRequestsPolling();
+    if (isLoggedIn() && !window.isAPITokenRole()) startActiveRequestsPolling();
   }
 
   // 供其他模块订阅活动请求数据（全站唯一轮询源，避免重复请求）
@@ -805,31 +905,33 @@
       max-width: 360px;
       box-shadow: 0 10px 25px rgba(0,0,0,0.12);
       overflow: hidden;
+      overflow-wrap: anywhere;
+      white-space: pre-wrap;
       isolation: isolate;
       pointer-events: auto;
     `;
     if (type === 'success') {
-      // 高可读：浅底深字
-      el.style.background = 'var(--success-50)';
-      el.style.color = 'var(--success-600)';
-      el.style.borderColor = 'var(--success-500)';
+      el.style.background = 'var(--notification-success-bg)';
+      el.style.color = 'var(--notification-success-fg)';
+      el.style.borderColor = 'var(--notification-success-border)';
       el.style.boxShadow = '0 6px 28px rgba(16,185,129,0.18)';
     } else if (type === 'error') {
-      el.style.background = 'var(--error-50)';
-      el.style.color = 'var(--error-600)';
-      el.style.borderColor = 'var(--error-500)';
+      el.style.background = 'var(--notification-error-bg)';
+      el.style.color = 'var(--notification-error-fg)';
+      el.style.borderColor = 'var(--notification-error-border)';
       el.style.boxShadow = '0 6px 28px rgba(239,68,68,0.18)';
     } else if (type === 'warning') {
-      el.style.background = 'var(--warning-50)';
-      el.style.color = 'var(--warning-700)';
-      el.style.borderColor = 'var(--warning-500)';
+      el.style.background = 'var(--notification-warning-bg)';
+      el.style.color = 'var(--notification-warning-fg)';
+      el.style.borderColor = 'var(--notification-warning-border)';
       el.style.boxShadow = '0 6px 28px rgba(245,158,11,0.18)';
     } else if (type === 'info') {
-      el.style.background = 'var(--info-50)';
-      el.style.color = 'var(--neutral-800)';
-      el.style.borderColor = 'rgba(0,0,0,0.08)';
+      el.style.background = 'var(--notification-info-bg)';
+      el.style.color = 'var(--notification-info-fg)';
+      el.style.borderColor = 'var(--notification-info-border)';
     }
     el.textContent = message;
+    el.setAttribute('role', type === 'error' ? 'alert' : 'status');
     const host = ensureNotifyHost();
     host.appendChild(el);
     requestAnimationFrame(() => { el.style.opacity = '1'; el.style.transform = 'translateX(0)'; });
@@ -844,80 +946,71 @@
 })();
 
 // ============================================================
-// 渠道类型管理模块（动态加载配置，单一数据源）
+// 协议配置管理模块（动态加载配置，单一数据源）
 // ============================================================
 (function () {
-  let channelTypesCache = null;
+  let protocolsCache = null;
 
   // 复用公共工具（DRY）：真实实现由下方公共工具模块导出到 window.escapeHtml
   const escapeHtml = (str) => window.escapeHtml(str);
 
-  /**
-   * 获取渠道类型配置（带缓存）
-   */
-  async function getChannelTypes() {
-    if (channelTypesCache) {
-      return channelTypesCache;
-    }
+  // 协议显示名由 locales 提供（与 model-test.js 共用词条）
+  const PROTOCOL_LABEL_KEYS = {
+    anthropic: 'modelTest.clientProtocolAnthropic',
+    codex: 'modelTest.clientProtocolCodex',
+    openai: 'modelTest.clientProtocolOpenAI',
+    gemini: 'modelTest.clientProtocolGemini'
+  };
 
-    const types = await fetchData('/public/channel-types');
-    channelTypesCache = types || [];
-    return channelTypesCache;
+  function protocolDisplayName(value) {
+    const key = PROTOCOL_LABEL_KEYS[value];
+    const label = key && typeof window.t === 'function' ? window.t(key) : '';
+    return label && label !== key ? label : value;
   }
 
   /**
-   * 渲染渠道类型单选按钮组（用于编辑渠道界面）
-   * @param {string} containerId - 容器元素ID
-   * @param {string} selectedValue - 选中的值（默认'anthropic'）
+   * 获取协议列表（带缓存）。后端返回协议名数组，显示名由前端 locales 补齐。
+   * @returns {Promise<Array<{value: string, display_name: string}>>}
    */
-  async function renderChannelTypeRadios(containerId, selectedValue = 'anthropic') {
-    const container = document.getElementById(containerId);
-    if (!container) {
-      console.error('Container element not found:', containerId);
-      return;
+  async function getProtocols() {
+    if (protocolsCache) {
+      return protocolsCache;
     }
 
-    const types = await getChannelTypes();
-
-    container.innerHTML = types.map(type => `
-      <label class="channel-editor-radio-option">
-        <input type="radio"
-               name="channelType"
-               value="${escapeHtml(type.value)}"
-               ${type.value === selectedValue ? 'checked' : ''}>
-        <span title="${escapeHtml(type.description)}">${escapeHtml(type.display_name)}</span>
-      </label>
-    `).join('');
+    const values = await fetchData('/public/protocols');
+    protocolsCache = (Array.isArray(values) ? values : []).map(value => ({
+      value,
+      display_name: protocolDisplayName(value)
+    }));
+    return protocolsCache;
   }
 
   /**
-   * 渲染渠道类型下拉选择框（用于测试渠道界面）
+   * 渲染协议下拉选择框
    * @param {string} selectId - select元素ID
    * @param {string} selectedValue - 选中的值（默认'anthropic'）
    */
-  async function renderChannelTypeSelect(selectId, selectedValue = 'anthropic') {
+  async function renderProtocolSelect(selectId, selectedValue = 'anthropic') {
     const select = document.getElementById(selectId);
     if (!select) {
       console.error('select element not found:', selectId);
       return;
     }
 
-    const types = await getChannelTypes();
+    const protocols = await getProtocols();
 
-    select.innerHTML = types.map(type => `
-      <option value="${escapeHtml(type.value)}"
-              ${type.value === selectedValue ? 'selected' : ''}
-              title="${escapeHtml(type.description)}">
-        ${escapeHtml(type.display_name)}
+    select.innerHTML = protocols.map(protocol => `
+      <option value="${escapeHtml(protocol.value)}"
+              ${protocol.value === selectedValue ? 'selected' : ''}>
+        ${escapeHtml(protocol.display_name)}
       </option>
     `).join('');
   }
 
   // 导出到全局作用域
-  window.ChannelTypeManager = {
-    getChannelTypes,
-    renderChannelTypeRadios,
-    renderChannelTypeSelect
+  window.ProtocolManager = {
+    getProtocols,
+    renderProtocolSelect
   };
 })();
 
@@ -1022,6 +1115,13 @@
     const run = typeof options.run === 'function' ? options.run : () => {};
 
     const execute = async () => {
+	  const session = await window.fetchDataWithAuth('/dashboard/session');
+	  if (session && session.role) localStorage.setItem(window.WebAuth.ROLE_KEY, session.role);
+	  const restrictedPages = new Set(['channels', 'tokens', 'settings']);
+	  if (window.isAPITokenRole() && restrictedPages.has(options.topbarKey)) {
+	    window.location.replace('/web/index.html');
+	    return;
+	  }
       if (options.translate !== false && window.i18n && typeof window.i18n.translatePage === 'function') {
         window.i18n.translatePage();
       }
@@ -1165,6 +1265,10 @@
   async function initAuthTokenFilter(options = {}) {
     const selectId = options.selectId;
     if (!selectId) return [];
+
+    if (window.isAPITokenRole()) {
+      return [];
+    }
 
     if (Array.isArray(options.preloadedTokens)) {
       fillAuthTokenSelect(selectId, options.preloadedTokens, options.loadOptions);
@@ -1412,6 +1516,7 @@
   const AUTO_REFRESH_CACHE_TTL_MS = 60 * 1000;
 
   async function fetchAutoRefreshIntervalSec() {
+    if (window.isAPITokenRole()) return 0;
     try {
       const cached = window.sessionStorage?.getItem(AUTO_REFRESH_CACHE_KEY);
       if (cached) {
@@ -1533,6 +1638,7 @@
    * @param {boolean} [config.attachMode] - 附着模式，使用已存在的 HTML 元素
    * @param {boolean} [config.allowCustomInput] - 允许提交非下拉选项的自定义输入
    * @param {boolean} [config.commitEmptyAsFirst] - 输入为空回车/失焦时提交第一项（通常为“全部”），覆盖默认的取消/恢复行为
+   * @param {boolean} [config.showAllOptionsOnOpen] - 打开时先展示完整选项，开始输入后再按关键字过滤
    * @returns {Object} 组件实例
    */
   function createSearchableCombobox(config) {
@@ -1549,7 +1655,8 @@
       minWidth = 150,
       attachMode = false,
       allowCustomInput = false,
-      commitEmptyAsFirst = false
+      commitEmptyAsFirst = false,
+      showAllOptionsOnOpen = false
     } = config;
 
     let input, dropdown, wrapper, dropdownHome, container = null;
@@ -1597,6 +1704,13 @@
       dropdownHome = dropdown.parentElement;
     }
 
+    input.setAttribute('role', 'combobox');
+    input.setAttribute('aria-autocomplete', 'list');
+    input.setAttribute('aria-haspopup', 'listbox');
+    input.setAttribute('aria-controls', dropdown.id);
+    input.setAttribute('aria-expanded', 'false');
+    dropdown.setAttribute('role', 'listbox');
+
     let activeIndex = -1;
     let outsideHandler = null;
     let repositionHandler = null;
@@ -1618,6 +1732,8 @@
     function closeDropdown() {
       dropdown.style.display = 'none';
       dropdown.dataset.open = '0';
+      input.setAttribute('aria-expanded', 'false');
+      input.removeAttribute('aria-activedescendant');
       activeIndex = -1;
       clearOutsideHandler();
       clearRepositionHandler();
@@ -1631,6 +1747,7 @@
       input.dataset.pickActive = '1';
       input.dataset.prevInputValue = input.value;
       input.dataset.prevValue = currentValue;
+      delete input.dataset.pickEdited;
       // 非自定义输入模式始终清空；自定义输入模式下：
       // - 当前值为空（全量态）→ 清空，避免把“所有渠道”这类占位标签当成过滤关键字
       // - 当前值精确命中下拉选项（用户已从下拉选中而非输入自定义词）→ 清空，便于再次浏览全部选项
@@ -1671,6 +1788,7 @@
       delete input.dataset.pickActive;
       delete input.dataset.prevInputValue;
       delete input.dataset.prevValue;
+      delete input.dataset.pickEdited;
 
       closeDropdown();
       if (onCancel) onCancel();
@@ -1683,6 +1801,7 @@
       delete input.dataset.pickActive;
       delete input.dataset.prevInputValue;
       delete input.dataset.prevValue;
+      delete input.dataset.pickEdited;
 
       closeDropdown();
       if (onSelect) onSelect(value, label);
@@ -1737,8 +1856,11 @@
     }
 
     function getDropdownItems() {
-      const keyword = input.value.trim().toLowerCase();
       const allOptions = getOptions();
+      if (showAllOptionsOnOpen && input.dataset.pickActive === '1' && input.dataset.pickEdited !== '1') {
+        return allOptions;
+      }
+      const keyword = input.value.trim().toLowerCase();
       if (!keyword) return allOptions;
       return allOptions.filter(opt =>
         String(opt.label).toLowerCase().includes(keyword) ||
@@ -1759,6 +1881,7 @@
         const row = document.createElement('div');
         row.className = 'filter-dropdown-item';
         row.setAttribute('role', 'option');
+        row.id = `${dropdown.id}-option-${idx}`;
         row.dataset.value = item.value;
         row.dataset.index = String(idx);
         row.textContent = item.label;
@@ -1766,7 +1889,9 @@
           row.classList.add(...String(item.className).split(/\s+/).filter(Boolean));
         }
 
-        if (item.value === currentValue) row.classList.add('selected');
+        const selected = item.value === currentValue;
+        row.setAttribute('aria-selected', selected ? 'true' : 'false');
+        if (selected) row.classList.add('selected');
         if (idx === activeIndex) row.classList.add('active');
 
         row.addEventListener('mousedown', (e) => {
@@ -1777,6 +1902,12 @@
 
         dropdown.appendChild(row);
       });
+
+      if (activeIndex >= 0 && activeIndex < items.length) {
+        input.setAttribute('aria-activedescendant', `${dropdown.id}-option-${activeIndex}`);
+      } else {
+        input.removeAttribute('aria-activedescendant');
+      }
     }
 
     function positionDropdown() {
@@ -1801,6 +1932,7 @@
       }
       dropdown.style.display = 'block';
       dropdown.dataset.open = '1';
+      input.setAttribute('aria-expanded', 'true');
       renderDropdown();
       positionDropdown();
 
@@ -1836,8 +1968,12 @@
     });
 
     input.addEventListener('input', () => {
-      if (dropdown.dataset.open !== '1') {
+      const wasClosed = dropdown.dataset.open !== '1';
+      if (wasClosed) {
         beginPick();
+      }
+      input.dataset.pickEdited = '1';
+      if (wasClosed) {
         openDropdown();
       }
       activeIndex = -1;
@@ -1935,34 +2071,42 @@
    * @param {string} text - 要复制的文本
    * @returns {Promise<void>}
    */
-  function fallbackCopyToClipboard(text) {
+  function copyWithSelection(text) {
     const ta = document.createElement('textarea');
     ta.value = text;
     ta.style.position = 'fixed';
     ta.style.left = '-9999px';
-    document.body.appendChild(ta);
+    ta.tabIndex = -1;
+    const dialogs = typeof document.querySelectorAll === 'function'
+      ? document.querySelectorAll('dialog[open]')
+      : [];
+    const host = dialogs.length > 0 ? dialogs[dialogs.length - 1] : document.body;
+    const previousFocus = document.activeElement;
+    host.appendChild(ta);
     ta.select();
+    ta.setSelectionRange?.(0, ta.value.length);
 
     try {
-      const copied = typeof document.execCommand === 'function' && document.execCommand('copy');
-      if (!copied) {
-        throw new Error('copy failed');
-      }
+      return typeof document.execCommand === 'function' && document.execCommand('copy');
     } catch {
-      document.body.removeChild(ta);
-      return Promise.reject(new Error('copy failed'));
+      return false;
+    } finally {
+      host.removeChild(ta);
+      previousFocus?.focus?.({ preventScroll: true });
     }
-
-    document.body.removeChild(ta);
-    return Promise.resolve();
   }
 
   function copyToClipboard(text) {
+    // 必须在点击事件的同步调用栈内执行，异步 Clipboard API 被拒绝后
+    // 再降级会丢失 user activation，浏览器仍会拦截复制。
+    if (typeof document.execCommand === 'function' && copyWithSelection(text)) {
+      return Promise.resolve();
+    }
     const clipboard = globalThis.navigator && globalThis.navigator.clipboard;
     if (clipboard && typeof clipboard.writeText === 'function') {
-      return clipboard.writeText(text).catch(() => fallbackCopyToClipboard(text));
+      return clipboard.writeText(text);
     }
-    return fallbackCopyToClipboard(text);
+    return Promise.reject(new Error('copy failed'));
   }
 
   function escapeCodeHtml(str) {
@@ -2262,31 +2406,9 @@
     });
   }
 
-  /**
-   * 初始化渠道类型筛选下拉框
-   * @param {string} selectId - select 元素 ID
-   * @param {string} initialType - 初始选中的类型
-   * @param {function(string)} onChange - 选中值变更回调
-   */
-  async function initChannelTypeFilter(selectId, initialType, onChange) {
-    const select = document.getElementById(selectId);
-    if (!select) return;
-
-    const types = await window.ChannelTypeManager.getChannelTypes();
-    select.innerHTML = `<option value="all">${window.t('common.all')}</option>`;
-    types.forEach(type => {
-      const option = document.createElement('option');
-      option.value = type.value;
-      option.textContent = type.display_name;
-      if (type.value === initialType) option.selected = true;
-      select.appendChild(option);
-    });
-
-    select.addEventListener('change', (e) => onChange(e.target.value));
-  }
-
   async function loadAuthTokensIntoSelect(selectId, opts) {
     const o = opts || {};
+	if (window.isAPITokenRole()) return [];
     try {
       const data = await fetchDataWithAuth('/admin/auth-tokens');
       const tokens = (data && data.tokens) || [];
@@ -2393,7 +2515,6 @@
   window.copyToClipboard = copyToClipboard;
   window.renderUpstreamCodeBlock = renderUpstreamCodeBlock;
   window.setHighlightedCodeContent = setHighlightedCodeContent;
-  window.initChannelTypeFilter = initChannelTypeFilter;
   window.loadAuthTokensIntoSelect = loadAuthTokensIntoSelect;
   window.initTimeRangeSelector = initTimeRangeSelector;
   window.bindTimeRangeSelector = bindTimeRangeSelector;

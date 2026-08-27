@@ -5,10 +5,8 @@ import (
 	"time"
 
 	"ccLoad/internal/model"
+	"ccLoad/internal/util"
 )
-
-// ErrSettingNotFound 系统设置未找到错误（重导出自 model 包以保持兼容性）
-var ErrSettingNotFound = model.ErrSettingNotFound
 
 // Store 数据持久化接口
 // [REFACTOR] 2025-12：合并子接口，所有方法平铺
@@ -19,12 +17,16 @@ type Store interface {
 	GetConfig(ctx context.Context, id int64) (*model.Config, error)
 	CreateConfig(ctx context.Context, c *model.Config) (*model.Config, error)
 	UpdateConfig(ctx context.Context, id int64, upd *model.Config) (*model.Config, error)
+	CompareAndSwapOAuthCredential(ctx context.Context, channelID int64, expectedAuthType, expectedCredential, nextCredential string) (bool, error)
+	ResetOAuthQuotaCostUsage(ctx context.Context, channelID int64, resetAt time.Time) error
+	DisableOAuthChannelIfCredentialMatches(ctx context.Context, channelID int64, expectedAuthType, expectedCredential string) (bool, error)
+	DisableConfigIfOAuthSnapshotMatches(ctx context.Context, expected *model.Config) (bool, error)
+	DeleteConfigIfOAuthSnapshotMatches(ctx context.Context, expected *model.Config) (bool, error)
+	UpdateOAuthModelStateIfCredentialMatches(ctx context.Context, channelID int64, expectedAuthType, expectedCredential string, modelEntries []model.ModelEntry, scheduledCheckModel string) (bool, error)
 	UpdateChannelEnabled(ctx context.Context, id int64, enabled bool) (*model.Config, error)
+	BatchPatchConfigs(ctx context.Context, channelIDs []int64, patch model.BatchConfigPatch) (model.BatchConfigPatchResult, error)
 	DeleteConfig(ctx context.Context, id int64) error
 	GetEnabledChannelsByModel(ctx context.Context, modelName string) ([]*model.Config, error)
-	GetEnabledChannelsByModelAndProtocol(ctx context.Context, modelName, protocol string) ([]*model.Config, error)
-	GetEnabledChannelsByType(ctx context.Context, channelType string) ([]*model.Config, error)
-	GetEnabledChannelsByExposedProtocol(ctx context.Context, protocol string) ([]*model.Config, error)
 	BatchUpdatePriority(ctx context.Context, updates []struct {
 		ID       int64
 		Priority int
@@ -49,16 +51,23 @@ type Store interface {
 	DeleteAllAPIKeys(ctx context.Context, channelID int64) error
 
 	// === Cooldown Management ===
+	ConfigureCooldown(settings util.CooldownSettings)
 	// Channel-level cooldown
 	GetAllChannelCooldowns(ctx context.Context) (map[int64]time.Time, error)
 	BumpChannelCooldown(ctx context.Context, channelID int64, now time.Time, statusCode int) (time.Duration, error)
 	ResetChannelCooldown(ctx context.Context, channelID int64) error
+	ResetAllCooldowns(ctx context.Context, channelID int64) error
 	SetChannelCooldown(ctx context.Context, channelID int64, until time.Time) error
 	// Key-level cooldown
 	GetAllKeyCooldowns(ctx context.Context) (map[int64]map[int]time.Time, error)
 	BumpKeyCooldown(ctx context.Context, channelID int64, keyIndex int, now time.Time, statusCode int) (time.Duration, error)
 	ResetKeyCooldown(ctx context.Context, channelID int64, keyIndex int) error
 	SetKeyCooldown(ctx context.Context, channelID int64, keyIndex int, until time.Time) error
+	// Model-level cooldown
+	GetAllModelCooldowns(ctx context.Context) (map[int64]map[string]time.Time, error)
+	BumpModelCooldown(ctx context.Context, channelID int64, model string, now time.Time, statusCode int) (time.Duration, error)
+	SetModelCooldown(ctx context.Context, channelID int64, model string, until time.Time) error
+	ResetModelCooldown(ctx context.Context, channelID int64, model string) error
 
 	// === Log Management ===
 	AddLog(ctx context.Context, e *model.LogEntry) error
@@ -74,15 +83,17 @@ type Store interface {
 	// === Debug Log Management ===
 	AddDebugLog(ctx context.Context, e *model.DebugLogEntry) error
 	GetDebugLogByLogID(ctx context.Context, logID int64) (*model.DebugLogEntry, error)
-	CleanupDebugLogsBefore(ctx context.Context, cutoff time.Time) error
+	CleanupDebugLogsBatch(ctx context.Context, cutoff time.Time, limit int) (int64, error)
 	TruncateDebugLogs(ctx context.Context) error
 
 	// === Metrics & Statistics ===
 	AggregateRangeWithFilter(ctx context.Context, since, until time.Time, bucket time.Duration, filter *model.LogFilter) ([]model.MetricPoint, error)
-	GetDistinctModels(ctx context.Context, since, until time.Time, channelType string, filter *model.LogFilter) ([]string, error)
-	GetDistinctChannels(ctx context.Context, since, until time.Time, channelType string, filter *model.LogFilter) ([]model.ChannelNameID, error)
+	GetDistinctModels(ctx context.Context, since, until time.Time, filter *model.LogFilter) ([]string, error)
+	GetDistinctStatusCodes(ctx context.Context, since, until time.Time, filter *model.LogFilter) ([]int, error)
+	GetDistinctChannels(ctx context.Context, since, until time.Time, filter *model.LogFilter) ([]model.ChannelNameID, error)
 	GetStats(ctx context.Context, startTime, endTime time.Time, filter *model.LogFilter, isToday bool) ([]model.StatsEntry, error)
 	GetStatsLite(ctx context.Context, startTime, endTime time.Time, filter *model.LogFilter) ([]model.StatsEntry, error) // 轻量版：跳过RPM计算和渠道名填充
+	GetClientProtocolStats(ctx context.Context, startTime, endTime time.Time, filter *model.LogFilter) ([]model.ClientProtocolStats, error)
 	GetRPMStats(ctx context.Context, startTime, endTime time.Time, filter *model.LogFilter, isToday bool) (*model.RPMStats, error)
 	GetChannelSuccessRates(ctx context.Context, since time.Time) (map[int64]model.ChannelHealthStats, error)
 	GetHealthTimeline(ctx context.Context, params model.HealthTimelineParams) ([]model.HealthTimelineRow, error)
@@ -98,22 +109,23 @@ type Store interface {
 	UpdateAuthToken(ctx context.Context, token *model.AuthToken) error
 	DeleteAuthToken(ctx context.Context, id int64) error
 	UpdateTokenLastUsed(ctx context.Context, tokenHash string, now time.Time) error
-	UpdateTokenStats(ctx context.Context, tokenHash string, isSuccess bool, duration float64, isStreaming bool, firstByteTime float64, promptTokens int64, completionTokens int64, cacheReadTokens int64, cacheCreationTokens int64, costUSD float64, effectiveCostUSD float64) error
+	UpdateTokenStats(ctx context.Context, tokenHash string, isSuccess bool, duration float64, isStreaming bool, firstByteTime float64, promptTokens int64, completionTokens int64, cacheReadTokens int64, cacheCreationTokens int64, costUSD float64, effectiveCostUSD float64, completedAt time.Time) error
 	GetAuthTokenStatsInRange(ctx context.Context, startTime, endTime time.Time) (map[int64]*model.AuthTokenRangeStats, error)
 	FillAuthTokenRPMStats(ctx context.Context, stats map[int64]*model.AuthTokenRangeStats, startTime, endTime time.Time, isToday bool) error
+
+	// === Web Session Management ===
+	CreateWebSession(ctx context.Context, token string, session model.WebSession) error
+	GetWebSession(ctx context.Context, token string) (model.WebSession, bool, error)
+	DeleteWebSession(ctx context.Context, token string) error
+	DeleteWebSessionsByAuthTokenID(ctx context.Context, authTokenID int64) error
+	CleanExpiredWebSessions(ctx context.Context) error
+	LoadWebSessions(ctx context.Context) (map[string]model.WebSession, error)
 
 	// === System Settings ===
 	GetSetting(ctx context.Context, key string) (*model.SystemSetting, error)
 	ListAllSettings(ctx context.Context) ([]*model.SystemSetting, error)
 	UpdateSetting(ctx context.Context, key, value string) error
 	BatchUpdateSettings(ctx context.Context, updates map[string]string) error
-
-	// === Admin Session Management ===
-	CreateAdminSession(ctx context.Context, token string, expiresAt time.Time) error
-	GetAdminSession(ctx context.Context, token string) (expiresAt time.Time, exists bool, err error)
-	DeleteAdminSession(ctx context.Context, token string) error
-	CleanExpiredSessions(ctx context.Context) error
-	LoadAllSessions(ctx context.Context) (map[string]time.Time, error)
 
 	// === Batch Operations ===
 	ImportChannelBatch(ctx context.Context, channels []*model.ChannelWithKeys) (created, updated int, err error)

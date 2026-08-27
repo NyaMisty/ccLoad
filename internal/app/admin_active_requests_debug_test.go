@@ -1,6 +1,7 @@
 package app
 
 import (
+	"errors"
 	"io"
 	"net/http"
 	"strconv"
@@ -9,16 +10,26 @@ import (
 	"time"
 
 	"ccLoad/internal/model"
+	"ccLoad/internal/storage"
 
 	"github.com/gin-gonic/gin"
 )
+
+type runtimeMetricsStore struct {
+	storage.Store
+	metrics storage.HybridRuntimeMetrics
+}
+
+func (s *runtimeMetricsStore) RuntimeMetrics() storage.HybridRuntimeMetrics {
+	return s.metrics
+}
 
 func TestHandleActiveRequests_ExposesDebugAvailability(t *testing.T) {
 	t.Parallel()
 
 	srv := newInMemoryServer(t)
 	m := newActiveRequestManager()
-	id := m.Register(time.Now(), "claude-3-opus", "1.2.3.4", true)
+	id := beginTestActiveRequest(m, time.Now(), "claude-3-opus", "1.2.3.4", true)
 	m.SetDebugCapture(id, &debugCapture{})
 
 	srv.activeRequests = m
@@ -47,6 +58,182 @@ func TestHandleActiveRequests_ExposesDebugAvailability(t *testing.T) {
 	}
 	if got, ok := value.(bool); !ok || !got {
 		t.Fatalf("debug_log_available=%v, want true", value)
+	}
+}
+
+func TestHandleRuntimeMetricsExposesRuntimeResources(t *testing.T) {
+	srv := newInMemoryServer(t)
+	srv.startedAt = time.Now().Add(-2 * time.Minute)
+	srv.maxConcurrency = 3
+	srv.concurrencySem = make(chan struct{}, srv.maxConcurrency)
+	srv.concurrencySem <- struct{}{}
+	srv.logService.logDropCount.Store(4)
+	srv.logService.logFailCount.Store(5)
+	srv.store = &runtimeMetricsStore{
+		Store: srv.store,
+		metrics: storage.HybridRuntimeMetrics{
+			SQLiteReadFailures:     2,
+			AnalyticsReadsPrimary:  true,
+			PrimarySyncPending:     7,
+			PrimarySyncFailures:    3,
+			PrimarySyncDropped:     1,
+			PrimarySyncLastSuccess: 123456,
+		},
+	}
+	srv.responsesWebsocketConnections = newResponsesWebsocketConnectionLimiter(1, 1)
+	releaseConnection, limit := srv.responsesWebsocketConnections.acquire("token-a")
+	if limit != nil {
+		t.Fatalf("acquire downstream websocket connection: %+v", limit)
+	}
+	defer releaseConnection()
+	if _, rejected := srv.responsesWebsocketConnections.acquire("token-a"); rejected == nil {
+		t.Fatal("expected per-token downstream websocket rejection")
+	}
+
+	expired, releaseExpired, err := srv.responsesExecutionSessions.acquire("token-a", "expired-session")
+	if err != nil {
+		t.Fatalf("acquire expiring execution session: %v", err)
+	}
+	releaseExpired()
+	srv.responsesExecutionSessions.cleanup(time.Now().Add(srv.responsesExecutionSessions.sessionTTL() + time.Second))
+	if expired == nil {
+		t.Fatal("expected expiring execution session")
+	}
+
+	srv.configService.mu.Lock()
+	srv.configService.cache["responses_ws_max_sessions"] = &model.SystemSetting{
+		Key: "responses_ws_max_sessions", Value: "1",
+	}
+	srv.configService.mu.Unlock()
+	session, release, err := srv.responsesExecutionSessions.acquire("token-a", "session-a")
+	if err != nil {
+		t.Fatalf("acquire execution session: %v", err)
+	}
+	defer release()
+	if _, _, errCapacity := srv.responsesExecutionSessions.acquire("token-b", "session-b"); !errors.Is(errCapacity, errResponsesExecutionSessionCapacity) {
+		t.Fatalf("capacity rejection error=%v", errCapacity)
+	}
+	srv.responsesExecutionSessions.commit(session, []byte(`{}`), responsesWebsocketTurnResult{completedOutput: []byte(`[]`)})
+	srv.configService.mu.Lock()
+	srv.configService.cache["responses_ws_max_transcript_bytes"] = &model.SystemSetting{
+		Key: "responses_ws_max_transcript_bytes", Value: "1",
+	}
+	srv.configService.mu.Unlock()
+	if _, _, errBudget := srv.responsesExecutionSessions.acquire("token-b", "session-b"); !errors.Is(errBudget, errResponsesExecutionSessionTranscriptBudget) {
+		t.Fatalf("budget rejection error=%v", errBudget)
+	}
+	srv.responsesExecutionSessions.recordPreviousResponseMiss(session, "resp-stale", true)
+	session.upstream.recordReconnect("test reconnect")
+
+	c, w := newTestContext(t, newRequest(http.MethodGet, "/admin/runtime-metrics", nil))
+	srv.HandleRuntimeMetrics(c)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status=%d, want 200; body=%s", w.Code, w.Body.String())
+	}
+
+	resp := mustParseAPIResponse[map[string]any](t, w.Body.Bytes())
+	processMetrics, ok := resp.Data["process"].(map[string]any)
+	if !ok {
+		t.Fatalf("process metrics missing: %#v", resp.Data)
+	}
+	if processMetrics["concurrency_slots_in_use"] != float64(1) ||
+		processMetrics["max_concurrency"] != float64(3) {
+		t.Fatalf("unexpected process load metrics: %#v", processMetrics)
+	}
+	for _, key := range []string{"version", "started_at_unix_ms"} {
+		if _, exists := processMetrics[key]; exists {
+			t.Fatalf("%s should be removed from process metrics: %#v", key, processMetrics)
+		}
+	}
+	if uptime, okUptime := processMetrics["uptime_seconds"].(float64); !okUptime || uptime < 119 {
+		t.Fatalf("unexpected process uptime: %#v", processMetrics)
+	}
+	for _, key := range []string{"goroutines", "heap_alloc_bytes", "heap_sys_bytes"} {
+		if value, okValue := processMetrics[key].(float64); !okValue || value <= 0 {
+			t.Fatalf("%s=%v, want positive runtime metric; metrics=%#v", key, processMetrics[key], processMetrics)
+		}
+	}
+	// CPU/RSS/GC 指标存在且非负;RSS 与 CPU 的具体值依赖平台,只验证契约
+	for _, key := range []string{
+		"cpu_usage_percent", "cpu_user_seconds", "cpu_system_seconds",
+		"rss_bytes", "max_rss_bytes", "gc_count", "gc_pause_total_ns", "gc_cpu_percent",
+	} {
+		if value, okValue := processMetrics[key].(float64); !okValue || value < 0 {
+			t.Fatalf("%s=%v, want non-negative runtime metric; metrics=%#v", key, processMetrics[key], processMetrics)
+		}
+	}
+	httpMetrics, ok := resp.Data["http_proxy"].(map[string]any)
+	if !ok {
+		t.Fatalf("http proxy metrics missing: %#v", resp.Data)
+	}
+	for _, key := range []string{
+		"active_requests", "completed_requests", "non_error_responses",
+		"client_error_responses", "server_error_responses", "streaming_requests",
+		"non_streaming_requests", "request_body_bytes", "response_body_bytes",
+	} {
+		if httpMetrics[key] != float64(0) {
+			t.Fatalf("http %s=%v, want 0; metrics=%#v", key, httpMetrics[key], httpMetrics)
+		}
+	}
+	ws, ok := resp.Data["responses_websocket"].(map[string]any)
+	if !ok {
+		t.Fatalf("responses_websocket metrics missing: %#v", resp.Data)
+	}
+	if ws["sessions"] != float64(1) || ws["active_attachments"] != float64(1) || ws["transcript_bytes"] != float64(4) {
+		t.Fatalf("unexpected websocket resource metrics: %#v", ws)
+	}
+	if ws["reconnects"] != float64(1) {
+		t.Fatalf("websocket reconnect metric missing: %#v", ws)
+	}
+	if ws["max_sessions"] != float64(1) {
+		t.Fatalf("websocket limits missing: %#v", ws)
+	}
+	if ws["max_transcript_bytes"] != float64(1) {
+		t.Fatalf("websocket transcript budget missing: %#v", ws)
+	}
+	for key, want := range map[string]float64{
+		"ttl_expired":              1,
+		"capacity_rejected":        1,
+		"budget_rejected":          1,
+		"previous_response_misses": 1,
+	} {
+		if ws[key] != want {
+			t.Fatalf("%s=%v, want %v; metrics=%#v", key, ws[key], want, ws)
+		}
+	}
+	if ws["downstream_connections"] != float64(1) ||
+		ws["rejected_downstream_connections"] != float64(1) ||
+		ws["max_downstream_connections"] != float64(1) ||
+		ws["max_downstream_connections_per_token"] != float64(1) {
+		t.Fatalf("downstream websocket metrics missing: %#v", ws)
+	}
+	for _, key := range []string{
+		"upstream_handshakes",
+		"upstream_reuses",
+		"upstream_heartbeat_failures",
+		"upstream_queued_read_bytes",
+		"oldest_upstream_connection_seconds",
+	} {
+		if _, exists := ws[key]; !exists {
+			t.Fatalf("%s metric missing: %#v", key, ws)
+		}
+	}
+	storageMetrics, ok := resp.Data["storage"].(map[string]any)
+	if !ok {
+		t.Fatalf("storage metrics missing: %#v", resp.Data)
+	}
+	if storageMetrics["sqlite_read_failures"] != float64(2) || storageMetrics["analytics_reads_primary"] != true {
+		t.Fatalf("unexpected storage metrics: %#v", storageMetrics)
+	}
+	if storageMetrics["primary_sync_pending"] != float64(7) ||
+		storageMetrics["primary_sync_failures"] != float64(3) ||
+		storageMetrics["primary_sync_dropped"] != float64(1) ||
+		storageMetrics["primary_sync_last_success_unix_ms"] != float64(123456) {
+		t.Fatalf("unexpected primary sync metrics: %#v", storageMetrics)
+	}
+	logMetrics, ok := resp.Data["logs"].(map[string]any)
+	if !ok || logMetrics["dropped_entries"] != float64(4) || logMetrics["persistence_failed_entries"] != float64(5) {
+		t.Fatalf("unexpected log metrics: %#v", logMetrics)
 	}
 }
 
@@ -90,7 +277,7 @@ func TestHandleGetActiveRequestDebugLog_ReturnsLiveSnapshot(t *testing.T) {
 	}
 
 	m := newActiveRequestManager()
-	id := m.Register(time.Now(), "claude-3-opus", "1.2.3.4", true)
+	id := beginTestActiveRequest(m, time.Now(), "claude-3-opus", "1.2.3.4", true)
 	m.SetDebugCapture(id, dc)
 	srv.activeRequests = m
 

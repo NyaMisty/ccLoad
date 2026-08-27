@@ -1,6 +1,7 @@
 package app
 
 import (
+	"context"
 	"errors"
 	"net/http"
 	"sync"
@@ -128,8 +129,8 @@ func (s *Server) reserveChannelRPM(cfg *model.Config) channelRPMReservation {
 	return s.channelRPMLimiter.reserve(cfg.ID, cfg.RPMLimit)
 }
 
-func (s *Server) reserveUpstreamRequest(cfg *model.Config, apiKey string) (release func(), err error) {
-	release, err = s.acquireKeyConcurrencySlot(cfg, apiKey)
+func (s *Server) reserveUpstreamRequest(cfg *model.Config) (release func(), err error) {
+	release, err = s.acquireChannelConcurrencySlot(cfg)
 	if err != nil {
 		return nil, err
 	}
@@ -142,6 +143,29 @@ func (s *Server) reserveUpstreamRequest(cfg *model.Config, apiKey string) (relea
 	return nil, &channelRPMExceededError{retryAfter: reservation.retryAfter}
 }
 
+func (s *Server) waitForUpstreamRequest(ctx context.Context, cfg *model.Config) (func(), error) {
+	for {
+		release, err := s.waitForChannelConcurrencySlot(ctx, cfg)
+		if err != nil {
+			return nil, err
+		}
+
+		reservation := s.reserveChannelRPM(cfg)
+		if reservation.allowed {
+			return release, nil
+		}
+		release()
+
+		timer := time.NewTimer(reservation.retryAfter)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return nil, ctx.Err()
+		case <-timer.C:
+		}
+	}
+}
+
 func channelRPMRetryAfter(err error) time.Duration {
 	var rpmErr *channelRPMExceededError
 	if errors.As(err, &rpmErr) {
@@ -150,8 +174,12 @@ func channelRPMRetryAfter(err error) time.Duration {
 	return 0
 }
 
-func (s *Server) doUpstreamRequest(cfg *model.Config, apiKey string, req *http.Request) (*http.Response, error) {
-	release, err := s.reserveUpstreamRequest(cfg, apiKey)
+func (s *Server) doUpstreamRequest(cfg *model.Config, req *http.Request) (*http.Response, error) {
+	release, err := s.reserveUpstreamRequest(cfg)
+	return s.doReservedUpstreamRequest(cfg, req, release, err)
+}
+
+func (s *Server) doReservedUpstreamRequest(cfg *model.Config, req *http.Request, release func(), err error) (*http.Response, error) {
 	if err != nil {
 		return nil, err
 	}

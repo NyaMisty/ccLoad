@@ -48,13 +48,11 @@ func (s *Server) HandleChannelChat(c *gin.Context) {
 		writeChatErrorEvent(c, "failed to load api keys")
 		return
 	}
-	requestAPIKey := strings.TrimSpace(testReq.APIKey)
-	if len(apiKeys) == 0 && requestAPIKey == "" {
-		writeChatErrorEvent(c, "渠道未配置有效的 API Key")
-		return
-	}
-
-	keySelection, err := s.selectChannelTestKey(apiKeys, testReq.KeyIndex, requestAPIKey)
+	persistedCfg := cfg
+	cfg, keySelection, err := s.prepareChannelTestAuth(
+		c.Request.Context(), cfg, apiKeys, testReq.KeyIndex, strings.TrimSpace(testReq.APIKey),
+		oauthCredentialRefreshIfNeeded,
+	)
 	if err != nil {
 		writeChatErrorEvent(c, err.Error())
 		return
@@ -66,21 +64,11 @@ func (s *Server) HandleChannelChat(c *gin.Context) {
 	}
 
 	if strings.TrimSpace(testReq.Content) == "" && len(testReq.Messages) == 0 {
-		testReq.Content = s.configService.GetString("channel_test_content", "sonnet 4.0的发布日期是什么")
+		testReq.Content = configuredChannelTestContent(s.configService)
 	}
 
-	// 模型重定向
 	originalModel := testReq.Model
-	if redirectModel, ok := cfg.GetRedirectModel(testReq.Model); ok && redirectModel != "" {
-		testReq.Model = redirectModel
-	}
-
-	clientProtocol := resolveClientProtocol(cfg, &testReq)
-	upstreamProto := resolveTestUpstreamProtocol(cfg, clientProtocol)
-	if !supportsRuntimeTestProtocol(clientProtocol, upstreamProto) {
-		writeChatErrorEvent(c, fmt.Sprintf("不支持协议转换 %s -> %s", clientProtocol, upstreamProto))
-		return
-	}
+	clientProtocol := resolveClientProtocol(&testReq)
 
 	urls := cfg.GetURLs()
 	if len(urls) == 0 {
@@ -92,7 +80,13 @@ func (s *Server) HandleChannelChat(c *gin.Context) {
 	if len(urls) > 1 && s.urlSelector != nil {
 		selector = s.urlSelector
 	}
-	orderedURLs := orderURLsWithSelector(selector, cfg.ID, urls)
+	orderedURLs := orderChannelAttemptURLs(selector, cfg, urls)
+	switch cfg.GetProtocolTransformMode() {
+	case model.ProtocolTransformModeAuto:
+		orderedURLs = prioritizeAutomaticProtocolURLs(orderedURLs, cfg.URLs)
+	case model.ProtocolTransformModeLocal:
+		orderedURLs = prioritizeDeclaredProtocolURLs(orderedURLs, cfg.URLs)
+	}
 
 	// 设置 SSE 响应头
 	c.Header("Content-Type", "text/event-stream")
@@ -102,19 +96,73 @@ func (s *Server) HandleChannelChat(c *gin.Context) {
 	disableResponseWriteTimeout(c.Writer, "聊天流式")
 
 	var lastResult map[string]any
+	var urlPolicy channelURLAttemptPolicy
 	for idx, entry := range orderedURLs {
-		attempt := s.streamChatWithURL(c, cfg, keySelection.apiKey, &testReq, clientProtocol, entry.url, originalModel)
-		if attempt.handled {
-			// Write chat log from stream result
-			s.writeChatStreamLog(c, cfg, &testReq, keySelection.apiKey, attempt.streamResult, originalModel)
-			return
-		}
-		lastResult = attempt.result
-		if idx == len(orderedURLs)-1 {
-			break
+		upstreamProtocols := resolveConfiguredURLUpstreamProtocols(
+			cfg, configuredURLAt(cfg, entry.idx, entry.url), clientProtocol,
+		)
+		if len(upstreamProtocols) == 0 {
+			lastResult = map[string]any{
+				"success":  false,
+				"error":    fmt.Sprintf("URL 不支持当前协议 %s", clientProtocol),
+				"base_url": entry.url,
+			}
+			continue
 		}
 
-		continueFallback, shouldCooldown := shouldFallbackToNextURL(attempt.result)
+		capabilityExhausted := false
+		for protocolIdx, upstreamProtocol := range upstreamProtocols {
+			attempt := s.streamChatWithURLForProtocol(
+				c, cfg, keySelection.requestCredential, &testReq, clientProtocol, upstreamProtocol, entry.url, originalModel,
+			)
+			if attempt.handled {
+				if attempt.streamResult != nil {
+					attempt.streamResult.capacityRetries = urlPolicy.antigravityCapacityRetries
+				}
+				if attempt.succeeded && urlPolicy.antigravityCapacityRetries > 0 {
+					s.applyChannelTestResultCooldown(
+						c.Request.Context(), cfg, keySelection.keyIndex, &testReq,
+						keySelection.updatePersistedCooldown, map[string]any{
+							"success": true, "status_code": http.StatusOK, "actual_model": attempt.actualModel,
+						},
+					)
+				}
+				// Write chat log from stream result
+				s.writeChatStreamLog(c, persistedCfg, &testReq, keySelection.apiKey, attempt.streamResult, originalModel)
+				return
+			}
+			lastResult = attempt.result
+			if !isChannelTestProtocolEndpointMissing(lastResult) {
+				break
+			}
+			capabilityExhausted = protocolIdx == len(upstreamProtocols)-1
+		}
+		hasNextURL := idx < len(orderedURLs)-1
+		decision := urlPolicy.decide(cfg, hasNextURL, channelURLFailureFromTestResult(lastResult))
+		if decision.firstCapacity && keySelection.updatePersistedCooldown {
+			s.applyChannelTestCapacityCooldown(
+				c.Request.Context(), cfg, keySelection.keyIndex, &testReq, lastResult,
+			)
+		}
+		if decision.retry {
+			if err := waitForChannelURLRetry(c.Request.Context(), decision.delay); err != nil {
+				lastResult["error"] = "渠道测试已取消: " + err.Error()
+				break
+			}
+			continue
+		}
+		if decision.capacity {
+			lastResult["antigravity_capacity_cooldown_applied"] = urlPolicy.antigravityCapacityObserved
+			markChannelTestCapacityExhausted(lastResult, urlPolicy.antigravityCapacityRetries)
+		}
+		if !hasNextURL {
+			break
+		}
+		if capabilityExhausted && cfg.GetProtocolTransformMode() != model.ProtocolTransformModeUpstream {
+			continue
+		}
+
+		continueFallback, shouldCooldown := shouldFallbackToNextURL(lastResult)
 		if shouldCooldown && selector != nil {
 			selector.CooldownURL(cfg.ID, entry.url)
 		}
@@ -125,7 +173,13 @@ func (s *Server) HandleChannelChat(c *gin.Context) {
 
 	if lastResult != nil {
 		writeChatErrorEvent(c, chatErrorMessageFromResult(lastResult))
-		s.persistDetectionLog(c.Request.Context(), detectionLogFromResult(cfg, model.LogSourceManualChat, originalModel, testReq.Model, keySelection.apiKey, c.ClientIP(), 0, testReq.ThinkingEffort, lastResult))
+		if capacity, _ := lastResult["antigravity_model_capacity"].(bool); capacity {
+			lastResult = s.applyChannelTestResultCooldown(
+				c.Request.Context(), cfg, keySelection.keyIndex, &testReq,
+				keySelection.updatePersistedCooldown, lastResult,
+			)
+		}
+		s.persistDetectionLog(c.Request.Context(), detectionLogFromResult(persistedCfg, model.LogSourceManualChat, originalModel, channelTestActualModel(lastResult, testReq.Model), keySelection.apiKey, c.ClientIP(), testReq.ThinkingEffort, lastResult))
 		return
 	}
 	writeChatErrorEvent(c, "渠道测试失败: 未找到可用URL")
@@ -133,6 +187,8 @@ func (s *Server) HandleChannelChat(c *gin.Context) {
 
 type chatURLAttemptResult struct {
 	handled      bool
+	succeeded    bool
+	actualModel  string
 	result       map[string]any
 	streamResult *chatStreamResult
 }
@@ -143,9 +199,11 @@ type chatStreamResult struct {
 	firstContentTime time.Time
 	usageParser      *sseUsageParser
 	model            string
-	channelType      string
+	clientProtocol   string
+	upstreamProtocol string
 	statusCode       int
 	requestThinking  string
+	capacityRetries  int
 	errorResult      map[string]any
 	debugData        *model.DebugLogEntry
 }
@@ -199,18 +257,38 @@ func chatSummaryEventChunk(sr *chatStreamResult, testReq *testutil.TestChannelRe
 	return []byte("data: " + string(jsonBytes) + "\n\n")
 }
 
-// streamChatWithURL 对单个 URL 发起对话请求并写入前端 SSE。
-// handled=true 表示已经写入最终响应；handled=false 时 result 交给调用方决定是否 fallback。
-func (s *Server) streamChatWithURL(
+func (s *Server) streamChatWithURLForProtocol(
 	c *gin.Context,
 	cfg *model.Config,
 	apiKey string,
 	testReq *testutil.TestChannelRequest,
-	clientProtocol, selectedURL string,
+	clientProtocol, upstreamProtocol, selectedURL string,
 	originalModel string,
-) chatURLAttemptResult {
-	req, requestPlan, cancel, err := s.buildTestUpstreamRequest(c.Request.Context(), cfg, apiKey, testReq, clientProtocol, selectedURL)
+) (out chatURLAttemptResult) {
+	attemptReq := *testReq
+	attemptReq.Model = s.resolveFinalUpstreamModel(cfg, originalModel, upstreamProtocol)
+	testReq = &attemptReq
+	defer func() {
+		out.actualModel = attemptReq.Model
+		if out.result == nil {
+			return
+		}
+		out.result["client_protocol"] = clientProtocol
+		out.result["upstream_protocol"] = upstreamProtocol
+		out.result["actual_model"] = attemptReq.Model
+	}()
+
+	req, requestPlan, cancel, err := s.buildTestUpstreamRequestForProtocol(
+		c.Request.Context(), cfg, apiKey, testReq, clientProtocol, upstreamProtocol, selectedURL,
+	)
 	if err != nil {
+		if isAutomaticProtocolTranslationFailure(cfg, err) {
+			return chatURLAttemptResult{result: map[string]any{
+				"success":                     false,
+				"error":                       err.Error(),
+				"protocol_capability_missing": true,
+			}}
+		}
 		writeChatErrorEvent(c, err.Error())
 		return chatURLAttemptResult{handled: true}
 	}
@@ -218,7 +296,7 @@ func (s *Server) streamChatWithURL(
 	requestThinking := testRequestThinkingEffort(testReq, requestPlan)
 
 	start := time.Now()
-	resp, err := s.doUpstreamRequest(cfg, apiKey, req)
+	resp, err := s.doUpstreamRequest(cfg, req)
 	if err != nil {
 		result := chatRequestErrorResult(start, testReq, requestPlan.timeout, err)
 		if requestThinking != "" {
@@ -232,7 +310,7 @@ func (s *Server) streamChatWithURL(
 	}
 
 	contentType := resp.Header.Get("Content-Type")
-	isSSE := strings.Contains(strings.ToLower(contentType), "text/event-stream")
+	isSSE := responseIsSSE(resp, requestPlan.upstreamStreaming)
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 8*1024))
@@ -254,17 +332,18 @@ func (s *Server) streamChatWithURL(
 	}
 
 	if !isSSE {
-		s.streamChatNonStreamResponse(c, resp, requestPlan, testReq, contentType, start, cfg, apiKey, requestThinking, originalModel)
-		return chatURLAttemptResult{handled: true}
+		succeeded := s.streamChatNonStreamResponse(c, resp, requestPlan, testReq, contentType, start, cfg, apiKey, requestThinking, originalModel)
+		return chatURLAttemptResult{handled: true, succeeded: succeeded, actualModel: attemptReq.Model}
 	}
 
 	sr := &chatStreamResult{
-		start:           start,
-		usageParser:     newSSEUsageParser(cfg.GetChannelType()),
-		model:           testReq.Model,
-		channelType:     cfg.GetChannelType(),
-		statusCode:      resp.StatusCode,
-		requestThinking: requestThinking,
+		start:            start,
+		usageParser:      newSSEUsageParser(requestPlan.upstreamProtocol),
+		model:            testReq.Model,
+		clientProtocol:   requestPlan.clientProtocol,
+		upstreamProtocol: requestPlan.upstreamProtocol,
+		statusCode:       resp.StatusCode,
+		requestThinking:  requestThinking,
 	}
 
 	firstContentMarked := false
@@ -278,7 +357,7 @@ func (s *Server) streamChatWithURL(
 	}
 
 	var streamErr error
-	if clientProtocol == requestPlan.upstreamProtocol {
+	if clientProtocol == requestPlan.upstreamProtocol && !requestPlan.antigravityOAuth {
 		// 原生协议：直接透传 SSE，提取 delta 文本
 		streamErr = streamChatNativeWithFirstContent(c, resp.Body, markFirstContent, sr)
 	} else {
@@ -292,6 +371,8 @@ func (s *Server) streamChatWithURL(
 		}
 		sr.errorResult = result
 		writeChatErrorEvent(c, chatErrorMessageFromResult(result))
+	} else if errorEvent := sr.usageParser.GetLastError(); len(errorEvent) > 0 {
+		sr.errorResult = chatSSEErrorResult(start, resp.StatusCode, errorEvent)
 	}
 
 	// Write summary event after stream ends
@@ -301,7 +382,30 @@ func (s *Server) streamChatWithURL(
 	if requestPlan.debugCapture != nil {
 		sr.debugData = requestPlan.debugCapture.buildEntry(resp)
 	}
-	return chatURLAttemptResult{handled: true, streamResult: sr}
+	return chatURLAttemptResult{handled: true, succeeded: sr.errorResult == nil, actualModel: attemptReq.Model, streamResult: sr}
+}
+
+func chatSSEErrorResult(start time.Time, upstreamStatus int, errorEvent []byte) map[string]any {
+	errorMsg := "上游返回错误"
+	var obj map[string]any
+	if err := sonic.Unmarshal(errorEvent, &obj); err == nil {
+		if msg, _, matched := extractSSEErrorMessage(obj); matched && strings.TrimSpace(msg) != "" {
+			errorMsg = msg
+		}
+	}
+	statusCode := classifySSEErrorStatus(errorEvent)
+	if statusCode <= 0 {
+		statusCode = upstreamStatus
+	}
+	return map[string]any{
+		"success":                false,
+		"status_code":            statusCode,
+		"is_streaming":           true,
+		"duration_ms":            time.Since(start).Milliseconds(),
+		"error":                  errorMsg,
+		"raw_response":           string(errorEvent),
+		"upstream_response_body": string(errorEvent),
+	}
 }
 
 func chatRequestErrorResult(start time.Time, testReq *testutil.TestChannelRequest, timeout *channelTestTimeout, err error) map[string]any {
@@ -312,8 +416,8 @@ func chatRequestErrorResult(start time.Time, testReq *testutil.TestChannelReques
 		result["is_streaming"] = isStream
 		return result
 	}
-	if errors.Is(err, ErrKeyConcurrencyExceeded) {
-		result := keyConcurrencyExceededTestResult(start, err)
+	if errors.Is(err, ErrChannelConcurrencyExceeded) {
+		result := channelConcurrencyExceededTestResult(start, err)
 		result["is_streaming"] = isStream
 		return result
 	}
@@ -323,12 +427,20 @@ func chatRequestErrorResult(start time.Time, testReq *testutil.TestChannelReques
 	if timeout != nil && timeout.firstStreamContentTimeoutTriggered() {
 		threshold := timeout.firstByteTimeout
 		errorMsg = fmt.Sprintf(
-			"上游首个有效流内容超时: upstream first valid stream content timeout after %.2fs (threshold=%v): %v",
+			"流式请求首个有效内容超时: upstream first valid stream content timeout after %.2fs (threshold=%v): %v",
 			time.Since(start).Seconds(),
 			threshold,
 			err,
 		)
 		statusCode = util.StatusFirstByteTimeout
+	} else if timeout != nil && timeout.streamTimeoutTriggered() {
+		errorMsg = fmt.Sprintf(
+			"流式请求总超时: upstream stream timeout after %.2fs (threshold=%v): %v",
+			time.Since(start).Seconds(),
+			timeout.streamTimeout,
+			err,
+		)
+		statusCode = util.StatusStreamIncomplete
 	} else if testReq != nil && !testReq.Stream && timeout != nil && timeout.nonStreamTimeout > 0 && errors.Is(err, context.DeadlineExceeded) {
 		errorMsg = fmt.Sprintf(
 			"非流式请求超时: upstream timeout after %.2fs (threshold=%v): %v",
@@ -375,7 +487,7 @@ func (s *Server) streamChatNonStreamResponse(
 	apiKey string,
 	requestThinking string,
 	originalModel string,
-) {
+) bool {
 	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
 		errorMsg := "读取响应失败: " + err.Error()
@@ -383,22 +495,34 @@ func (s *Server) streamChatNonStreamResponse(
 			errorMsg = timeoutMsg
 		}
 		writeChatErrorEvent(c, errorMsg)
-		return
+		return false
 	}
 
 	result := map[string]any{
-		"success":      resp.StatusCode >= 200 && resp.StatusCode < 300,
-		"status_code":  resp.StatusCode,
-		"is_streaming": false,
+		"success":           resp.StatusCode >= 200 && resp.StatusCode < 300,
+		"status_code":       resp.StatusCode,
+		"is_streaming":      false,
+		"client_protocol":   requestPlan.clientProtocol,
+		"upstream_protocol": requestPlan.upstreamProtocol,
 	}
 	if requestThinking != "" {
 		result["thinking_effort"] = requestThinking
 	}
 	result = s.parseTestNonStreamResponse(c.Request.Context(), requestPlan, testReq, resp, contentType, start, respBody, result)
 	result = attachTestDebugData(requestPlan, resp, result)
+	succeeded, _ := result["success"].(bool)
+	responseText, _ := result["response_text"].(string)
+	if strings.TrimSpace(responseText) == "" {
+		succeeded = false
+		result["success"] = false
+		if msg, _ := result["error"].(string); strings.TrimSpace(msg) == "" {
+			result["error"] = "上游响应中没有可显示文本"
+		}
+	}
 	writeChatNonStreamResult(c, result)
 	writeChatNonStreamSummary(c, result)
-	s.persistDetectionLog(c.Request.Context(), detectionLogFromResult(cfg, model.LogSourceManualChat, originalModel, testReq.Model, apiKey, c.ClientIP(), 0, requestThinking, result))
+	s.persistDetectionLog(c.Request.Context(), detectionLogFromResult(cfg, model.LogSourceManualChat, originalModel, testReq.Model, apiKey, c.ClientIP(), requestThinking, result))
+	return succeeded
 }
 
 func writeChatNonStreamResult(c *gin.Context, result map[string]any) {
@@ -484,11 +608,13 @@ func (s *Server) writeChatStreamLog(c *gin.Context, cfg *model.Config, testReq *
 		return
 	}
 	result := map[string]any{
-		"success":      true,
-		"status_code":  sr.statusCode,
-		"is_streaming": true,
-		"duration_ms":  time.Since(sr.start).Milliseconds(),
-		"message":      "ok",
+		"success":           true,
+		"status_code":       sr.statusCode,
+		"is_streaming":      true,
+		"duration_ms":       time.Since(sr.start).Milliseconds(),
+		"message":           "ok",
+		"client_protocol":   sr.clientProtocol,
+		"upstream_protocol": sr.upstreamProtocol,
 	}
 	if sr.errorResult != nil {
 		result = sr.errorResult
@@ -497,6 +623,9 @@ func (s *Server) writeChatStreamLog(c *gin.Context, cfg *model.Config, testReq *
 			result["status_code"] = sr.statusCode
 		}
 	}
+	result["client_protocol"] = sr.clientProtocol
+	result["upstream_protocol"] = sr.upstreamProtocol
+	annotateChannelTestCapacityRetries(result, sr.capacityRetries)
 	if !sr.firstContentTime.IsZero() {
 		result["first_byte_duration_ms"] = sr.firstContentTime.Sub(sr.start).Milliseconds()
 	}
@@ -521,7 +650,7 @@ func (s *Server) writeChatStreamLog(c *gin.Context, cfg *model.Config, testReq *
 	if sr.debugData != nil {
 		result["debug_data"] = sr.debugData
 	}
-	s.persistDetectionLog(c.Request.Context(), detectionLogFromResult(cfg, model.LogSourceManualChat, originalModel, testReq.Model, apiKey, c.ClientIP(), 0, sr.requestThinking, result))
+	s.persistDetectionLog(c.Request.Context(), detectionLogFromResult(cfg, model.LogSourceManualChat, originalModel, testReq.Model, apiKey, c.ClientIP(), sr.requestThinking, result))
 }
 
 // streamChatNative 原生协议时把上游 SSE 实时透传给前端（提取 delta 文本）。
@@ -550,28 +679,52 @@ func streamChatTranslated(c *gin.Context, resp *http.Response, requestPlan *chan
 	var state any
 	frontendState := &chatFrontendStreamState{}
 	ctx := c.Request.Context()
+	requestPlan.debugCapture.captureTranslatedResponseMeta(resp.StatusCode, resp.Header)
 
 	src := readerWithCloser{Reader: resp.Body, Closer: resp.Body}
 	return streamTransformSSEEvents(ctx, src, c.Writer,
 		func(rawEvent []byte) error {
+			parserEvent := rawEvent
+			if requestPlan.antigravityOAuth {
+				var err error
+				parserEvent, err = unwrapAntigravitySSEEvent(rawEvent)
+				if err != nil {
+					return err
+				}
+			}
 			if sr != nil && sr.usageParser != nil {
-				_ = sr.usageParser.Feed(rawEvent)
+				_ = sr.usageParser.Feed(parserEvent)
 			}
 			return nil
 		},
 		func(rawEvent []byte) ([][]byte, error) {
+			translatedRequestBody := requestPlan.requestBody
+			if requestPlan.antigravityOAuth {
+				var err error
+				rawEvent, err = unwrapAntigravitySSEEvent(rawEvent)
+				if err != nil {
+					return nil, err
+				}
+				translatedRequestBody, err = unwrapAntigravityRequest(requestPlan.requestBody)
+				if err != nil {
+					return nil, err
+				}
+			}
 			translated, err := s.protocolRegistry.TranslateResponseStream(
 				ctx,
 				protocol.Protocol(requestPlan.upstreamProtocol),
 				protocol.Protocol(requestPlan.clientProtocol),
 				testReq.Model,
 				requestPlan.clientBody,
-				requestPlan.requestBody,
+				translatedRequestBody,
 				rawEvent,
 				&state,
 			)
 			if err != nil {
 				return nil, err
+			}
+			for _, chunk := range translated {
+				requestPlan.debugCapture.captureTranslatedResponse(chunk)
 			}
 			var chunks [][]byte
 			for _, chunk := range translated {

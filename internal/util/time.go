@@ -1,13 +1,11 @@
 package util
 
 import (
-	"os"
-	"strconv"
 	"time"
 )
 
-// 冷却时间变量（支持环境变量覆盖，启动时读取一次）
-var (
+// 内置冷却时间。这些值是不可变默认值；运行时覆盖保存在具体存储实例的 CooldownPolicy 中。
+const (
 	// AuthErrorInitialCooldown 认证错误（401/402/403）的初始冷却时间
 	AuthErrorInitialCooldown = 5 * time.Minute
 
@@ -27,47 +25,67 @@ var (
 	MinCooldownDuration = 10 * time.Second
 )
 
-func init() {
-	applyCooldownEnvOverrides(os.Getenv)
+// CooldownSettings 冷却时长配置（单位：秒）。非正值表示保留内置默认值。
+type CooldownSettings struct {
+	AuthSec      int
+	TimeoutSec   int
+	ServerSec    int
+	RateLimitSec int
+	MaxSec       int
+	MinSec       int
 }
 
-func envSecondsFrom(getenv func(string) string, key string) time.Duration {
-	s := getenv(key)
-	if s == "" {
-		return 0
-	}
-	v, err := strconv.ParseInt(s, 10, 64)
-	if err != nil || v <= 0 {
-		return 0
-	}
-	return time.Duration(v) * time.Second
+// CooldownPolicy 是单个存储实例的不可变指数退避策略。
+type CooldownPolicy struct {
+	authInitial   time.Duration
+	timeout       time.Duration
+	serverInitial time.Duration
+	rateLimit     time.Duration
+	maxDuration   time.Duration
+	minDuration   time.Duration
 }
 
-func applyCooldownEnvOverrides(getenv func(string) string) {
-	// 环境变量覆盖（启动时读取一次，重启生效）
-	if v := envSecondsFrom(getenv, "CCLOAD_COOLDOWN_AUTH_SEC"); v > 0 {
-		AuthErrorInitialCooldown = v
+// NewCooldownPolicy 根据系统设置构造冷却策略；非正值使用内置默认值。
+func NewCooldownPolicy(s CooldownSettings) *CooldownPolicy {
+	policy := &CooldownPolicy{
+		authInitial:   AuthErrorInitialCooldown,
+		timeout:       TimeoutErrorCooldown,
+		serverInitial: ServerErrorInitialCooldown,
+		rateLimit:     RateLimitErrorCooldown,
+		maxDuration:   MaxCooldownDuration,
+		minDuration:   MinCooldownDuration,
 	}
-	if v := envSecondsFrom(getenv, "CCLOAD_COOLDOWN_TIMEOUT_SEC"); v > 0 {
-		TimeoutErrorCooldown = v
+	assign := func(target *time.Duration, seconds int) {
+		if seconds > 0 && int64(seconds) <= int64((1<<63-1)/time.Second) {
+			*target = time.Duration(seconds) * time.Second
+		}
 	}
-	if v := envSecondsFrom(getenv, "CCLOAD_COOLDOWN_SERVER_SEC"); v > 0 {
-		ServerErrorInitialCooldown = v
-	}
-	if v := envSecondsFrom(getenv, "CCLOAD_COOLDOWN_RATE_LIMIT_SEC"); v > 0 {
-		RateLimitErrorCooldown = v
-	}
-	if v := envSecondsFrom(getenv, "CCLOAD_COOLDOWN_MAX_SEC"); v > 0 {
-		MaxCooldownDuration = v
-	}
-	if v := envSecondsFrom(getenv, "CCLOAD_COOLDOWN_MIN_SEC"); v > 0 {
-		MinCooldownDuration = v
-	}
+	assign(&policy.authInitial, s.AuthSec)
+	assign(&policy.timeout, s.TimeoutSec)
+	assign(&policy.serverInitial, s.ServerSec)
+	assign(&policy.rateLimit, s.RateLimitSec)
+	assign(&policy.maxDuration, s.MaxSec)
+	assign(&policy.minDuration, s.MinSec)
+	return policy
 }
+
+var defaultCooldownPolicy = NewCooldownPolicy(CooldownSettings{})
 
 // CalculateBackoffDuration 计算指数退避冷却时间
 func CalculateBackoffDuration(prevMs int64, until time.Time, now time.Time, statusCode *int) time.Duration {
-	prev := time.Duration(prevMs) * time.Millisecond
+	return defaultCooldownPolicy.CalculateBackoffDuration(prevMs, until, now, statusCode)
+}
+
+// CalculateBackoffDuration 使用当前策略计算指数退避冷却时间。
+func (p *CooldownPolicy) CalculateBackoffDuration(prevMs int64, until time.Time, now time.Time, statusCode *int) time.Duration {
+	var prev time.Duration
+	if prevMs <= 0 {
+		prev = 0
+	} else if prevMs > int64((1<<63-1)/time.Millisecond) {
+		prev = p.maxDuration
+	} else {
+		prev = time.Duration(prevMs) * time.Millisecond
+	}
 
 	// 如果没有历史记录，检查until字段
 	if prev <= 0 {
@@ -75,30 +93,34 @@ func CalculateBackoffDuration(prevMs int64, until time.Time, now time.Time, stat
 			prev = until.Sub(now)
 		} else {
 			// 首次错误：根据状态码确定初始冷却时间
-			return getInitialCooldown(statusCode)
+			return p.initialCooldown(statusCode)
 		}
 	}
 
-	// 后续错误：指数退避翻倍
-	next := min(max(prev*2, MinCooldownDuration), MaxCooldownDuration)
+	// 后续错误：指数退避翻倍；先按策略上限饱和，避免 Duration 溢出。
+	next := p.maxDuration
+	if prev < p.maxDuration/2 {
+		next = prev * 2
+	}
+	next = min(max(next, p.minDuration), p.maxDuration)
 	return next
 }
 
-// getInitialCooldown 根据状态码返回初始冷却时间
-func getInitialCooldown(statusCode *int) time.Duration {
+// initialCooldown 根据状态码返回初始冷却时间。
+func (p *CooldownPolicy) initialCooldown(statusCode *int) time.Duration {
 	if statusCode == nil {
-		return RateLimitErrorCooldown
+		return p.rateLimit
 	}
 	code := *statusCode
 	switch {
 	case code == 401 || code == 402 || code == 403:
-		return AuthErrorInitialCooldown
+		return p.authInitial
 	case code == StatusFirstByteTimeout || code == StatusSSEError:
-		return TimeoutErrorCooldown
+		return p.timeout
 	case code >= 500:
-		return ServerErrorInitialCooldown
+		return p.serverInitial
 	default:
-		return RateLimitErrorCooldown
+		return p.rateLimit
 	}
 }
 

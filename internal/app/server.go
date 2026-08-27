@@ -1,20 +1,30 @@
 package app
 
 import (
+	"container/list"
 	"context"
+	"crypto/sha256"
 	"crypto/tls"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net"
 	"net/http"
 	neturl "net/url"
 	"os"
-	"strconv"
+	"regexp"
+	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
 
+	"ccLoad/internal/anthropicauth"
+	"ccLoad/internal/antigravityauth"
+	"ccLoad/internal/codexauth"
 	"ccLoad/internal/config"
 	"ccLoad/internal/cooldown"
 	"ccLoad/internal/model"
@@ -22,6 +32,9 @@ import (
 	protocolbuiltin "ccLoad/internal/protocol/builtin"
 	"ccLoad/internal/storage"
 	"ccLoad/internal/util"
+	"ccLoad/internal/version"
+	"ccLoad/internal/xaiauth"
+	"ccLoad/internal/zaiauth"
 
 	"github.com/gin-gonic/gin"
 )
@@ -38,6 +51,8 @@ type Server struct {
 	// ============================================================================
 	// 核心字段
 	// ============================================================================
+	startedAt                     time.Time
+	cpuUsage                      cpuUsageTracker // 运行状态查询间的 CPU 占用率采样(零值可用)
 	store                         storage.Store
 	channelCache                  *storage.ChannelCache      // 高性能渠道缓存层
 	keySelector                   *KeySelector               // Key选择器（多Key支持）
@@ -45,28 +60,72 @@ type Server struct {
 	healthCache                   *HealthCache               // 渠道健康度缓存
 	costCache                     *CostCache                 // 渠道每日成本缓存
 	channelRPMLimiter             *channelRPMLimiter         // 渠道RPM限制器（内存滑动窗口）
-	channelConcurrencyLimiter     *channelConcurrencyLimiter // 渠道内单 Key 并发限制器（内存计数）
+	channelConcurrencyLimiter     *channelConcurrencyLimiter // 渠道并发限制器（内存计数）
 	statsCache                    *StatsCache                // 统计结果缓存层
+	updateManager                 *version.UpdateManager     // 版本检查与可选自动应用的唯一状态源
 	channelBalancer               *SmoothWeightedRR          // 渠道负载均衡器（平滑加权轮询）
 	urlSelector                   *URLSelector               // URL选择器（多URL场景的延迟追踪与冷却）
+	disabledURLSyncMu             sync.Mutex
 	protocolRegistry              *protocol.Registry
-	client                        *http.Client          // HTTP客户端（全局默认）
-	proxyTransports               sync.Map              // proxyURL → *http.Transport（渠道级代理缓存）
+	client                        *http.Client // HTTP客户端（全局默认）
+	antigravityClient             *http.Client // Antigravity 专用标准 HTTP/1.1 客户端
+	xaiSSOClient                  *http.Client // xAI Web SSO 专用 HTTP/1.1 客户端
+	proxyTransports               sync.Map     // upstreamHTTPClientCacheKey → *http.Client（渠道级代理缓存）
+	antigravityTransports         *antigravityHTTPClientCache
+	antigravityTransportMu        sync.Mutex
+	protocolCapabilities          protocolCapabilityCache
 	skipTLSVerify                 bool                  // 透传给渠道级 Transport
 	activeRequests                *activeRequestManager // 进行中请求（内存状态，不持久化）
+	httpRuntime                   httpProxyRuntimeMetrics
+	restartMu                     sync.RWMutex
+	restartFunc                   func()
+	responsesExecutionSessions    *responsesExecutionSessionStore
+	responsesWebsocketConnections *responsesWebsocketConnectionLimiter
+	codexOAuth                    *codexOAuthManager
+	codexService                  *codexauth.Service
+	codexCredentials              *codexCredentialManager
+	codexQuotaResetInFlight       sync.Map
+	antigravityOAuth              *codexOAuthManager
+	antigravityCredentials        *antigravityCredentialManager
+	antigravityService            *antigravityauth.Service
+	xaiService                    *xaiauth.Service
+	xaiCredentials                *xaiCredentialManager
+	xaiOAuth                      *xaiOAuthManager
+	anthropicService              *anthropicauth.Service
+	anthropicCredentials          *anthropicCredentialManager
+	anthropicOAuth                *codexOAuthManager
+	zaiService                    *zaiauth.Service
+	zaiCredentials                *zaiCredentialManager
+	zaiOAuth                      *zaiOAuthManager
+	antigravityPromptMatcher      *regexp.Regexp
 	scheduledChannelChecksRunning atomic.Bool
 
 	// 异步统计（有界队列，避免每请求起goroutine）
-	tokenStatsCh        chan tokenStatsUpdate
-	tokenStatsDropCount atomic.Int64
+	tokenStatsCh               chan tokenStatsUpdate
+	tokenStatsDropCount        atomic.Int64
+	codexPassiveUsageCh        chan codexPassiveUsageTask
+	codexPassiveUsageDropCount atomic.Int64
 
 	// 运行时配置（启动时从数据库加载，修改后重启生效）
-	maxKeyRetries       int                                 // 单个渠道内最大Key重试次数
-	firstByteTimeout    time.Duration                       // 上游首字节超时（流式请求）
-	nonStreamTimeout    time.Duration                       // 非流式请求超时
-	channelTypeTimeouts map[string]channelTypeTimeoutConfig // 按运行时上游协议覆盖超时，0=回退全局
+	maxKeyRetries    int // 单个渠道内最大Key重试次数
+	bodyLimits       requestBodyLimits
+	firstByteTimeout time.Duration // 上游首字节超时（流式请求）
+	httpReadTimeout  time.Duration // 下游请求读取超时（HTTP Server ReadTimeout）
+	streamTimeout    time.Duration // 流式请求总超时
+	nonStreamTimeout time.Duration // 非流式请求超时
+	// 上游 HTTP/1.1、HTTP/2 和 WebSocket 物理连接最长复用时间；0 表示不限制。
+	upstreamConnectionMaxAge time.Duration
+	// 仅供测试注入（缩短下游与上游 WebSocket 的 idle/ping 间隔以覆盖保活路径）；
+	// 生产始终为零值，实际取值回退到各自的默认常量。
+	responsesWebsocketIdleTimeoutOverride  time.Duration
+	responsesWebsocketPingIntervalOverride time.Duration
+	protocolTimeouts                       map[string]protocolTimeoutConfig // 按运行时上游协议覆盖超时，0=回退全局
 	// 模型匹配配置（启动时从数据库加载，修改后重启生效）
-	modelFuzzyMatch bool // 未命中时启用模糊匹配（子串匹配+版本排序）
+	modelFuzzyMatch           bool // 未命中时启用模糊匹配（子串匹配+版本排序）
+	activeRequestTitleEnabled bool
+	codexMap429To503          bool
+	// 渠道未配置专属规则时使用的进程级默认规则。
+	globalCooldownDetectionRules *model.CooldownDetectionRules
 
 	// 登录速率限制器（用于传递给AuthService）
 	loginRateLimiter *util.LoginRateLimiter
@@ -76,21 +135,26 @@ type Server struct {
 	maxConcurrency int           // 最大并发数（默认1000）
 
 	// 优雅关闭机制
-	baseCtx        context.Context    // server生命周期context，Shutdown时取消
-	baseCancel     context.CancelFunc // 取消baseCtx
-	shutdownCh     chan struct{}      // 关闭信号channel
-	shutdownDone   chan struct{}      // Shutdown完成信号（幂等）
-	isShuttingDown atomic.Bool        // shutdown标志，防止向已关闭channel写入
-	wg             sync.WaitGroup     // 等待所有后台goroutine结束
+	baseCtx                 context.Context    // server生命周期context，Shutdown时取消
+	baseCancel              context.CancelFunc // 取消baseCtx
+	shutdownCh              chan struct{}      // 关闭信号channel
+	shutdownDone            chan struct{}      // Shutdown完成信号（幂等）
+	isShuttingDown          atomic.Bool        // shutdown标志，防止向已关闭channel写入
+	modelCatalogSyncMu      sync.Mutex         // 串行化模型目录启动和关闭，保护 WaitGroup
+	modelCatalogSyncStarted atomic.Bool
+	wg                      sync.WaitGroup // 等待所有后台goroutine结束
 
-	// [OPT] P3: 渠道类型缓存（TTL 30s）
-	channelTypesCache     map[int64]string
-	channelTypesCacheTime time.Time
-	channelTypesCacheMu   sync.RWMutex
+	oauthCredentialImportRunMu   sync.Mutex
+	oauthCredentialImportJobsMu  sync.Mutex
+	oauthCredentialImportJobs    *oauthCredentialImportJobManager
+	oauthCredentialCleanupJobsMu sync.Mutex
+	oauthCredentialCleanupJobs   *oauthCredentialCleanupJobManager
+	oauthCredentialRefreshes     *oauthCredentialRefreshTracker
 }
 
 // NewServer 创建并初始化一个新的 Server 实例
 func NewServer(store storage.Store) *Server {
+	startedAt := time.Now()
 	// 初始化ConfigService（优先从数据库加载配置,环境变量作Fallback）
 	configService := NewConfigService(store)
 	loadCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -121,14 +185,13 @@ func NewServer(store storage.Store) *Server {
 
 	// 从ConfigService读取运行时配置（启动时加载一次，修改后重启生效）
 	runtimeCfg := loadServerRuntimeConfig(configService)
+	warnMigratedEnvSettings()
 
-	// 最大并发数保留环境变量读取（启动参数，不支持Web管理）
-	maxConcurrency := config.DefaultMaxConcurrency
-	if concEnv := os.Getenv("CCLOAD_MAX_CONCURRENCY"); concEnv != "" {
-		if val, err := strconv.Atoi(concEnv); err == nil && val > 0 {
-			maxConcurrency = val
-		}
-	}
+	// 运行时配置必须归属具体 Server/存储实例，构造函数不修改进程级状态。
+	bodyLimits := newRequestBodyLimits(runtimeCfg.MaxBodyBytes, runtimeCfg.MaxImageBodyBytes)
+	store.ConfigureCooldown(runtimeCfg.Cooldown)
+
+	maxConcurrency := runtimeCfg.MaxConcurrency
 
 	// TLS证书验证配置（仅环境变量）
 	// 这是一个危险开关：一旦关闭证书校验，上游 HTTPS 等同明文 + 任意中间人。
@@ -139,45 +202,67 @@ func NewServer(store storage.Store) *Server {
 
 	// 构建HTTP Transport（使用统一函数，消除DRY违反）
 	transport := buildHTTPTransport(skipTLSVerify)
-	log.Print("[INFO] HTTP/2已启用（头部压缩+多路复用，HTTPS自动协商）")
+	log.Print("[INFO] HTTP/2已启用（HTTPS自动协商）；Antigravity 固定使用 HTTP/1.1")
 	logHostOverrides(getHostOverrides())
 
 	baseCtx, baseCancel := context.WithCancel(context.Background())
 
 	s := &Server{
+		startedAt:        startedAt,
 		store:            store,
 		configService:    configService,
 		loginRateLimiter: util.NewLoginRateLimiter(),
 
 		// 运行时配置（启动时加载，修改后重启生效）
-		maxKeyRetries:       runtimeCfg.MaxKeyRetries,
-		firstByteTimeout:    runtimeCfg.FirstByteTimeout,
-		nonStreamTimeout:    runtimeCfg.NonStreamTimeout,
-		channelTypeTimeouts: runtimeCfg.ChannelTypeTimeouts,
+		maxKeyRetries:            runtimeCfg.MaxKeyRetries,
+		bodyLimits:               bodyLimits,
+		firstByteTimeout:         runtimeCfg.FirstByteTimeout,
+		httpReadTimeout:          runtimeCfg.HTTPReadTimeout,
+		streamTimeout:            runtimeCfg.StreamTimeout,
+		nonStreamTimeout:         runtimeCfg.NonStreamTimeout,
+		upstreamConnectionMaxAge: runtimeCfg.UpstreamConnectionMaxAge,
+		protocolTimeouts:         runtimeCfg.ProtocolTimeouts,
 		// 模型匹配配置（启动时加载，修改后重启生效）
-		modelFuzzyMatch: runtimeCfg.ModelFuzzyMatch,
+		modelFuzzyMatch:              runtimeCfg.ModelFuzzyMatch,
+		activeRequestTitleEnabled:    runtimeCfg.ActiveRequestTitleEnabled,
+		codexMap429To503:             runtimeCfg.CodexMap429To503,
+		globalCooldownDetectionRules: runtimeCfg.GlobalCooldownDetectionRules,
 
-		// HTTP客户端
-		client: &http.Client{
-			Transport: transport,
-			Timeout:   0, // 不设置全局超时，避免中断长时间任务
-		},
-		skipTLSVerify: skipTLSVerify,
+		// HTTP客户端：不设置请求总超时，连接复用时限只轮换连接池，不中断在途请求。
+		client:                newUpstreamHTTPClient(transport, runtimeCfg.UpstreamConnectionMaxAge),
+		antigravityClient:     newAntigravityHTTPClient(transport, runtimeCfg.UpstreamConnectionMaxAge),
+		antigravityTransports: newAntigravityHTTPClientCache(antigravityHTTPClientCacheCapacity),
+		xaiSSOClient:          newXAISSOHTTPClient(transport),
+		skipTLSVerify:         skipTLSVerify,
 
 		// 并发控制：使用信号量限制最大并发请求数
 		concurrencySem: make(chan struct{}, maxConcurrency),
 		maxConcurrency: maxConcurrency,
 
 		// 初始化优雅关闭机制
-		baseCtx:      baseCtx,
-		baseCancel:   baseCancel,
-		shutdownCh:   make(chan struct{}),
-		shutdownDone: make(chan struct{}),
+		baseCtx:                  baseCtx,
+		baseCancel:               baseCancel,
+		shutdownCh:               make(chan struct{}),
+		shutdownDone:             make(chan struct{}),
+		oauthCredentialRefreshes: newOAuthCredentialRefreshTracker(),
 
 		// Token统计队列（避免每请求起goroutine）
-		tokenStatsCh: make(chan tokenStatsUpdate, config.DefaultTokenStatsBufferSize),
+		tokenStatsCh:        make(chan tokenStatsUpdate, config.DefaultTokenStatsBufferSize),
+		codexPassiveUsageCh: make(chan codexPassiveUsageTask, codexPassiveUsageQueueSize),
 
-		activeRequests:            newActiveRequestManager(),
+		activeRequests: newActiveRequestManager(),
+		responsesExecutionSessions: newResponsesExecutionSessionStore(
+			configService,
+			bodyLimits.maxForPath("/v1/responses"),
+			runtimeCfg.UpstreamConnectionMaxAge,
+		),
+		responsesWebsocketConnections: newResponsesWebsocketConnectionLimiter(
+			configService.GetInt(responsesWebsocketMaxConnectionsSetting, defaultResponsesWebsocketConnectionLimit),
+			configService.GetInt(
+				responsesWebsocketMaxConnectionsPerTokenSetting,
+				defaultResponsesWebsocketConnectionPerSubjectLimit,
+			),
+		),
 		channelRPMLimiter:         newChannelRPMLimiter(time.Now),
 		channelConcurrencyLimiter: newChannelConcurrencyLimiter(),
 	}
@@ -188,6 +273,83 @@ func NewServer(store storage.Store) *Server {
 
 	// 初始化高性能缓存层（60秒TTL，避免数据库性能杀手查询）
 	s.channelCache = storage.NewChannelCache(store, 60*time.Second)
+	channelLoadCtx, channelLoadCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	channels, err := store.ListConfigs(channelLoadCtx)
+	channelLoadCancel()
+	if err != nil {
+		log.Fatalf("[FATAL] 加载渠道配置失败: %v", err)
+	}
+	log.Printf("[INFO] 已加载渠道配置（%d项）", len(channels))
+
+	codexOAuthService := codexauth.NewService(s.client)
+	s.codexService = codexOAuthService
+	s.codexCredentials = newCodexCredentialManager(codexOAuthService, store, s.getClientForChannel, func(int64) {
+		s.InvalidateChannelListCache()
+	})
+	s.codexCredentials.refreshTracker = s.oauthCredentialRefreshes
+	s.codexOAuth = newCodexOAuthManager(codexOAuthService, store, func(channelID int64) {
+		s.codexCredentials.invalidate(channelID)
+		s.InvalidateChannelListCache()
+	})
+	s.antigravityService = antigravityauth.NewService(s.antigravityClient)
+	s.antigravityPromptMatcher = loadAntigravityPromptMatcher(configService)
+	s.antigravityCredentials = newAntigravityCredentialManager(s.antigravityService, store, s.getClientForChannel, func(int64) {
+		s.InvalidateChannelListCache()
+	})
+	s.antigravityCredentials.refreshTracker = s.oauthCredentialRefreshes
+	s.antigravityOAuth = newAntigravityOAuthManager(s.antigravityService, store, func(channelID int64) {
+		s.antigravityCredentials.invalidate(channelID)
+		s.InvalidateChannelListCache()
+	})
+	s.xaiService = xaiauth.NewService(s.client)
+	s.xaiCredentials = newXAICredentialManager(store, s.getClientForChannel, func(int64) {
+		s.InvalidateChannelListCache()
+	})
+	s.xaiCredentials.refreshTracker = s.oauthCredentialRefreshes
+	s.xaiOAuth = newXAIOAuthManager(
+		s.baseCtx,
+		s.xaiService,
+		func(ctx context.Context, credential *xaiauth.Credential) (*xaiauth.Credential, error) {
+			return completeXAICredential(ctx, s.xaiService, s.client, credential, xaiauth.CLIBaseURL)
+		},
+		func(ctx context.Context, credential *xaiauth.Credential) (int64, error) {
+			cfg, _, err := createOrUpdateXAIChannel(ctx, store, credential)
+			if err != nil {
+				return 0, err
+			}
+			s.xaiCredentials.invalidate(cfg.ID)
+			s.InvalidateChannelListCache()
+			return cfg.ID, nil
+		},
+	)
+	s.anthropicService = anthropicauth.NewService(s.client)
+	s.anthropicCredentials = newAnthropicCredentialManager(
+		s.anthropicService, store, s.getClientForChannel, func(int64) { s.InvalidateChannelListCache() },
+	)
+	s.anthropicCredentials.refreshTracker = s.oauthCredentialRefreshes
+	s.anthropicOAuth = newAnthropicOAuthManager(s.anthropicService, store, func(channelID int64) {
+		s.anthropicCredentials.invalidate(channelID)
+		s.InvalidateChannelListCache()
+	})
+	s.zaiService = zaiauth.NewService(s.client)
+	s.zaiCredentials = newZAICredentialManager(store, s.getClientForChannel, func(int64) {
+		s.InvalidateChannelListCache()
+	})
+	s.zaiCredentials.refreshTracker = s.oauthCredentialRefreshes
+	s.zaiOAuth = newZAIOAuthManager(
+		s.baseCtx,
+		s.zaiService,
+		func(ctx context.Context, accessToken string) (*zaiauth.Credential, error) {
+			return s.buildZAICredential(ctx, zaiCredentialImportRequest{AccessToken: accessToken})
+		},
+		func(ctx context.Context, credential *zaiauth.Credential) (int64, string, error) {
+			cfg, _, err := s.commitZAICredential(ctx, credential)
+			if err != nil {
+				return 0, "", err
+			}
+			return cfg.ID, cfg.Name, nil
+		},
+	)
 
 	// 初始化冷却管理器（统一管理渠道级和Key级冷却）
 	// 传入Server作为configGetter，利用缓存层查询渠道配置
@@ -206,7 +368,6 @@ func NewServer(store storage.Store) *Server {
 	healthConfig := loadHealthScoreConfig(configService)
 	s.healthCache = NewHealthCache(store, healthConfig, s.shutdownCh, &s.isShuttingDown, &s.wg)
 	if healthConfig.Enabled {
-		s.healthCache.Start()
 		log.Print("[INFO] 健康度排序已启用（基于成功率动态调整渠道优先级；冷却仍按原规则过滤）")
 	}
 
@@ -232,12 +393,6 @@ func NewServer(store storage.Store) *Server {
 		&s.isShuttingDown,
 		&s.wg,
 	)
-	// 启动日志 Workers
-	s.logService.StartWorkers()
-
-	// 启动清理协程（调试日志清理始终运行，普通日志按保留天数决定）
-	s.logService.StartCleanupLoop()
-
 	// 2. AuthService（负责认证授权）
 	// 初始化时自动从数据库加载API访问令牌
 	s.authService = NewAuthService(
@@ -245,6 +400,7 @@ func NewServer(store storage.Store) *Server {
 		s.loginRateLimiter,
 		store, // 传入store用于热更新令牌
 	)
+	s.authService.RegisterWebSessionRevokeHook(s.xaiOAuth.cancelByAdmin)
 
 	// 启动后台 worker（Token 统计 / Token 清理 / 状态清理）
 	s.startBackgroundWorkers()
@@ -255,26 +411,175 @@ func NewServer(store storage.Store) *Server {
 	if channelCheckIntervalHours == 0 {
 		log.Print("[INFO] 渠道定时检测未启用（channel_check_interval_hours=0）")
 	} else {
-		s.startScheduledChannelCheckLoop(time.Duration(channelCheckIntervalHours * float64(time.Hour)))
+		interval, _ := settingDurationFromFloat64(channelCheckIntervalHours, time.Hour)
+		s.startScheduledChannelCheckLoop(interval)
 	}
+
+	s.oauthCredentialImportJobs = newOAuthCredentialImportJobManager(s.baseCtx, oauthCredentialImportMaxRunningJobs)
+	s.oauthCredentialCleanupJobs = newOAuthCredentialCleanupJobManager(s.baseCtx)
+
+	// 所有启动关键状态完成加载后，再启动非关键后台任务。
+	// SQLite 纯模式只有一个连接，维护任务不得与认证/渠道初始化竞争。
+	s.healthCache.Start()
+	s.logService.StartWorkers()
+	s.logService.StartCleanupLoop()
 
 	return s
 
 }
 
-type channelTypeTimeoutConfig struct {
+// RefreshAntigravityUserAgent resolves the Antigravity Hub version before the
+// HTTP server starts accepting requests. The returned value is always usable;
+// on failure it is the fixed production fallback.
+func (s *Server) RefreshAntigravityUserAgent(ctx context.Context) (string, error) {
+	if s == nil || s.antigravityService == nil {
+		return antigravityauth.DefaultUserAgent, errors.New("antigravity service is unavailable")
+	}
+	err := s.antigravityService.RefreshUserAgent(ctx)
+	return s.antigravityUserAgent(), err
+}
+
+func (s *Server) antigravityUserAgent() string {
+	if s == nil {
+		return antigravityauth.DefaultUserAgent
+	}
+	return s.antigravityService.RequestUserAgent()
+}
+
+func loadAntigravityPromptMatcher(configService *ConfigService) *regexp.Regexp {
+	if configService == nil {
+		return nil
+	}
+	var words []string
+	if err := json.Unmarshal([]byte(configService.GetString("antigravity_sensitive_words", config.DefaultAntigravitySensitiveWordsJSON)), &words); err != nil {
+		log.Printf("[WARN] 无效的 antigravity_sensitive_words，已禁用提示词替换: %v", err)
+		return nil
+	}
+	return buildAntigravitySensitiveWordMatcher(words)
+}
+
+// StartModelCatalogSync 加载本地快照，并在启用时同步官方模型目录。
+func (s *Server) StartModelCatalogSync() {
+	if s == nil || s.configService == nil {
+		return
+	}
+	s.modelCatalogSyncMu.Lock()
+	defer s.modelCatalogSyncMu.Unlock()
+	if s.isShuttingDown.Load() || !s.modelCatalogSyncStarted.CompareAndSwap(false, true) {
+		return
+	}
+
+	intervalHours := normalizeModelCatalogSyncIntervalHours(
+		s.configService.GetFloat("model_catalog_sync_interval_hours", defaultModelCatalogSyncHours),
+	)
+	syncer := NewModelCatalogSyncer(
+		&http.Client{Timeout: modelCatalogRequestTimeout},
+		modelsDevCatalogURL,
+		modelCatalogCachePath(),
+	)
+	if err := syncer.LoadCache(); err != nil {
+		log.Printf("[WARN] 模型目录缓存加载失败: %v", err)
+	}
+	if intervalHours == 0 {
+		return
+	}
+
+	interval, valid := settingDurationFromFloat64(intervalHours, time.Hour)
+	if !valid || interval <= 0 {
+		log.Printf("[WARN] 无效的模型目录同步间隔: %v 小时", intervalHours)
+		return
+	}
+	s.wg.Add(1)
+	go s.runModelCatalogSyncLoop(syncer, interval)
+}
+
+type protocolTimeoutConfig struct {
 	FirstByteTimeout time.Duration
+	StreamTimeout    time.Duration
 	NonStreamTimeout time.Duration
 }
 
 // serverRuntimeConfig 启动期从数据库读取的运行时配置（修改后重启生效）
 type serverRuntimeConfig struct {
-	MaxKeyRetries       int
-	FirstByteTimeout    time.Duration
-	NonStreamTimeout    time.Duration
-	ChannelTypeTimeouts map[string]channelTypeTimeoutConfig
-	LogRetentionDays    int
-	ModelFuzzyMatch     bool
+	MaxKeyRetries                int
+	MaxConcurrency               int
+	MaxBodyBytes                 int
+	MaxImageBodyBytes            int
+	HTTPReadTimeout              time.Duration
+	FirstByteTimeout             time.Duration
+	StreamTimeout                time.Duration
+	NonStreamTimeout             time.Duration
+	UpstreamConnectionMaxAge     time.Duration
+	ProtocolTimeouts             map[string]protocolTimeoutConfig
+	LogRetentionDays             int
+	ModelFuzzyMatch              bool
+	ActiveRequestTitleEnabled    bool
+	CodexMap429To503             bool
+	GlobalCooldownDetectionRules *model.CooldownDetectionRules
+	Cooldown                     util.CooldownSettings
+}
+
+func loadGlobalCooldownDetectionRules(cs *ConfigService) *model.CooldownDetectionRules {
+	rules, err := parseGlobalCooldownDetectionRules(cs.GetString(globalCooldownDetectionRulesSettingKey, "{}"))
+	if err != nil {
+		log.Printf("[WARN] 无效的 %s，已回退为空规则: %v", globalCooldownDetectionRulesSettingKey, err)
+		return nil
+	}
+	return rules
+}
+
+// loadPositiveInt 读取必须为正数的配置项，非法值回退默认并告警。
+// loadHTTPReadTimeout 读取下游请求读取超时。0 表示使用内建默认值，负数非法。
+func loadHTTPReadTimeout(cs *ConfigService) time.Duration {
+	value := cs.GetDuration(config.HTTPReadTimeoutSettingKey, 0)
+	if value < 0 {
+		log.Printf("[WARN] 无效的 %s=%v（必须 >= 0），已使用默认值 %v",
+			config.HTTPReadTimeoutSettingKey, value, config.DefaultHTTPReadTimeout)
+		return config.DefaultHTTPReadTimeout
+	}
+	if value == 0 {
+		return config.DefaultHTTPReadTimeout
+	}
+	return value
+}
+
+func loadPositiveInt(cs *ConfigService, key string, defaultValue int) int {
+	value := cs.GetInt(key, defaultValue)
+	if value <= 0 {
+		log.Printf("[WARN] 无效的 %s=%d（必须 > 0），已使用默认值 %d", key, value, defaultValue)
+		return defaultValue
+	}
+	return value
+}
+
+// loadPositiveDurationSeconds 读取必须为正数且可安全转换为 time.Duration 的秒数。
+func loadPositiveDurationSeconds(cs *ConfigService, key string, defaultValue int) int {
+	value := loadPositiveInt(cs, key, defaultValue)
+	if _, valid := settingDurationFromInt64(int64(value), time.Second); !valid {
+		log.Printf("[WARN] 无效的 %s=%d（超出可表示的时长），已使用默认值 %d", key, value, defaultValue)
+		return defaultValue
+	}
+	return value
+}
+
+// loadCooldownSettings 从系统设置读取冷却时长（秒），非法值回退默认。
+func loadCooldownSettings(cs *ConfigService) util.CooldownSettings {
+	settings := util.CooldownSettings{
+		AuthSec:      loadPositiveDurationSeconds(cs, "cooldown_auth_seconds", config.DefaultCooldownAuthSeconds),
+		ServerSec:    loadPositiveDurationSeconds(cs, "cooldown_server_seconds", config.DefaultCooldownServerSeconds),
+		TimeoutSec:   loadPositiveDurationSeconds(cs, "cooldown_timeout_seconds", config.DefaultCooldownTimeoutSeconds),
+		RateLimitSec: loadPositiveDurationSeconds(cs, "cooldown_rate_limit_seconds", config.DefaultCooldownRateLimitSeconds),
+		MaxSec:       loadPositiveDurationSeconds(cs, "cooldown_max_seconds", config.DefaultCooldownMaxSeconds),
+		MinSec:       loadPositiveDurationSeconds(cs, "cooldown_min_seconds", config.DefaultCooldownMinSeconds),
+	}
+	// 上下限倒挂会让指数退避直接被 max 钳死在下限之下，语义不可用，回退默认对。
+	if settings.MinSec > settings.MaxSec {
+		log.Printf("[WARN] cooldown_min_seconds=%d 大于 cooldown_max_seconds=%d，已回退默认值 %d/%d",
+			settings.MinSec, settings.MaxSec, config.DefaultCooldownMinSeconds, config.DefaultCooldownMaxSeconds)
+		settings.MinSec = config.DefaultCooldownMinSeconds
+		settings.MaxSec = config.DefaultCooldownMaxSeconds
+	}
+	return settings
 }
 
 // loadServerRuntimeConfig 从 ConfigService 加载运行时配置并校验，无效值兜底为默认值
@@ -291,13 +596,25 @@ func loadServerRuntimeConfig(cs *ConfigService) serverRuntimeConfig {
 		firstByteTimeout = 0
 	}
 
+	streamTimeout := cs.GetDuration("stream_timeout", 0)
+	if streamTimeout < 0 {
+		log.Printf("[WARN] 无效的 stream_timeout=%v（必须 >= 0，0=禁用），已设为 0", streamTimeout)
+		streamTimeout = 0
+	}
+
 	nonStreamTimeout := cs.GetDuration("non_stream_timeout", 120*time.Second)
 	if nonStreamTimeout < 0 {
 		log.Printf("[WARN] 无效的 non_stream_timeout=%v（必须 >= 0，0=禁用），已使用默认值 %v", nonStreamTimeout, 120*time.Second)
 		nonStreamTimeout = 120 * time.Second
 	}
 
-	channelTypeTimeouts := loadChannelTypeTimeouts(cs)
+	upstreamConnectionMaxAge := cs.GetDuration("upstream_connection_reuse_limit_seconds", 0)
+	if upstreamConnectionMaxAge < 0 {
+		log.Printf("[WARN] 无效的 upstream_connection_reuse_limit_seconds=%v（必须 >= 0，0=不限制），已设为 0", upstreamConnectionMaxAge)
+		upstreamConnectionMaxAge = 0
+	}
+
+	protocolTimeouts := loadProtocolTimeouts(cs)
 
 	logRetentionDays := cs.GetInt("log_retention_days", 7)
 
@@ -307,33 +624,45 @@ func loadServerRuntimeConfig(cs *ConfigService) serverRuntimeConfig {
 	}
 
 	return serverRuntimeConfig{
-		MaxKeyRetries:       maxKeyRetries,
-		FirstByteTimeout:    firstByteTimeout,
-		NonStreamTimeout:    nonStreamTimeout,
-		ChannelTypeTimeouts: channelTypeTimeouts,
-		LogRetentionDays:    logRetentionDays,
-		ModelFuzzyMatch:     modelFuzzyMatch,
+		MaxKeyRetries:                maxKeyRetries,
+		MaxConcurrency:               loadPositiveInt(cs, "max_concurrency", config.DefaultMaxConcurrency),
+		MaxBodyBytes:                 loadPositiveInt(cs, "max_body_bytes", config.DefaultMaxBodyBytes),
+		MaxImageBodyBytes:            loadPositiveInt(cs, "max_image_body_bytes", config.DefaultMaxImageBodyBytes),
+		HTTPReadTimeout:              loadHTTPReadTimeout(cs),
+		FirstByteTimeout:             firstByteTimeout,
+		StreamTimeout:                streamTimeout,
+		NonStreamTimeout:             nonStreamTimeout,
+		UpstreamConnectionMaxAge:     upstreamConnectionMaxAge,
+		ProtocolTimeouts:             protocolTimeouts,
+		LogRetentionDays:             logRetentionDays,
+		ModelFuzzyMatch:              modelFuzzyMatch,
+		ActiveRequestTitleEnabled:    cs.GetBool(config.ActiveRequestTitleEnabledSettingKey, false),
+		CodexMap429To503:             cs.GetBool(config.CodexMap429To503SettingKey, false),
+		GlobalCooldownDetectionRules: loadGlobalCooldownDetectionRules(cs),
+		Cooldown:                     loadCooldownSettings(cs),
 	}
 }
 
-func loadChannelTypeTimeouts(cs *ConfigService) map[string]channelTypeTimeoutConfig {
-	timeouts := make(map[string]channelTypeTimeoutConfig, len(util.ChannelTypes))
-	for _, channelType := range util.ChannelTypes {
-		firstByteTimeout := cs.GetDuration(channelTypeFirstByteTimeoutSettingKey(channelType.Value), 0)
+func loadProtocolTimeouts(cs *ConfigService) map[string]protocolTimeoutConfig {
+	supported := protocol.AllProtocols()
+	timeouts := make(map[string]protocolTimeoutConfig, len(supported))
+	for _, supportedProtocol := range supported {
+		name := string(supportedProtocol)
+		firstByteTimeout := cs.GetDuration(protocolFirstByteTimeoutSettingKey(name), 0)
 		if firstByteTimeout < 0 {
 			log.Printf("[WARN] 无效的 %s=%v（必须 >= 0），已设为 0（回退全局首字超时）",
-				channelTypeFirstByteTimeoutSettingKey(channelType.Value), firstByteTimeout)
+				protocolFirstByteTimeoutSettingKey(name), firstByteTimeout)
 			firstByteTimeout = 0
 		}
 
-		nonStreamTimeout := cs.GetDuration(channelTypeNonStreamTimeoutSettingKey(channelType.Value), 0)
+		nonStreamTimeout := cs.GetDuration(protocolNonStreamTimeoutSettingKey(name), 0)
 		if nonStreamTimeout < 0 {
 			log.Printf("[WARN] 无效的 %s=%v（必须 >= 0），已设为 0（回退全局非流超时）",
-				channelTypeNonStreamTimeoutSettingKey(channelType.Value), nonStreamTimeout)
+				protocolNonStreamTimeoutSettingKey(name), nonStreamTimeout)
 			nonStreamTimeout = 0
 		}
 
-		timeouts[channelType.Value] = channelTypeTimeoutConfig{
+		timeouts[name] = protocolTimeoutConfig{
 			FirstByteTimeout: firstByteTimeout,
 			NonStreamTimeout: nonStreamTimeout,
 		}
@@ -341,12 +670,38 @@ func loadChannelTypeTimeouts(cs *ConfigService) map[string]channelTypeTimeoutCon
 	return timeouts
 }
 
-func channelTypeFirstByteTimeoutSettingKey(channelType string) string {
-	return util.NormalizeChannelType(channelType) + "_first_byte_timeout"
+// migratedEnvSettings 已迁移到系统设置的旧环境变量 → 新配置项。
+// 保留告警而非静默忽略：老部署仍在 .env 里设着这些值，不提示会让人以为限额还生效。
+var migratedEnvSettings = map[string]string{
+	"CCLOAD_MAX_CONCURRENCY":         "max_concurrency",
+	"CCLOAD_MAX_BODY_BYTES":          "max_body_bytes / max_image_body_bytes",
+	"CCLOAD_COOLDOWN_AUTH_SEC":       "cooldown_auth_seconds",
+	"CCLOAD_COOLDOWN_SERVER_SEC":     "cooldown_server_seconds",
+	"CCLOAD_COOLDOWN_TIMEOUT_SEC":    "cooldown_timeout_seconds",
+	"CCLOAD_COOLDOWN_RATE_LIMIT_SEC": "cooldown_rate_limit_seconds",
+	"CCLOAD_COOLDOWN_MAX_SEC":        "cooldown_max_seconds",
+	"CCLOAD_COOLDOWN_MIN_SEC":        "cooldown_min_seconds",
 }
 
-func channelTypeNonStreamTimeoutSettingKey(channelType string) string {
-	return util.NormalizeChannelType(channelType) + "_non_stream_timeout"
+func warnMigratedEnvSettings() {
+	keys := make([]string, 0, len(migratedEnvSettings))
+	for key := range migratedEnvSettings {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		if os.Getenv(key) != "" {
+			log.Printf("[WARN] 环境变量 %s 已废弃且不再生效，请改用系统设置项 %s", key, migratedEnvSettings[key])
+		}
+	}
+}
+
+func protocolFirstByteTimeoutSettingKey(upstreamProtocol string) string {
+	return util.NormalizeProtocol(upstreamProtocol) + "_first_byte_timeout"
+}
+
+func protocolNonStreamTimeoutSettingKey(upstreamProtocol string) string {
+	return util.NormalizeProtocol(upstreamProtocol) + "_non_stream_timeout"
 }
 
 // loadHealthScoreConfig 从 ConfigService 加载健康度配置，无效值兜底为默认值
@@ -357,20 +712,35 @@ func loadHealthScoreConfig(cs *ConfigService) model.HealthScoreConfig {
 		log.Printf("[WARN] 无效的 success_rate_penalty_weight=%d（必须 >= 0），已使用默认值 %d", successRatePenaltyWeight, defaultHealthCfg.SuccessRatePenaltyWeight)
 		successRatePenaltyWeight = defaultHealthCfg.SuccessRatePenaltyWeight
 	}
-	windowMinutes := cs.GetInt("health_score_window_minutes", 30)
-	if windowMinutes < 1 {
-		log.Printf("[WARN] 无效的 health_score_window_minutes=%d（必须 >= 1），已使用默认值 30", windowMinutes)
-		windowMinutes = 30
+	windowMinutes := cs.GetInt("health_score_window_minutes", defaultHealthCfg.WindowMinutes)
+	if _, valid := settingDurationFromInt64(int64(windowMinutes), time.Minute); windowMinutes < 1 || !valid {
+		log.Printf("[WARN] 无效的 health_score_window_minutes=%d（必须 >= 1），已使用默认值 %d", windowMinutes, defaultHealthCfg.WindowMinutes)
+		windowMinutes = defaultHealthCfg.WindowMinutes
 	}
-	updateInterval := cs.GetInt("health_score_update_interval", 30)
-	if updateInterval < 1 {
-		log.Printf("[WARN] 无效的 health_score_update_interval=%d（必须 >= 1），已使用默认值 30", updateInterval)
-		updateInterval = 30
+	updateInterval := cs.GetInt("health_score_update_interval", defaultHealthCfg.UpdateIntervalSeconds)
+	if _, valid := settingDurationFromInt64(int64(updateInterval), time.Second); updateInterval < 1 || !valid {
+		log.Printf("[WARN] 无效的 health_score_update_interval=%d（必须 >= 1），已使用默认值 %d", updateInterval, defaultHealthCfg.UpdateIntervalSeconds)
+		updateInterval = defaultHealthCfg.UpdateIntervalSeconds
 	}
 	minConfidentSample := cs.GetInt("health_min_confident_sample", defaultHealthCfg.MinConfidentSample)
 	if minConfidentSample < 1 {
 		log.Printf("[WARN] 无效的 health_min_confident_sample=%d（必须 >= 1），已使用默认值 %d", minConfidentSample, defaultHealthCfg.MinConfidentSample)
 		minConfidentSample = defaultHealthCfg.MinConfidentSample
+	}
+	ttfbPenaltyWeight := cs.GetFloat("ttfb_penalty_weight", defaultHealthCfg.TTFBPenaltyWeight)
+	if ttfbPenaltyWeight < 0 {
+		log.Printf("[WARN] 无效的 ttfb_penalty_weight=%v（必须 >= 0），已使用默认值 %v", ttfbPenaltyWeight, defaultHealthCfg.TTFBPenaltyWeight)
+		ttfbPenaltyWeight = defaultHealthCfg.TTFBPenaltyWeight
+	}
+	ttfbMaxSlowRatio := cs.GetFloat("ttfb_max_slow_ratio", defaultHealthCfg.TTFBMaxSlowRatio)
+	if ttfbMaxSlowRatio < 0 {
+		log.Printf("[WARN] 无效的 ttfb_max_slow_ratio=%v（必须 >= 0），已使用默认值 %v", ttfbMaxSlowRatio, defaultHealthCfg.TTFBMaxSlowRatio)
+		ttfbMaxSlowRatio = defaultHealthCfg.TTFBMaxSlowRatio
+	}
+	ttfbMinConfidentSample := cs.GetInt("ttfb_min_confident_sample", defaultHealthCfg.TTFBMinConfidentSample)
+	if ttfbMinConfidentSample < 1 {
+		log.Printf("[WARN] 无效的 ttfb_min_confident_sample=%d（必须 >= 1），已使用默认值 %d", ttfbMinConfidentSample, defaultHealthCfg.TTFBMinConfidentSample)
+		ttfbMinConfidentSample = defaultHealthCfg.TTFBMinConfidentSample
 	}
 	return model.HealthScoreConfig{
 		Enabled:                  cs.GetBool("enable_health_score", defaultHealthCfg.Enabled),
@@ -378,6 +748,10 @@ func loadHealthScoreConfig(cs *ConfigService) model.HealthScoreConfig {
 		WindowMinutes:            windowMinutes,
 		UpdateIntervalSeconds:    updateInterval,
 		MinConfidentSample:       minConfidentSample,
+		EnableTTFBScore:          cs.GetBool("enable_ttfb_score", defaultHealthCfg.EnableTTFBScore),
+		TTFBPenaltyWeight:        ttfbPenaltyWeight,
+		TTFBMaxSlowRatio:         ttfbMaxSlowRatio,
+		TTFBMinConfidentSample:   ttfbMinConfidentSample,
 	}
 }
 
@@ -411,22 +785,28 @@ func bootstrapCostAndURLStats(store storage.Store, costCache *CostCache, urlSele
 	disabledURLs, err := store.LoadDisabledURLs(disabledLoadCtx)
 	if err != nil {
 		log.Printf("[WARN] 加载手动禁用URL状态失败: %v（重启后禁用状态可能丢失）", err)
-	} else if len(disabledURLs) > 0 {
+	} else {
 		urlSelector.LoadDisabled(disabledURLs)
 		count := 0
 		for _, urls := range disabledURLs {
 			count += len(urls)
 		}
-		log.Printf("[INFO] 已恢复手动禁用URL状态（%d条）", count)
+		if count > 0 {
+			log.Printf("[INFO] 已恢复手动禁用URL状态（%d条）", count)
+		}
 	}
 }
 
-// startBackgroundWorkers 启动 Token 统计 / Token 清理 / 状态清理三个后台协程。
+// startBackgroundWorkers 启动所有常驻后台协程。
 // 全部纳入 s.wg，Shutdown 时通过 shutdownCh 协调退出。
 func (s *Server) startBackgroundWorkers() {
 	// 启动Token统计Worker（有界队列：性能可控，Shutdown可等待）
 	s.wg.Add(1)
 	go s.tokenStatsWorker()
+
+	// Codex SSE 额度是旁路元数据，异步落库不得阻塞流式响应。
+	s.wg.Add(1)
+	go s.codexPassiveUsageWorker()
 
 	// 启动后台清理协程（Token 认证）
 	s.wg.Add(1)
@@ -435,6 +815,36 @@ func (s *Server) startBackgroundWorkers() {
 	// [FIX] P1: 启动后台状态清理协程（防止内存泄漏）
 	s.wg.Add(1)
 	go s.stateCleanupLoop()
+
+	s.wg.Add(1)
+	go s.disabledURLReloadLoop()
+
+	s.wg.Add(1)
+	go s.responsesExecutionSessionCleanupLoop()
+}
+
+func (s *Server) disabledURLReloadLoop() {
+	defer s.wg.Done()
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-s.shutdownCh:
+			return
+		case <-ticker.C:
+			s.disabledURLSyncMu.Lock()
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			disabled, err := s.store.LoadDisabledURLs(ctx)
+			cancel()
+			if err != nil {
+				s.disabledURLSyncMu.Unlock()
+				log.Printf("[WARN] 刷新手动禁用URL状态失败: %v", err)
+				continue
+			}
+			s.urlSelector.LoadDisabled(disabled)
+			s.disabledURLSyncMu.Unlock()
+		}
+	}
 }
 
 // ================== 缓存辅助函数 ==================
@@ -510,28 +920,225 @@ func buildHTTPTransport(skipTLSVerify bool) *http.Transport {
 	return transport // HTTP/2 已通过 ForceAttemptHTTP2 启用
 }
 
-// getClientForChannel 返回渠道对应的 HTTP 客户端。
-// 无代理或空串 → 全局 client；相同 proxyURL 共享 Transport 和连接池。
-//
-// 缓存按 proxyURL 永久保留：渠道改 proxyURL 后旧 client 不再被引用，
-// 其空闲连接随 IdleConnTimeout 自然回收，进程退出时由 Shutdown 统一关闭。
-// 这是有界泄漏（proxyURL 种类有限），故意不引入 LRU/引用计数（YAGNI）。
+const antigravityHTTPClientCacheCapacity = 8192
+
+var errAntigravityHTTPClientCacheClosed = errors.New("antigravity HTTP client cache is closed")
+
+// antigravityHTTPClientCache is a bounded LRU of Antigravity clients. A client
+// owns a transport and therefore a physical connection pool; evicting it must
+// close idle connections or credential/proxy churn would retain sockets forever.
+type antigravityHTTPClientCache struct {
+	mu       sync.Mutex
+	capacity int
+	entries  map[upstreamHTTPClientCacheKey]*list.Element
+	order    *list.List
+	closed   bool
+}
+
+type antigravityHTTPClientCacheEntry struct {
+	key    upstreamHTTPClientCacheKey
+	client *http.Client
+}
+
+func newAntigravityHTTPClientCache(capacity int) *antigravityHTTPClientCache {
+	if capacity < 1 {
+		capacity = 1
+	}
+	return &antigravityHTTPClientCache{
+		capacity: capacity,
+		entries:  make(map[upstreamHTTPClientCacheKey]*list.Element, capacity),
+		order:    list.New(),
+	}
+}
+
+func (c *antigravityHTTPClientCache) getOrCreate(
+	key upstreamHTTPClientCacheKey,
+	create func() (*http.Client, error),
+) (*http.Client, error) {
+	if c == nil {
+		return create()
+	}
+	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
+		return nil, errAntigravityHTTPClientCacheClosed
+	}
+	if element := c.entries[key]; element != nil {
+		c.order.MoveToFront(element)
+		client := element.Value.(antigravityHTTPClientCacheEntry).client
+		c.mu.Unlock()
+		return client, nil
+	}
+	c.mu.Unlock()
+
+	client, err := create()
+	if err != nil {
+		return nil, err
+	}
+
+	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
+		closeUpstreamHTTPClient(client)
+		return nil, errAntigravityHTTPClientCacheClosed
+	}
+	// Another goroutine may have populated the same key while the transport
+	// was being built. Keep one client and immediately discard the duplicate.
+	if element := c.entries[key]; element != nil {
+		c.order.MoveToFront(element)
+		actual := element.Value.(antigravityHTTPClientCacheEntry).client
+		c.mu.Unlock()
+		closeUpstreamHTTPClient(client)
+		return actual, nil
+	}
+	element := c.order.PushFront(antigravityHTTPClientCacheEntry{key: key, client: client})
+	c.entries[key] = element
+	var evicted *http.Client
+	if c.order.Len() > c.capacity {
+		oldest := c.order.Back()
+		if oldest != nil {
+			entry := oldest.Value.(antigravityHTTPClientCacheEntry)
+			delete(c.entries, entry.key)
+			c.order.Remove(oldest)
+			evicted = entry.client
+		}
+	}
+	c.mu.Unlock()
+	if evicted != nil {
+		closeUpstreamHTTPClient(evicted)
+	}
+	return client, nil
+}
+
+func (c *antigravityHTTPClientCache) closeAll() {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	c.closed = true
+	clients := make([]*http.Client, 0, len(c.entries))
+	for _, element := range c.entries {
+		clients = append(clients, element.Value.(antigravityHTTPClientCacheEntry).client)
+	}
+	c.entries = make(map[upstreamHTTPClientCacheKey]*list.Element, c.capacity)
+	c.order.Init()
+	c.mu.Unlock()
+	for _, client := range clients {
+		closeUpstreamHTTPClient(client)
+	}
+}
+
+type upstreamHTTPClientCacheKey struct {
+	proxyURL              string
+	antigravityHTTP11Only bool
+	credentialScope       string
+}
+
+func (s *Server) getAntigravityHTTPClientCache() *antigravityHTTPClientCache {
+	s.antigravityTransportMu.Lock()
+	defer s.antigravityTransportMu.Unlock()
+	if s.antigravityTransports == nil {
+		s.antigravityTransports = newAntigravityHTTPClientCache(antigravityHTTPClientCacheCapacity)
+	}
+	return s.antigravityTransports
+}
+
+// antigravityCredentialPoolScope deliberately uses the refresh token rather
+// than the access token. Access tokens rotate; the refresh token identifies the
+// OAuth identity whose HTTP/1.1 connection pool must remain isolated.
+func antigravityCredentialPoolScope(cfg *model.Config) string {
+	if cfg == nil || !cfg.UsesAntigravityOAuth() {
+		return ""
+	}
+	if credential, err := antigravityauth.ParseCredential([]byte(cfg.OAuthCredential)); err == nil && credential.RefreshToken != "" {
+		digest := sha256.Sum256([]byte(credential.RefreshToken))
+		return "refresh:" + hex.EncodeToString(digest[:])
+	}
+	// A malformed/incomplete credential must not make unrelated channels share
+	// a pool. Channel ID is stable and is only a defensive fallback.
+	if cfg.ID != 0 {
+		return fmt.Sprintf("channel:%d", cfg.ID)
+	}
+	return ""
+}
+
 func (s *Server) getClientForChannel(cfg *model.Config) *http.Client {
-	if cfg.ProxyURL == "" {
+	if cfg == nil {
 		return s.client
 	}
-	if v, ok := s.proxyTransports.Load(cfg.ProxyURL); ok {
+	defaultClient := s.client
+	clientFactory := newUpstreamHTTPClient
+	antigravityHTTP11Only := cfg.UsesAntigravityOAuth()
+	if antigravityHTTP11Only {
+		defaultClient = s.antigravityClient
+		clientFactory = newAntigravityHTTPClient
+		// Tests and embedders may inject a semantic RoundTripper. It already is
+		// the transport boundary; replacing it with a network transport would
+		// silently bypass the injected behavior.
+		if defaultClient != nil {
+			switch defaultClient.Transport.(type) {
+			case *http.Transport, *upstreamConnectionAgeTransport:
+			default:
+				return defaultClient
+			}
+		}
+		credentialScope := antigravityCredentialPoolScope(cfg)
+		// Channels without a parseable credential are retained on the legacy
+		// global client. Real OAuth credentials always receive their own scope.
+		if credentialScope != "" {
+			proxyURL := strings.TrimSpace(cfg.ProxyURL)
+			key := upstreamHTTPClientCacheKey{
+				proxyURL:              proxyURL,
+				antigravityHTTP11Only: true,
+				credentialScope:       credentialScope,
+			}
+			cache := s.getAntigravityHTTPClientCache()
+			client, err := cache.getOrCreate(key, func() (*http.Client, error) {
+				var transport *http.Transport
+				var err error
+				if proxyURL == "" {
+					transport = buildHTTPTransport(s.skipTLSVerify)
+				} else {
+					transport, err = buildChannelProxyTransport(proxyURL, s.skipTLSVerify)
+				}
+				if err != nil {
+					return nil, err
+				}
+				return clientFactory(transport, s.upstreamConnectionMaxAge), nil
+			})
+			if err == nil {
+				return client
+			}
+			log.Printf("[WARN] 渠道 %d 代理 %q 无效，回退凭证隔离的直连池: %v", cfg.ID, cfg.ProxyURL, err)
+			fallbackKey := key
+			fallbackKey.proxyURL = ""
+			fallback, fallbackErr := cache.getOrCreate(fallbackKey, func() (*http.Client, error) {
+				return clientFactory(buildHTTPTransport(s.skipTLSVerify), s.upstreamConnectionMaxAge), nil
+			})
+			if fallbackErr == nil {
+				return fallback
+			}
+		}
+	}
+	if cfg.ProxyURL == "" {
+		return defaultClient
+	}
+	cacheKey := upstreamHTTPClientCacheKey{
+		proxyURL:              cfg.ProxyURL,
+		antigravityHTTP11Only: antigravityHTTP11Only,
+	}
+	if v, ok := s.proxyTransports.Load(cacheKey); ok {
 		return v.(*http.Client)
 	}
 
 	t, err := buildChannelProxyTransport(cfg.ProxyURL, s.skipTLSVerify)
 	if err != nil {
 		log.Printf("[WARN] 渠道 %d 代理 %q 无效，回退全局: %v", cfg.ID, cfg.ProxyURL, err)
-		return s.client
+		return defaultClient
 	}
-	c := &http.Client{Transport: t, Timeout: 0}
-	if actual, loaded := s.proxyTransports.LoadOrStore(cfg.ProxyURL, c); loaded {
-		t.CloseIdleConnections()
+	c := clientFactory(t, s.upstreamConnectionMaxAge)
+	if actual, loaded := s.proxyTransports.LoadOrStore(cacheKey, c); loaded {
+		closeUpstreamHTTPClient(c)
 		return actual.(*http.Client)
 	}
 	log.Printf("[INFO] 渠道 %d 使用独立代理: %s", cfg.ID, cfg.ProxyURL)
@@ -586,15 +1193,16 @@ func (s *Server) GetEnabledChannelsByModel(ctx context.Context, modelName string
 	)
 }
 
-// GetEnabledChannelsByType 根据渠道类型获取所有启用的渠道配置
-func (s *Server) GetEnabledChannelsByType(ctx context.Context, channelType string) ([]*model.Config, error) {
+// getEnabledChannelsSnapshotByModel 返回路由热路径使用的只读渠道快照。
+// Config 指针由 ChannelCache 持有，调用方只能过滤或重排外层 slice，不能修改 Config。
+func (s *Server) getEnabledChannelsSnapshotByModel(ctx context.Context, modelName string) ([]*model.Config, error) {
 	return readThroughChannelCache(
 		s,
 		func(cache *storage.ChannelCache) ([]*model.Config, error) {
-			return cache.GetEnabledChannelsByType(ctx, channelType)
+			return cache.GetEnabledChannelsSnapshotByModel(ctx, modelName)
 		},
 		func() ([]*model.Config, error) {
-			return s.store.GetEnabledChannelsByType(ctx, channelType)
+			return s.store.GetEnabledChannelsByModel(ctx, modelName)
 		},
 	)
 }
@@ -635,6 +1243,33 @@ func (s *Server) getAllKeyCooldowns(ctx context.Context) (map[int64]map[int]time
 	)
 }
 
+func (s *Server) getAllModelCooldowns(ctx context.Context) (map[int64]map[string]time.Time, error) {
+	return readThroughChannelCache(
+		s,
+		func(cache *storage.ChannelCache) (map[int64]map[string]time.Time, error) {
+			return cache.GetAllModelCooldowns(ctx)
+		},
+		func() (map[int64]map[string]time.Time, error) {
+			return s.store.GetAllModelCooldowns(ctx)
+		},
+	)
+}
+
+// hasActiveModelCooldown 通过缓存快速判断指定渠道模型是否有活跃冷却。
+// 用于成功路径的快速跳过：绝大多数模型从未被冷却，无需每次成功都执行 DELETE。
+func (s *Server) hasActiveModelCooldown(ctx context.Context, channelID int64, model string) bool {
+	cooldowns, err := s.getAllModelCooldowns(ctx)
+	if err != nil {
+		return true // 查询失败时保守处理：执行清除
+	}
+	models := cooldowns[channelID]
+	if len(models) == 0 {
+		return false
+	}
+	until, ok := models[model]
+	return ok && until.After(time.Now())
+}
+
 // InvalidateChannelListCache 使渠道列表缓存失效
 // 在渠道CRUD操作后调用，确保缓存一致性
 func (s *Server) InvalidateChannelListCache() {
@@ -645,10 +1280,8 @@ func (s *Server) InvalidateChannelListCache() {
 	if s.channelBalancer != nil {
 		s.channelBalancer.ResetAll()
 	}
-	// 一并失效渠道类型映射缓存，避免 admin CRUD 后 60s TTL 脏读（read-after-write 一致性）
-	s.channelTypesCacheMu.Lock()
-	s.channelTypesCache = nil
-	s.channelTypesCacheMu.Unlock()
+	// URL 或上游协议配置可能已变化，丢弃运行时学习结果。
+	s.protocolCapabilities.clear()
 }
 
 // InvalidateAPIKeysCache 使指定渠道的 API Keys 缓存失效
@@ -683,12 +1316,24 @@ func (s *Server) invalidateChannelRelatedCache(channelID int64) {
 	s.invalidateCooldownCache()
 }
 
+// GetReadTimeout 返回 HTTP ReadTimeout：读取请求头与请求体的整段上限。
+// 它决定慢速上传何时被传输层切断，与请求体大小上限是两件事。
+func (s *Server) GetReadTimeout() time.Duration {
+	if s == nil || s.httpReadTimeout <= 0 {
+		return config.DefaultHTTPReadTimeout
+	}
+	return s.httpReadTimeout
+}
+
 // GetWriteTimeout 返回建议的 HTTP WriteTimeout
-// 基于 nonStreamTimeout 动态计算，确保传输层超时 >= 业务层超时
+// 基于请求总超时动态计算，确保传输层不会早于业务层截断响应
 func (s *Server) GetWriteTimeout() time.Duration {
 	const minWriteTimeout = 120 * time.Second
 	maxTimeout := s.nonStreamTimeout
-	for _, timeouts := range s.channelTypeTimeouts {
+	if s.streamTimeout > maxTimeout {
+		maxTimeout = s.streamTimeout
+	}
+	for _, timeouts := range s.protocolTimeouts {
 		if timeouts.NonStreamTimeout > maxTimeout {
 			maxTimeout = timeouts.NonStreamTimeout
 		}
@@ -699,21 +1344,19 @@ func (s *Server) GetWriteTimeout() time.Duration {
 	return minWriteTimeout
 }
 
-func (s *Server) resolveProtocolTimeouts(cfg *model.Config, plan protocol.TransformPlan) channelTypeTimeoutConfig {
-	timeouts := channelTypeTimeoutConfig{
+func (s *Server) resolveProtocolTimeouts(plan protocol.TransformPlan) protocolTimeoutConfig {
+	timeouts := protocolTimeoutConfig{
 		FirstByteTimeout: s.firstByteTimeout,
+		StreamTimeout:    s.streamTimeout,
 		NonStreamTimeout: s.nonStreamTimeout,
 	}
 
 	protocolKey := string(plan.UpstreamProtocol)
-	if protocolKey == "" && cfg != nil {
-		protocolKey = cfg.GetChannelType()
-	}
 	if protocolKey == "" {
 		return timeouts
 	}
 
-	override, ok := s.channelTypeTimeouts[util.NormalizeChannelType(protocolKey)]
+	override, ok := s.protocolTimeouts[util.NormalizeProtocol(protocolKey)]
 	if !ok {
 		return timeouts
 	}
@@ -751,16 +1394,27 @@ func (s *Server) SetupRoutes(r *gin.Engine) {
 		apiV1Beta.Any("/*path", s.HandleProxyRequest)
 	}
 
+	// Codex CLI 直连路由别名（chatgpt_base_url 兼容），对齐 CLIProxyAPI 的
+	// codexDirect 路由组。GET 是 Responses WebSocket 升级；POST 是 SSE
+	// fallback，两者都由 DetectRequestFamily 识别为 RequestFamilyResponses。
+	codexDirect := r.Group("/backend-api/codex")
+	codexDirect.Use(s.authService.RequireAPIAuth())
+	codexDirect.Use(captureClientRequestMetadata())
+	{
+		codexDirect.GET("/responses", s.HandleProxyRequest)
+		codexDirect.POST("/responses", s.HandleProxyRequest)
+	}
+
 	// 健康检查（公开访问，无需认证，K8s liveness/readiness probe）
 	r.GET("/health", s.HandleHealth)
 
 	// 公开访问的API（首页仪表盘数据）
 	// [SECURITY NOTE] /public/* 端点故意不做认证，用于首页展示。
-	// 如需隐藏运营数据，可添加 s.authService.RequireTokenAuth() 中间件。
+	// 认证仪表盘使用 /dashboard/summary；该公开端点保留给未登录首页集成。
 	public := r.Group("/public", ZstdMiddleware())
 	{
 		public.GET("/summary", s.HandlePublicSummary)
-		public.GET("/channel-types", s.HandleGetChannelTypes)
+		public.GET("/protocols", s.HandleGetProtocols)
 		public.GET("/version", s.HandlePublicVersion)
 	}
 
@@ -770,7 +1424,7 @@ func (s *Server) SetupRoutes(r *gin.Engine) {
 
 	// 需要身份验证的admin APIs（使用Token认证）
 	admin := r.Group("/admin", ZstdMiddleware())
-	admin.Use(s.authService.RequireTokenAuth())
+	admin.Use(s.authService.RequireAdminAuth())
 	{
 		// 渠道管理
 		admin.GET("/channels", s.HandleChannels)
@@ -778,20 +1432,68 @@ func (s *Server) SetupRoutes(r *gin.Engine) {
 		admin.GET("/channels/filter-options", s.HandleChannelsFilterOptions)
 		admin.GET("/channels/export", s.HandleExportChannelsCSV)
 		admin.POST("/channels/import", s.HandleImportChannelsCSV)
+		admin.POST("/oauth/credentials/import", s.HandleImportOAuthCredentials)
+		admin.POST("/oauth/credentials/import/stream", s.HandleImportOAuthCredentialsStream)
+		admin.POST("/oauth/credentials/import/jobs", s.HandleStartOAuthCredentialImportJob)
+		admin.GET("/oauth/credentials/import/jobs/:id", s.HandleOAuthCredentialImportJob)
+		admin.GET("/oauth/credentials/cleanup/options", s.HandleOAuthCredentialCleanupOptions)
+		admin.POST("/oauth/credentials/cleanup/jobs", s.HandleStartOAuthCredentialCleanupJob)
+		admin.GET("/oauth/credentials/cleanup/jobs/:id/stream", s.HandleOAuthCredentialCleanupStream)
+		admin.POST("/oauth/credentials/cleanup/jobs/:id/cancel", s.HandleCancelOAuthCredentialCleanupJob)
+		admin.POST("/codex/oauth/start", s.HandleStartCodexOAuth)
+		admin.GET("/codex/oauth/status", s.HandleCodexOAuthStatus)
+		admin.POST("/codex/oauth/cancel", s.HandleCancelCodexOAuth)
+		admin.POST("/codex/oauth/callback", s.HandleSubmitCodexOAuthCallback)
+		admin.POST("/codex/personal-access-token", s.HandleCreateCodexPersonalAccessToken)
+		admin.POST("/codex/credentials/import", s.HandleImportCodexCredential)
+		admin.POST("/channels/:id/codex-credential/refresh", s.HandleRefreshCodexCredential)
+		admin.PUT("/channels/:id/codex-quota-overdraft", s.HandleUpdateCodexQuotaOverdraft)
+		admin.POST("/channels/:id/oauth-usage", s.HandleOAuthUsage)
+		admin.POST("/channels/:id/codex-quota-reset", s.HandleResetCodexQuota)
+		admin.POST("/channels/oauth-usage/batch/stream", s.HandleOAuthUsageBatchStream)
+		admin.POST("/antigravity/oauth/start", s.HandleStartAntigravityOAuth)
+		admin.GET("/antigravity/oauth/status", s.HandleAntigravityOAuthStatus)
+		admin.POST("/antigravity/oauth/cancel", s.HandleCancelAntigravityOAuth)
+		admin.POST("/antigravity/oauth/callback", s.HandleSubmitAntigravityOAuthCallback)
+		admin.POST("/antigravity/credentials/import", s.HandleImportAntigravityCredential)
+		admin.POST("/channels/:id/antigravity-credential/refresh", s.HandleRefreshAntigravityCredential)
+		admin.POST("/xai/oauth/start", s.HandleStartXAIOAuth)
+		admin.GET("/xai/oauth/status", s.HandleXAIOAuthStatus)
+		admin.POST("/xai/oauth/cancel", s.HandleCancelXAIOAuth)
+		admin.POST("/xai/oauth/callback", s.HandleSubmitXAIOAuthCallback)
+		admin.POST("/xai/credentials/import/stream", s.HandleImportXAICredentialsStream)
+		admin.POST("/xai/credentials/import/jobs", s.HandleStartXAICredentialImportJob)
+		admin.POST("/anthropic/oauth/start", s.HandleStartAnthropicOAuth)
+		admin.GET("/anthropic/oauth/status", s.HandleAnthropicOAuthStatus)
+		admin.POST("/anthropic/oauth/cancel", s.HandleCancelAnthropicOAuth)
+		admin.POST("/anthropic/oauth/callback", s.HandleSubmitAnthropicOAuthCode)
+		admin.POST("/anthropic/oauth/cookie", s.HandleAnthropicCookieAuth)
+		admin.POST("/channels/:id/anthropic-credential/refresh", s.HandleRefreshAnthropicCredential)
+		admin.POST("/zai/oauth/start", s.HandleStartZAIOAuth)
+		admin.GET("/zai/oauth/status", s.HandleZAIOAuthStatus)
+		admin.POST("/zai/oauth/cancel", s.HandleCancelZAIOAuth)
+		admin.POST("/zai/credentials/import", s.HandleImportZAICredential)
 		admin.POST("/channels/check-duplicate", s.HandleCheckDuplicateChannel)
 		admin.POST("/channels/batch-priority", s.HandleBatchUpdatePriority) // 批量更新渠道优先级
 		admin.POST("/channels/batch-enabled", s.HandleBatchSetEnabled)      // 批量启用/禁用渠道
-		admin.POST("/channels/batch-delete", s.HandleBatchDeleteChannels)   // 批量删除渠道
+		admin.POST("/channels/batch-clear-cooldowns", s.HandleBatchClearCooldowns)
+		admin.POST("/channels/batch-advanced", s.HandleBatchPatchChannels)
+		admin.POST("/channels/batch-delete", s.HandleBatchDeleteChannels) // 批量删除渠道
+		admin.POST("/channels/cooldown-detection/test", s.HandleCooldownDetectionTest)
 		admin.GET("/channels/:id", s.HandleChannelByID)
 		admin.PUT("/channels/:id", s.HandleChannelByID)
 		admin.DELETE("/channels/:id", s.HandleChannelByID)
+		admin.GET("/channels/:id/editor", s.HandleChannelEditor)
 		admin.GET("/channels/:id/keys", s.HandleChannelKeys)
+		admin.GET("/channels/:id/model-stats", s.HandleChannelModelStats)
 		admin.GET("/channels/:id/url-stats", s.HandleChannelURLStats)
 		admin.POST("/channels/:id/url-disable", s.HandleURLDisable)
 		admin.POST("/channels/:id/url-enable", s.HandleURLEnable)
 		admin.POST("/channels/:id/key-disable", s.HandleAPIKeyDisable)
 		admin.POST("/channels/:id/key-enable", s.HandleAPIKeyEnable)
 		admin.POST("/channels/models/fetch", s.HandleFetchModelsPreview) // 临时渠道配置获取模型列表
+		admin.POST("/channels/billing/fetch", s.HandleFetchSub2APIBilling)
+		admin.POST("/channels/websocket-probe", s.HandleChannelWebsocketProbe)
 		admin.POST("/channels/models/refresh-batch", s.HandleBatchRefreshModels)
 		admin.GET("/channels/:id/models/fetch", s.HandleFetchModels) // 获取渠道可用模型列表(新增)
 		admin.POST("/channels/:id/models", s.HandleAddModels)        // 添加渠道模型
@@ -799,6 +1501,7 @@ func (s *Server) SetupRoutes(r *gin.Engine) {
 		admin.POST("/channels/:id/test", s.HandleChannelTest)
 		admin.POST("/channels/:id/test-url", s.HandleChannelURLTest)
 		admin.POST("/channels/:id/chat", s.HandleChannelChat)
+		admin.POST("/channels/:id/images/generations", s.HandleChannelImageGeneration)
 		admin.POST("/channels/:id/cooldown", s.HandleSetChannelCooldown)
 		admin.POST("/channels/:id/keys/:keyIndex/cooldown", s.HandleSetKeyCooldown)
 		admin.DELETE("/channels/:id/keys/:keyIndex", s.HandleDeleteAPIKey)
@@ -809,6 +1512,7 @@ func (s *Server) SetupRoutes(r *gin.Engine) {
 		admin.POST("/debug-logs/merged-response", s.HandleMergeDebugResponse)
 		admin.GET("/debug-logs/:log_id", s.HandleGetDebugLog)
 		admin.GET("/active-requests", s.HandleActiveRequests) // 进行中请求（内存状态）
+		admin.GET("/runtime-metrics", s.HandleRuntimeMetrics)
 		admin.GET("/active-requests/:request_id/debug-log", s.HandleGetActiveRequestDebugLog)
 		admin.GET("/metrics", s.HandleMetrics)
 		admin.GET("/stats", s.HandleStats)
@@ -828,6 +1532,26 @@ func (s *Server) SetupRoutes(r *gin.Engine) {
 		admin.POST("/settings/:key/reset", s.AdminResetSetting)
 		admin.POST("/settings/batch", s.AdminBatchUpdateSettings)
 	}
+
+	// Web 仪表盘只读 API。API Token 会话由服务端强制绑定 auth_token_id。
+	dashboard := r.Group("/dashboard", ZstdMiddleware())
+	dashboard.Use(s.authService.RequireWebAuth())
+	{
+		dashboard.GET("/session", s.authService.HandleWebSession)
+		dashboard.GET("/summary", s.HandlePublicSummary)
+		dashboard.GET("/logs", s.HandleErrors)
+		dashboard.GET("/logs/bootstrap", s.HandleLogsBootstrap)
+		dashboard.GET("/metrics", s.HandleMetrics)
+		dashboard.GET("/stats", s.HandleStats)
+		dashboard.GET("/stats/filter-options", s.HandleStatsFilterOptions)
+		dashboard.GET("/models", s.HandleGetModels)
+		dashboard.GET("/channels", s.HandleDashboardChannels)
+		dashboard.GET("/channels/filter-options", s.HandleDashboardChannelFilterOptions)
+	}
+	dashboardProxy := r.Group("/dashboard")
+	dashboardProxy.Use(s.authService.RequireWebAuth(), s.authService.RequireWebAPITokenProxyAuth(), captureDashboardProxyMetadata())
+	dashboardProxy.Any("/v1/*path", s.HandleProxyRequest)
+	dashboardProxy.Any("/v1beta/*path", s.HandleProxyRequest)
 
 	// 静态文件服务（带版本号和缓存控制）
 	// - HTML：不缓存，动态替换 __VERSION__ 占位符
@@ -916,21 +1640,19 @@ func (s *Server) AddLogAsync(entry *model.LogEntry) {
 
 	// 委托给 LogService 处理日志写入
 	s.logService.AddLogAsync(entry)
+	s.recordURLRequestFromLog(entry)
 }
 
-// getModelsByChannelType 获取指定渠道类型的去重模型列表
-func (s *Server) getModelsByChannelType(ctx context.Context, channelType string) ([]string, error) {
-	// 直接查询数据库（KISS原则，避免过度设计）
-	channels, err := s.store.GetEnabledChannelsByType(ctx, channelType)
-	if err != nil {
-		return nil, err
+func (s *Server) recordURLRequestFromLog(entry *model.LogEntry) {
+	if s == nil || s.urlSelector == nil || entry == nil {
+		return
 	}
-	return modelNamesFromChannels(channels), nil
+	s.urlSelector.RecordRequestResult(entry.ChannelID, entry.BaseURL, entry.StatusCode)
 }
 
-// getModelsByExposedProtocol 获取指定暴露协议的去重模型列表
-func (s *Server) getModelsByExposedProtocol(ctx context.Context, protocol string) ([]string, error) {
-	channels, err := s.store.GetEnabledChannelsByExposedProtocol(ctx, protocol)
+// getAllEnabledModels 获取所有启用渠道的去重模型列表。
+func (s *Server) getAllEnabledModels(ctx context.Context) ([]string, error) {
+	channels, err := s.GetEnabledChannelsByModel(ctx, "*")
 	if err != nil {
 		return nil, err
 	}
@@ -966,7 +1688,9 @@ func (s *Server) HandleChannelKeys(c *gin.Context) {
 // 参数ctx用于控制最大等待时间，超时后强制退出
 // 返回值：nil表示成功，context.DeadlineExceeded表示超时
 func (s *Server) Shutdown(ctx context.Context) error {
+	s.modelCatalogSyncMu.Lock()
 	if s.isShuttingDown.Swap(true) {
+		s.modelCatalogSyncMu.Unlock()
 		select {
 		case <-s.shutdownDone:
 			return nil
@@ -974,12 +1698,31 @@ func (s *Server) Shutdown(ctx context.Context) error {
 			return ctx.Err()
 		}
 	}
+	s.modelCatalogSyncMu.Unlock()
 	defer close(s.shutdownDone)
 
 	log.Print("🛑 正在关闭Server，等待后台任务完成...")
 
 	// 取消server级context，通知所有派生的后台任务退出
 	s.baseCancel()
+	if s.codexOAuth != nil {
+		s.codexOAuth.close()
+	}
+	if s.antigravityOAuth != nil {
+		s.antigravityOAuth.close()
+	}
+	if s.xaiOAuth != nil {
+		s.xaiOAuth.close()
+	}
+	if s.anthropicOAuth != nil {
+		s.anthropicOAuth.close()
+	}
+	if s.zaiOAuth != nil {
+		s.zaiOAuth.close()
+	}
+	if s.responsesExecutionSessions != nil {
+		s.responsesExecutionSessions.close()
+	}
 
 	// 关闭shutdownCh，通知所有goroutine退出（幂等：由isShuttingDown守护）
 	close(s.shutdownCh)
@@ -999,6 +1742,19 @@ func (s *Server) Shutdown(ctx context.Context) error {
 		s.statsCache.Close()
 	}
 
+	var oauthCredentialImportShutdownErr error
+	if manager := s.currentOAuthCredentialImportJobs(); manager != nil {
+		oauthCredentialImportShutdownErr = manager.Close(ctx)
+	}
+	var oauthCredentialCleanupShutdownErr error
+	if manager := s.currentOAuthCredentialCleanupJobs(); manager != nil {
+		oauthCredentialCleanupShutdownErr = manager.Close(ctx)
+	}
+	var oauthCredentialRefreshShutdownErr error
+	if s.oauthCredentialRefreshes != nil {
+		oauthCredentialRefreshShutdownErr = s.oauthCredentialRefreshes.close(ctx)
+	}
+
 	// 使用channel等待所有goroutine完成
 	done := make(chan struct{})
 	go func() {
@@ -1008,17 +1764,37 @@ func (s *Server) Shutdown(ctx context.Context) error {
 
 	// 等待完成或超时
 	var err error
+	if oauthCredentialImportShutdownErr != nil {
+		err = oauthCredentialImportShutdownErr
+	}
+	if oauthCredentialCleanupShutdownErr != nil && err == nil {
+		err = oauthCredentialCleanupShutdownErr
+	}
+	if oauthCredentialRefreshShutdownErr != nil && err == nil {
+		err = oauthCredentialRefreshShutdownErr
+	}
 	select {
 	case <-done:
 		log.Print("[INFO] Server优雅关闭完成")
 	case <-ctx.Done():
 		log.Print("[WARN]  Server关闭超时，部分后台任务可能未完成")
-		err = ctx.Err()
+		if err == nil {
+			err = ctx.Err()
+		}
 	}
 
-	// 关闭渠道级代理 Transport 的空闲连接
+	// 停止连接池老化计时器并关闭全局及渠道代理 Transport 的空闲连接。
+	closeUpstreamHTTPClient(s.client)
+	closeUpstreamHTTPClient(s.antigravityClient)
+	closeUpstreamHTTPClient(s.xaiSSOClient)
+	s.antigravityTransportMu.Lock()
+	antigravityTransports := s.antigravityTransports
+	s.antigravityTransportMu.Unlock()
+	if antigravityTransports != nil {
+		antigravityTransports.closeAll()
+	}
 	s.proxyTransports.Range(func(_, v any) bool {
-		v.(*http.Client).CloseIdleConnections()
+		closeUpstreamHTTPClient(v.(*http.Client))
 		return true
 	})
 

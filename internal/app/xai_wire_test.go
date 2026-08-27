@@ -1,0 +1,323 @@
+package app
+
+import (
+	"encoding/json"
+	"net/http"
+	"reflect"
+	"testing"
+
+	"ccLoad/internal/xaiauth"
+)
+
+func TestFinalizeXAIResponsesBodyAppliesProviderContract(t *testing.T) {
+	t.Parallel()
+
+	raw := []byte(`{
+		"model":"client-model",
+		"stream":false,
+		"previous_response_id":"resp-old",
+		"prompt_cache_retention":"24h",
+		"safety_identifier":"unsafe",
+		"stream_options":{"include_usage":true},
+		"presence_penalty":0.5,
+		"frequency_penalty":0.25,
+		"stop":["END"],
+		"reasoning":{"effort":"xhigh","summary":"auto"},
+		"tools":[],
+		"tool_choice":"auto",
+		"parallel_tool_calls":true,
+		"input":[{"role":"user","content":[{"type":"input_text","text":"hello","external_web_access":true}]}],
+		"metadata":{"nested":{"external_web_access":false,"keep":"yes"}}
+	}`)
+
+	got, err := finalizeXAIResponsesBody(raw, "grok-4.5", "conv-parent")
+	if err != nil {
+		t.Fatalf("finalizeXAIResponsesBody() error = %v", err)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(got, &payload); err != nil {
+		t.Fatalf("result is not JSON: %v\n%s", err, got)
+	}
+	if payload["model"] != "grok-4.5" || payload["stream"] != true || payload["prompt_cache_key"] != "conv-parent" {
+		t.Fatalf("required xAI fields = %#v", payload)
+	}
+	for _, field := range []string{
+		"previous_response_id", "prompt_cache_retention", "safety_identifier", "stream_options",
+		"presence_penalty", "frequency_penalty", "stop",
+	} {
+		if _, exists := payload[field]; exists {
+			t.Fatalf("field %q survived xAI finalization: %s", field, got)
+		}
+	}
+	reasoning, _ := payload["reasoning"].(map[string]any)
+	if reasoning["effort"] != "high" || reasoning["summary"] != "auto" {
+		t.Fatalf("reasoning = %#v, want normalized high with summary preserved", reasoning)
+	}
+	tools, _ := payload["tools"].([]any)
+	if len(tools) != 0 {
+		t.Fatalf("tools = %#v, want no injected tools", tools)
+	}
+	for _, field := range []string{"tool_choice", "parallel_tool_calls"} {
+		if _, exists := payload[field]; exists {
+			t.Fatalf("orphaned tool field %q survived: %s", field, got)
+		}
+	}
+	assertNoJSONKey(t, payload, "external_web_access")
+}
+
+func TestFinalizeXAIResponsesBodyNormalizesReasoningInputItems(t *testing.T) {
+	t.Parallel()
+
+	raw := []byte(`{
+		"input":[
+			{"type":"reasoning","summary":[],"content":null,"encrypted_content":"grok-state"},
+			{"type":"reasoning","summary":[],"content":[{"type":"reasoning_text","text":"kept"}],"encrypted_content":null},
+			{"role":"user","content":"continue"}
+		]
+	}`)
+
+	got, err := finalizeXAIResponsesBody(raw, "grok-4.5", "conv")
+	if err != nil {
+		t.Fatalf("finalizeXAIResponsesBody() error = %v", err)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(got, &payload); err != nil {
+		t.Fatalf("result is not JSON: %v\n%s", err, got)
+	}
+	input := payload["input"].([]any)
+	first := input[0].(map[string]any)
+	if _, exists := first["content"]; exists {
+		t.Fatalf("null reasoning content survived xAI finalization: %s", got)
+	}
+	if first["encrypted_content"] != "grok-state" {
+		t.Fatalf("valid encrypted state changed: %#v", first)
+	}
+	second := input[1].(map[string]any)
+	if _, exists := second["encrypted_content"]; exists {
+		t.Fatalf("null encrypted_content survived xAI finalization: %s", got)
+	}
+	if _, exists := second["content"]; !exists {
+		t.Fatalf("non-null reasoning content was removed: %s", got)
+	}
+}
+
+func TestFinalizeXAIResponsesBodyPreservesExplicitTools(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name         string
+		body         string
+		wantControls bool
+	}{
+		{
+			name:         "ordinary function tools",
+			body:         `{"tools":[{"type":"function","name":"lookup"}],"tool_choice":"auto","parallel_tool_calls":true}`,
+			wantControls: true,
+		},
+		{
+			name:         "explicit native searches",
+			body:         `{"tools":[{"type":"web_search"},{"type":"x_search"},{"type":"function","name":"lookup"}]}`,
+			wantControls: true,
+		},
+		{
+			name:         "ordinary function named web search",
+			body:         `{"tools":[{"type":"function","name":"web_search"}],"tool_choice":{"type":"function","name":"web_search"}}`,
+			wantControls: true,
+		},
+		{
+			name:         "allowed tools choice",
+			body:         `{"tools":[{"type":"function","name":"lookup"}],"tool_choice":{"type":"allowed_tools","tools":[{"type":"function","name":"lookup"}]}}`,
+			wantControls: true,
+		},
+		{
+			name: "empty tools prune orphan controls",
+			body: `{"tools":[],"tool_choice":"auto","parallel_tool_calls":true}`,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			var want map[string]any
+			if err := json.Unmarshal([]byte(test.body), &want); err != nil {
+				t.Fatal(err)
+			}
+			got, err := finalizeXAIResponsesBody([]byte(test.body), "grok-4.5", "conv")
+			if err != nil {
+				t.Fatalf("finalizeXAIResponsesBody() error = %v", err)
+			}
+			var payload map[string]any
+			if err := json.Unmarshal(got, &payload); err != nil {
+				t.Fatalf("result is not JSON: %v\n%s", err, got)
+			}
+			for _, field := range []string{"tools", "tool_choice", "parallel_tool_calls"} {
+				gotValue, gotExists := payload[field]
+				wantValue, wantExists := want[field]
+				if test.wantControls {
+					if gotExists != wantExists || !reflect.DeepEqual(gotValue, wantValue) {
+						t.Fatalf("%s = %#v, want %#v", field, gotValue, wantValue)
+					}
+				} else if gotExists {
+					t.Fatalf("orphaned field %s survived: %#v", field, gotValue)
+				}
+			}
+		})
+	}
+}
+
+func TestFinalizeXAIResponsesBodyDropsUnsupportedReasoning(t *testing.T) {
+	t.Parallel()
+
+	for _, modelName := range []string{"grok-composer-2.5-fast", "grok-4.20-0309-non-reasoning", "grok-build-0.1"} {
+		modelName := modelName
+		t.Run(modelName, func(t *testing.T) {
+			t.Parallel()
+			got, err := finalizeXAIResponsesBody(
+				[]byte(`{"model":"old","input":"hi","reasoning":{"effort":"high"}}`),
+				modelName,
+				"conv",
+			)
+			if err != nil {
+				t.Fatalf("finalizeXAIResponsesBody() error = %v", err)
+			}
+			var payload map[string]any
+			if err := json.Unmarshal(got, &payload); err != nil {
+				t.Fatal(err)
+			}
+			if _, exists := payload["reasoning"]; exists {
+				t.Fatalf("unsupported reasoning survived: %s", got)
+			}
+		})
+	}
+}
+
+func TestInjectXAIResponsesHeadersRebuildsIdentityAfterRules(t *testing.T) {
+	t.Parallel()
+
+	req, err := http.NewRequest(http.MethodPost, "https://cli-chat-proxy.grok.com/v1/responses", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header = http.Header{
+		"Authorization":             {"Bearer client-secret"},
+		"X-Api-Key":                 {"client-key"},
+		"X-Goog-Api-Key":            {"google-key"},
+		"X-Xai-Token-Auth":          {"wrong"},
+		"X-Grok-Client-Version":     {"wrong"},
+		"User-Agent":                {"wrong"},
+		"X-Grok-Client-Identifier":  {"must-be-removed"},
+		"X-Authenticateresponse":    {"must-be-removed"},
+		"X-Grok-Client-Mode":        {"wrong"},
+		"X-Grok-Conv-Id":            {"client-conversation"},
+		"Session-Id":                {"raw-session"},
+		"Session_id":                {"raw-session-legacy"},
+		"Originator":                {"codex-tui"},
+		"Chatgpt-Account-Id":        {"account"},
+		"Content-Type":              {"text/plain"},
+		"Accept":                    {"application/json"},
+		"X-Unrelated-Custom-Header": {"preserved"},
+	}
+
+	injectXAIResponsesHeaders(req, "access-token", "conv-derived")
+
+	want := map[string]string{
+		"Authorization":                "Bearer access-token",
+		"Content-Type":                 "application/json",
+		"Accept":                       "application/json, text/event-stream",
+		xaiauth.CLITokenAuthHeader:     xaiauth.CLITokenAuthValue,
+		xaiauth.CLIClientVersionHeader: "0.2.114",
+		"User-Agent":                   xaiauth.CLIUserAgent,
+		xaiauth.CLIClientModeHeader:    xaiauth.CLIClientMode,
+		"x-grok-conv-id":               "conv-derived",
+		"X-Unrelated-Custom-Header":    "preserved",
+	}
+	for name, value := range want {
+		if got := req.Header.Get(name); got != value {
+			t.Errorf("%s = %q, want %q", name, got, value)
+		}
+	}
+	for _, name := range []string{
+		"X-Api-Key", "x-goog-api-key", "Session-Id", "Session_id", "Originator", "ChatGPT-Account-ID",
+		"X-Grok-Client-Identifier", "X-Authenticateresponse",
+	} {
+		if got := req.Header.Get(name); got != "" {
+			t.Errorf("conflicting header %s survived with %q", name, got)
+		}
+	}
+}
+
+func TestDeriveXAIExecutionIDStableAndThreadIsolated(t *testing.T) {
+	t.Parallel()
+
+	parentHeaders := http.Header{"Session-Id": {"session"}, "Thread-Id": {"parent"}}
+	childHeaders := http.Header{"Session-Id": {"session"}, "Thread-Id": {"child"}}
+	first := deriveXAIExecutionID("subject-a", parentHeaders)
+	second := deriveXAIExecutionID("subject-a", parentHeaders)
+	child := deriveXAIExecutionID("subject-a", childHeaders)
+	otherSubject := deriveXAIExecutionID("subject-b", parentHeaders)
+	if first == "" || first != second {
+		t.Fatalf("stable execution ID mismatch: first=%q second=%q", first, second)
+	}
+	if child == first || otherSubject == first {
+		t.Fatalf("execution identity not isolated: parent=%q child=%q other=%q", first, child, otherSubject)
+	}
+	claudeHeaders := http.Header{"X-Claude-Code-Session-Id": {"claude-session"}}
+	claudeFirst := deriveXAIExecutionID("subject-a", claudeHeaders)
+	claudeSecond := deriveXAIExecutionID("subject-a", claudeHeaders)
+	claudeOtherSession := deriveXAIExecutionID("subject-a", http.Header{
+		"X-Claude-Code-Session-Id": {"other-claude-session"},
+	})
+	if claudeFirst == "" || claudeFirst != claudeSecond || claudeFirst == claudeOtherSession {
+		t.Fatalf(
+			"Claude Code execution identity is not stable and isolated: first=%q second=%q other=%q",
+			claudeFirst,
+			claudeSecond,
+			claudeOtherSession,
+		)
+	}
+	if transient := deriveXAIExecutionID("subject-a", http.Header{}); transient != "" {
+		t.Fatalf("missing explicit session must not invent cross-request identity, got %q", transient)
+	}
+}
+
+func TestXAICredentialRejectedIsSchemaStrict(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name   string
+		status int
+		body   string
+		want   bool
+	}{
+		{name: "unauthorized", status: http.StatusUnauthorized, body: `{}`, want: true},
+		{name: "structured bad credential", status: http.StatusForbidden, body: `{"error":{"type":"authentication_error","code":"invalid_token"}}`, want: true},
+		{name: "ordinary forbidden", status: http.StatusForbidden, body: `{"error":{"message":"forbidden"}}`},
+		{name: "entitlement", status: http.StatusForbidden, body: `{"error":{"type":"entitlement_error","code":"not_entitled"}}`},
+		{name: "quota", status: http.StatusTooManyRequests, body: `{"error":{"type":"rate_limit_error","code":"quota_exceeded"}}`},
+		{name: "server error", status: http.StatusBadGateway, body: `{}`},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := xaiCredentialRejected(test.status, nil, []byte(test.body)); got != test.want {
+				t.Fatalf("xaiCredentialRejected() = %v, want %v", got, test.want)
+			}
+		})
+	}
+}
+
+func assertNoJSONKey(t *testing.T, value any, forbidden string) {
+	t.Helper()
+	switch typed := value.(type) {
+	case map[string]any:
+		for key, child := range typed {
+			if key == forbidden {
+				t.Fatalf("found forbidden recursive key %q", forbidden)
+			}
+			assertNoJSONKey(t, child, forbidden)
+		}
+	case []any:
+		for _, child := range typed {
+			assertNoJSONKey(t, child, forbidden)
+		}
+	}
+}

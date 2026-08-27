@@ -6,17 +6,33 @@ import (
 	"strings"
 	"time"
 
+	"ccLoad/internal/config"
 	"ccLoad/internal/model"
+	"ccLoad/internal/protocol"
 	"ccLoad/internal/testutil"
 )
 
-const defaultChannelCheckIntervalHours = 0
+const defaultChannelCheckIntervalHours = config.DefaultChannelCheckIntervalHours
 
 func normalizeChannelCheckIntervalHours(hours float64) float64 {
-	if hours <= 0 {
+	if hours == 0 {
 		return 0
 	}
+	if _, ok := settingDurationFromFloat64(hours, time.Hour); !ok {
+		return defaultChannelCheckIntervalHours
+	}
 	return hours
+}
+
+func configuredChannelTestContent(configService *ConfigService) string {
+	if configService == nil {
+		return config.DefaultChannelTestContent
+	}
+	content := strings.TrimSpace(configService.GetString("channel_test_content", config.DefaultChannelTestContent))
+	if content == "" {
+		return config.DefaultChannelTestContent
+	}
+	return content
 }
 
 func (s *Server) startScheduledChannelCheckLoop(interval time.Duration) {
@@ -89,10 +105,7 @@ func (s *Server) runScheduledChannelChecks(ctx context.Context) error {
 		return err
 	}
 
-	content := "sonnet 4.0的发布日期是什么"
-	if s.configService != nil {
-		content = s.configService.GetString("channel_test_content", content)
-	}
+	content := configuredChannelTestContent(s.configService)
 
 	for _, cfg := range configs {
 		if ctx.Err() != nil {
@@ -129,14 +142,14 @@ func (s *Server) runScheduledChannelChecks(ctx context.Context) error {
 		}
 
 		req := &testutil.TestChannelRequest{
-			Model:       modelName,
-			ChannelType: cfg.GetChannelType(),
-			Content:     content,
-			Stream:      false,
+			Model:          modelName,
+			ClientProtocol: string(protocol.Anthropic),
+			Content:        content,
+			Stream:         false,
 		}
 		requestedModel := req.Model
 		result := s.executeChannelTest(ctx, cfg, keyIndex, apiKey, req)
-		s.persistDetectionLog(ctx, detectionLogFromResult(cfg, model.LogSourceScheduledCheck, requestedModel, req.Model, apiKey, "", 0, req.ThinkingEffort, result))
+		s.persistDetectionLog(ctx, detectionLogFromResult(cfg, model.LogSourceScheduledCheck, requestedModel, req.Model, apiKey, "", req.ThinkingEffort, result))
 		logScheduledChannelCheckResult(cfg, keyIndex, req.Model, result)
 	}
 
@@ -144,7 +157,7 @@ func (s *Server) runScheduledChannelChecks(ctx context.Context) error {
 }
 
 func shouldRunScheduledChannelCheck(cfg *model.Config) bool {
-	return cfg != nil && cfg.Enabled && cfg.ScheduledCheckEnabled
+	return cfg != nil && cfg.Enabled && cfg.ScheduledCheckEnabled && cfg.IsAvailableAt(time.Now())
 }
 
 func logScheduledChannelCheckResult(cfg *model.Config, keyIndex int, modelName string, result map[string]any) {

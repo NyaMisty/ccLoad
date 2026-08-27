@@ -2,91 +2,109 @@ package app
 
 import (
 	"context"
+	"net/url"
 	"strings"
 
 	modelpkg "ccLoad/internal/model"
-	"ccLoad/internal/storage"
+	"ccLoad/internal/protocol"
 	"ccLoad/internal/util"
 )
 
-func normalizeOptionalChannelType(value string) string {
+func normalizeOptionalProtocol(value string) string {
 	value = strings.TrimSpace(value)
 	if value == "" {
 		return ""
 	}
-	return util.NormalizeChannelType(value)
+	return util.NormalizeProtocol(value)
 }
 
-func (s *Server) getEnabledChannelsByExposedProtocol(ctx context.Context, protocol string) ([]*modelpkg.Config, error) {
-	normalizedType := util.NormalizeChannelType(protocol)
-	return readThroughChannelCache(
-		s,
-		func(cache *storage.ChannelCache) ([]*modelpkg.Config, error) {
-			return cache.GetEnabledChannelsByExposedProtocol(ctx, normalizedType)
-		},
-		func() ([]*modelpkg.Config, error) {
-			return s.store.GetEnabledChannelsByExposedProtocol(ctx, normalizedType)
-		},
-	)
-}
-
-func (s *Server) getEnabledChannelsByModelAndProtocol(ctx context.Context, model string, protocol string) ([]*modelpkg.Config, error) {
-	normalizedType := normalizeOptionalChannelType(protocol)
-	if normalizedType == "" {
-		return s.GetEnabledChannelsByModel(ctx, model)
+// selectCandidatesByClientProtocol 返回所有启用渠道；clientProtocol 仅用于计算客户端协议对应的模型冷却键。
+func (s *Server) selectCandidatesByClientProtocol(ctx context.Context, clientProtocol string) ([]*modelpkg.Config, error) {
+	channels, err := s.getEnabledChannelsSnapshotByModel(ctx, "*")
+	if err != nil {
+		return nil, err
 	}
-
-	return readThroughChannelCache(
-		s,
-		func(cache *storage.ChannelCache) ([]*modelpkg.Config, error) {
-			return cache.GetEnabledChannelsByModelAndProtocol(ctx, model, normalizedType)
-		},
-		func() ([]*modelpkg.Config, error) {
-			return s.store.GetEnabledChannelsByModelAndProtocol(ctx, model, normalizedType)
-		},
-	)
+	return s.filterCooldownChannels(ctx, channels, "*", clientProtocol)
 }
 
-// selectCandidatesByChannelType 根据客户端协议选择候选渠道
-func (s *Server) selectCandidatesByChannelType(ctx context.Context, channelType string) ([]*modelpkg.Config, error) {
-	normalizedType := util.NormalizeChannelType(channelType)
+// alphaSearchUpstreamURLs removes exact URLs for other Codex endpoints and
+// endpoints that recently proved they do not implement alpha/search.
+// Normal base URLs remain eligible because the request path is appended later.
+func (s *Server) alphaSearchUpstreamURLs(cfg *modelpkg.Config) []string {
+	urls := cfg.GetURLs()
+	compatible := make([]string, 0, len(urls))
+	for _, rawURL := range urls {
+		key := protocolCapabilityKey{
+			channelID: cfg.ID, baseURL: rawURL,
+			clientProtocol: protocol.Codex, requestFamily: protocol.RequestFamilyAlphaSearch,
+		}
+		if cached, known := s.protocolCapabilities.get(key); known && cached == protocolUnsupported {
+			continue
+		}
+		if !modelpkg.HasExactUpstreamURLMarker(rawURL) {
+			compatible = append(compatible, rawURL)
+			continue
+		}
 
-	// 优先走缓存查询
-	channels, err := s.getEnabledChannelsByExposedProtocol(ctx, normalizedType)
+		parsed, err := url.Parse(modelpkg.StripExactUpstreamURLMarker(rawURL))
+		if err == nil && protocol.DetectRequestFamily(parsed.Path) == protocol.RequestFamilyAlphaSearch {
+			compatible = append(compatible, rawURL)
+		}
+	}
+	return compatible
+}
+
+func (s *Server) selectAlphaSearchCandidates(ctx context.Context, modelName string) ([]*modelpkg.Config, error) {
+	routeModel := modelName
+	if routeModel == "" {
+		routeModel = "*"
+	}
+	channels, err := s.getEnabledChannelsSnapshotByModel(ctx, routeModel)
 	if err != nil {
 		return nil, err
 	}
 
-	// 兜底：全量查询（用于“全冷却兜底”场景）
-	if len(channels) == 0 {
-		all, err := s.store.ListConfigs(ctx)
-		if err != nil {
-			return nil, err
+	compatible := make([]*modelpkg.Config, 0, len(channels))
+	for _, cfg := range channels {
+		if cfg == nil {
+			continue
 		}
-		channels = make([]*modelpkg.Config, 0, len(all))
-		for _, cfg := range all {
-			if cfg != nil && cfg.Enabled && cfg.SupportsProtocol(normalizedType) {
-				channels = append(channels, cfg)
+
+		urls := s.alphaSearchUpstreamURLs(cfg)
+		if len(urls) == 0 {
+			continue
+		}
+		if len(urls) != len(cfg.GetURLs()) {
+			configuredURLs := cfg.URLs
+			cfg = cfg.Clone()
+			allowed := make(map[string]struct{}, len(urls))
+			for _, runtimeURL := range urls {
+				allowed[runtimeURL] = struct{}{}
+			}
+			cfg.URLs = cfg.URLs[:0]
+			for _, entry := range configuredURLs {
+				if _, ok := allowed[entry.RuntimeURL()]; ok {
+					cfg.URLs = append(cfg.URLs, entry)
+				}
 			}
 		}
+		compatible = append(compatible, cfg)
 	}
 
-	return s.filterCooldownChannels(ctx, channels)
+	return s.filterCooldownChannels(ctx, compatible, routeModel, string(protocol.Codex))
 }
 
-// selectCandidatesByModelAndType 根据模型和渠道类型筛选候选渠道
-// 遵循SRP：数据库负责返回满足模型的渠道，本函数仅负责类型过滤
-func (s *Server) selectCandidatesByModelAndType(ctx context.Context, model string, channelType string) ([]*modelpkg.Config, error) {
-	normalizedType := normalizeOptionalChannelType(channelType)
+// selectCandidatesByModelAndClientProtocol 按模型选择候选渠道；clientProtocol 仅表示客户端协议，不过滤上游主协议。
+func (s *Server) selectCandidatesByModelAndClientProtocol(ctx context.Context, model string, clientProtocol string) ([]*modelpkg.Config, error) {
+	normalizedType := normalizeOptionalProtocol(clientProtocol)
 
-	// 优先走索引查询
-	channels, err := s.getEnabledChannelsByModelAndProtocol(ctx, model, normalizedType)
+	channels, err := s.getEnabledChannelsSnapshotByModel(ctx, model)
 	if err != nil {
 		return nil, err
 	}
 
 	// 先做冷却/成本过滤，但不触发“全冷却兜底”，以便后续还能继续做模糊匹配回退。
-	filtered, err := s.filterCooldownChannelsStrict(ctx, channels)
+	filtered, err := s.filterCooldownChannelsStrict(ctx, channels, model, normalizedType)
 	if err != nil {
 		return nil, err
 	}
@@ -99,12 +117,9 @@ func (s *Server) selectCandidatesByModelAndType(ctx context.Context, model strin
 	// 精确候选可能存在但全部在冷却/成本限额下不可用，这时仍需尝试模糊匹配补充候选。
 	var allCandidates []*modelpkg.Config
 	if model != "*" {
-		source := make([]*modelpkg.Config, 0)
-		if normalizedType != "" {
-			source, err = s.getEnabledChannelsByModelAndProtocol(ctx, "*", normalizedType)
-			if err != nil {
-				return nil, err
-			}
+		source, err := s.getEnabledChannelsSnapshotByModel(ctx, "*")
+		if err != nil {
+			return nil, err
 		}
 		if len(source) == 0 {
 			source, err = s.store.ListConfigs(ctx)
@@ -118,9 +133,6 @@ func (s *Server) selectCandidatesByModelAndType(ctx context.Context, model strin
 			if cfg == nil || !cfg.Enabled {
 				continue
 			}
-			if channelType != "" && !cfg.SupportsProtocol(normalizedType) {
-				continue
-			}
 			if s.configSupportsModelWithFuzzyMatch(cfg, model) {
 				allCandidates = append(allCandidates, cfg)
 			}
@@ -128,7 +140,7 @@ func (s *Server) selectCandidatesByModelAndType(ctx context.Context, model strin
 	}
 
 	// 再次过滤，但仍不触发“全冷却兜底”：先把可用的候选尽可能找出来。
-	filtered, err = s.filterCooldownChannelsStrict(ctx, allCandidates)
+	filtered, err = s.filterCooldownChannelsStrict(ctx, allCandidates, model, normalizedType)
 	if err != nil {
 		return nil, err
 	}
@@ -137,5 +149,5 @@ func (s *Server) selectCandidatesByModelAndType(ctx context.Context, model strin
 	}
 
 	// 最终兜底：如果候选存在但全部在冷却中，让全冷却兜底逻辑选择“最早恢复”的渠道。
-	return s.filterCooldownChannels(ctx, allCandidates)
+	return s.filterCooldownChannels(ctx, allCandidates, model, normalizedType)
 }

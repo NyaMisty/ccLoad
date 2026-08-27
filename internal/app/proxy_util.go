@@ -79,10 +79,12 @@ func looksLikeJSON(body []byte) bool {
 
 // fwResult 转发结果
 type fwResult struct {
-	Status        int
-	Header        http.Header
-	Body          []byte  // filled for non-2xx or when needed
-	FirstByteTime float64 // 首字节响应时间（秒）
+	Status              int
+	UpstreamStatus      int // 原始上游 HTTP 状态码；Status 可被改写为 596-599 等内部分类码
+	Header              http.Header
+	Body                []byte  // filled for non-2xx or when needed
+	upstreamRequestBody []byte  // 实际发送的 provider wire body，仅用于同请求内安全降级重试
+	FirstByteTime       float64 // 首字节响应时间（秒）
 
 	// Token统计（2025-11新增，从SSE响应中提取）
 	InputTokens              int
@@ -99,6 +101,13 @@ type fwResult struct {
 
 	// 重试策略（例如 Codex 400 后剥离 reasoning/thinking 再成功）
 	RetryStrategy string
+	// QuotaOverdraftReplayed marks a request that consumed the one-shot Codex
+	// usage-limit replay. A successful final response activates credential-wide
+	// overdraft accounting until the upstream quota reset.
+	QuotaOverdraftReplayed bool
+	// QuotaOverdraftActiveUntil is the upstream quota reset time captured from
+	// the usage_limit_reached response that caused the successful replay.
+	QuotaOverdraftActiveUntil int64
 
 	// 上游响应字节数（2026-02新增）
 	// 用于499场景诊断：区分客户端在首字节前取消还是接收部分数据后取消
@@ -112,9 +121,14 @@ type fwResult struct {
 	// 响应是否已经提交给客户端（头或正文已发送）
 	// false 表示本次尝试仍可在同一请求内切换到其他Key/渠道
 	ResponseCommitted bool
+	// UpstreamWebsocket 只表示本次实际上游请求采用了WebSocket，不表示下游协议或渠道配置。
+	UpstreamWebsocket bool
+	// UpstreamWebsocketTransportFailure 表示原生上游 WebSocket 以 close 1006
+	// 或心跳传输错误结束。该故障按物理连接连续计数，不得升级为模型冷却。
+	UpstreamWebsocketTransportFailure bool
 
-	// OpenAI service_tier（2026-03新增）
-	// 响应中的 service_tier 字段决定计费倍率：priority=2x, flex=0.5x, default=1x
+	// OpenAI service_tier（2026-03新增）。Codex 请求中的 priority 是 Fast 模式标记；
+	// 其他情况由上游响应中的 service_tier 决定。
 	ServiceTier string
 
 	// ThinkingEffort 记录请求或上游响应声明的思考等级；上游响应非空时覆盖请求值。
@@ -122,51 +136,71 @@ type fwResult struct {
 
 	// Debug日志数据（debug开启时填充，传递到日志写入管道）
 	DebugData *model.DebugLogEntry
+
+	ResponsesTurnResult    responsesWebsocketTurnResult
+	HasResponsesTurnResult bool
 }
 
 // ForwardObserver 封装转发过程中的观测回调（遵循SRP，避免函数签名膨胀）
 type ForwardObserver struct {
-	OnBytesRead     func(int64) // 字节读取回调（可选）
-	OnFirstByteRead func()      // 首字节读取回调（可选）
-	OnDebugCapture  func(*debugCapture)
+	OnBytesRead         func(int64) // 字节读取回调（可选）
+	OnFirstByteRead     func()      // 首字节读取回调（可选）
+	OnUpstreamWebsocket func(bool)  // 实际上游传输变化回调（可选）
+	OnDebugCapture      func(*debugCapture)
 }
 
 // proxyRequestContext 代理请求上下文（封装请求信息，遵循DIP原则）
 type proxyRequestContext struct {
-	originalModel    string
-	clientProtocol   protocol.Protocol
-	requestMethod    string
-	requestPath      string
-	rawQuery         string
-	body             []byte
-	translatedBody   []byte
-	header           http.Header
-	isStreaming      bool
-	tokenHash        string               // Token哈希值（用于统计）
-	tokenID          int64                // Token ID（用于日志记录，0表示未使用token）
-	clientIP         string               // 客户端IP地址（用于日志记录）
-	activeReqID      int64                // 活跃请求ID（用于更新渠道信息）
-	observer         *ForwardObserver     // 转发观测回调（可选）
-	startTime        time.Time            // 请求开始时间（用于统计）
-	channelStartTime time.Time            // 当前渠道尝试开始时间（每次切换渠道时重置）
-	attemptStartTime time.Time            // 渠道内单次 Key/URL 尝试开始时间
-	attemptIndex     int                  // 全局尝试次数计数器（每次尝试递增，用于前端显示）
-	baseURL          string               // 当前尝试使用的上游URL（多URL场景）
-	debugData        *model.DebugLogEntry // Debug日志数据（debug开启时填充）
-	thinkingEffort   string
+	originalModel              string
+	clientProtocol             protocol.Protocol
+	codexClient                bool
+	upstreamProtocol           protocol.Protocol
+	requestMethod              string
+	requestPath                string
+	rawQuery                   string
+	body                       []byte
+	translatedBody             []byte
+	header                     http.Header
+	isStreaming                bool
+	tokenHash                  string               // Token哈希值（用于统计）
+	tokenID                    int64                // Token ID（用于日志记录，0表示未使用token）
+	clientIP                   string               // 客户端IP地址（用于日志记录）
+	activeReqID                int64                // 活跃请求ID（用于更新渠道信息）
+	observer                   *ForwardObserver     // 转发观测回调（可选）
+	startTime                  time.Time            // 请求开始时间（用于统计）
+	channelStartTime           time.Time            // 当前渠道尝试开始时间（每次切换渠道时重置）
+	attemptStartTime           time.Time            // 渠道内单次 Key/URL 尝试开始时间
+	baseURL                    string               // 当前尝试使用的上游URL（多URL场景）
+	debugData                  *model.DebugLogEntry // Debug日志数据（debug开启时填充）
+	thinkingEffort             string
+	routingSession             *responsesExecutionSession // 当前 Responses execution session 的首选渠道
+	nativeCodexWS              *codexUpstreamWebsocketSession
+	nativeCodexBody            []byte
+	quotaOverdraftTranscript   []byte
+	codexMultiAgentV2Optimized bool
+	codexMultiAgentV2Conflict  bool
 }
 
 // proxyResult 代理请求结果
 type proxyResult struct {
-	status           int
-	header           http.Header
-	body             []byte
-	channelID        *int64
-	duration         float64
-	firstByteTime    float64
-	succeeded        bool
-	isClientCanceled bool            // 客户端主动取消请求（context.Canceled）
-	nextAction       cooldown.Action // 统一重试决策：RetryKey/RetryChannel/ReturnClient
+	status                    int
+	header                    http.Header
+	body                      []byte
+	channelID                 *int64
+	duration                  float64
+	firstByteTime             float64
+	succeeded                 bool
+	isClientCanceled          bool // 客户端主动取消请求（context.Canceled）
+	isNetworkError            bool
+	nextAction                cooldown.Action // 统一重试决策：RetryKey/RetryChannel/ReturnClient
+	deferredCooldown          *cooldown.ErrorInput
+	deferredLog               *model.LogEntry
+	proxyLogWritten           bool
+	antigravityCapacity429    bool
+	protocolCapabilityMissing bool
+	websocketTargetCooling    bool
+	responsesTurn             responsesWebsocketTurnResult
+	hasResponsesTurn          bool
 }
 
 // ErrorAction 已迁移到 cooldown.Action (internal/cooldown/manager.go)
@@ -323,11 +357,18 @@ func copyRequestHeaders(dst *http.Request, src http.Header) {
 // 参数简化：直接接受API Key字符串，由调用方从KeySelector获取
 func injectAPIKeyHeaders(req *http.Request, apiKey string, upstreamProtocol string) {
 	switch strings.TrimSpace(strings.ToLower(upstreamProtocol)) {
-	case util.ChannelTypeGemini:
+	case util.ProtocolGemini:
 		// Gemini API: 仅使用 x-goog-api-key
 		req.Header.Set("x-goog-api-key", apiKey)
+	case util.ProtocolAnthropic:
+		req.Header.Set("x-api-key", apiKey)
+		if anthropicAPIKeyAuthorizationAllowed(req.URL) {
+			req.Header.Set("Authorization", "Bearer "+apiKey)
+		} else {
+			req.Header.Del("Authorization")
+		}
 	default:
-		// OpenAI/Claude/Anthropic/Codex API: 同时设置两个头
+		// OpenAI/Codex API: 同时设置两个头
 		req.Header.Set("x-api-key", apiKey)
 		req.Header.Set("Authorization", "Bearer "+apiKey)
 	}
@@ -347,29 +388,50 @@ var anthropicProtocolHeaders = []string{
 
 // stripAnthropicProtocolHeaders 当上游非 Anthropic 时，移除客户端携带的 Anthropic 专属头。
 func stripAnthropicProtocolHeaders(req *http.Request, upstreamType string) {
-	if upstreamType == util.ChannelTypeAnthropic {
+	if upstreamType == util.ProtocolAnthropic {
 		return
 	}
 	for _, h := range anthropicProtocolHeaders {
-		req.Header.Del(h)
+		deleteRawHeader(req.Header, h)
 	}
 }
 
-// injectAnthropicBetaFlag 确保 anthropic-beta 头包含指定 flag
+// injectAnthropicBetaFlag 确保 anthropic-beta 头包含指定 flag。
+// 指纹路径用 setRawHeader 写小写键，http.Header.Get/Set 只认 canonical 键，
+// 必须就地改写已有键，否则会拆出第二份同名头。
 func injectAnthropicBetaFlag(req *http.Request, flag string) {
-	existing := req.Header.Get("anthropic-beta")
-	if existing == "" {
-		req.Header.Set("anthropic-beta", flag)
+	flag = strings.TrimSpace(flag)
+	if req == nil || flag == "" {
 		return
 	}
-	if strings.Contains(existing, flag) {
+	h := req.Header
+	key, exists := existingHeaderKey(h, "anthropic-beta")
+	if !exists {
+		h.Set("anthropic-beta", flag)
 		return
 	}
-	req.Header.Set("anthropic-beta", existing+","+flag)
+	tokens := make([]string, 0, len(h[key])+1)
+	found := false
+	for _, value := range h[key] {
+		for _, token := range strings.Split(value, ",") {
+			token = strings.TrimSpace(token)
+			if token == "" {
+				continue
+			}
+			if token == flag {
+				found = true
+			}
+			tokens = append(tokens, token)
+		}
+	}
+	if !found {
+		tokens = append(tokens, flag)
+	}
+	h[key] = []string{strings.Join(tokens, ",")}
 }
 
 func ensureAnthropicVersionHeader(req *http.Request, upstreamType string) {
-	if upstreamType != util.ChannelTypeAnthropic {
+	if upstreamType != util.ProtocolAnthropic {
 		return
 	}
 	if req.Header.Get("anthropic-version") == "" {
@@ -379,11 +441,11 @@ func ensureAnthropicVersionHeader(req *http.Request, upstreamType string) {
 
 // normalizeAnyrouterAdaptiveThinking 为 anyrouter 的 Anthropic /v1/messages 请求补齐 adaptive thinking。
 // 自动注入只针对 anyrouter；普通 Anthropic 渠道不做兜底改写。
-func normalizeAnyrouterAdaptiveThinking(cfg *model.Config, requestPath string, body []byte) []byte {
+func normalizeAnyrouterAdaptiveThinking(cfg *model.Config, upstreamProtocol, requestPath string, body []byte) []byte {
 	if len(body) == 0 || cfg == nil {
 		return body
 	}
-	if cfg.GetChannelType() != util.ChannelTypeAnthropic {
+	if upstreamProtocol != util.ProtocolAnthropic {
 		return body
 	}
 	if !isAnyrouterChannel(cfg) {
@@ -427,7 +489,7 @@ func isAnyrouterChannel(cfg *model.Config) bool {
 	if cfg == nil {
 		return false
 	}
-	haystack := strings.ToLower(cfg.Name + "\n" + cfg.URL)
+	haystack := strings.ToLower(cfg.Name + "\n" + strings.Join(cfg.GetURLs(), "\n"))
 	return strings.Contains(haystack, "anyrouter")
 }
 
@@ -561,19 +623,18 @@ func buildCodexResponsesPath() string {
 // 1. 精确匹配的重定向（redirect_model 配置）
 // 2. 模糊匹配（启用 model_fuzzy_match 时）
 // 3. [FIX] 2026-01: 模糊匹配结果的重定向（链式解析）
-func (s *Server) prepareRequestBody(cfg *model.Config, reqCtx *proxyRequestContext) (actualModel string, bodyToSend []byte) {
-	actualModel = reqCtx.originalModel
-
+func (s *Server) resolveActualModel(cfg *model.Config, originalModel string) string {
+	actualModel := originalModel
 	// 1. 检查模型重定向（精确匹配优先）
-	if redirectModel, ok := cfg.GetRedirectModel(reqCtx.originalModel); ok && redirectModel != "" {
+	if redirectModel, ok := cfg.GetRedirectModel(originalModel); ok && redirectModel != "" {
 		actualModel = redirectModel
 	}
 
 	// 2. 模糊匹配回退（仅当未触发重定向时）
-	if actualModel == reqCtx.originalModel && s.modelFuzzyMatch {
+	if actualModel == originalModel && s.modelFuzzyMatch {
 		// 先检查精确匹配，避免不必要的模糊匹配
-		if !cfg.SupportsModel(reqCtx.originalModel) {
-			if matched, ok := cfg.FuzzyMatchModel(reqCtx.originalModel); ok {
+		if !cfg.SupportsModel(originalModel) {
+			if matched, ok := cfg.FuzzyMatchModel(originalModel); ok {
 				actualModel = matched
 			}
 		}
@@ -582,30 +643,58 @@ func (s *Server) prepareRequestBody(cfg *model.Config, reqCtx *proxyRequestConte
 	// 3. [FIX] 2026-01: 模糊匹配结果的重定向（链式解析）
 	// 场景：请求 gemini-3-flash → 模糊匹配 gemini-3-flash-preview → 重定向 gemini-3-flash-preview-0719
 	// 仅当模型已变更且变更后的模型有重定向配置时触发
-	if actualModel != reqCtx.originalModel {
+	if actualModel != originalModel {
 		if redirectModel, ok := cfg.GetRedirectModel(actualModel); ok && redirectModel != "" {
 			actualModel = redirectModel
 		}
 	}
+	return actualModel
+}
+
+// resolveFinalUpstreamModel 返回真正发送给上游的模型身份。
+// 协议转换使用 resolved model 构造上游 body，随后 custom_request_rules 可能再次覆盖 body.model。
+// Gemini 的模型位于 URL 路径，body 规则不改变其路由模型。
+func (s *Server) resolveFinalUpstreamModel(cfg *model.Config, originalModel string, upstreamProtocol string) string {
+	actualModel := s.resolveActualModel(cfg, originalModel)
+	if protocol.Protocol(util.NormalizeProtocol(upstreamProtocol)) == protocol.Gemini {
+		return actualModel
+	}
+	return resolveModelAfterBodyRules(actualModel, cfg.BodyRules())
+}
+
+func (s *Server) prepareRequestBody(cfg *model.Config, reqCtx *proxyRequestContext, upstreamProtocol protocol.Protocol) (actualModel string, bodyToSend []byte) {
+	actualModel = s.resolveFinalUpstreamModel(cfg, reqCtx.originalModel, string(upstreamProtocol))
 
 	bodyToSend = reqCtx.body
-
-	// 如果模型发生变更，修改请求体
-	if actualModel != reqCtx.originalModel {
-		var reqData map[string]json.RawMessage
-		if err := sonic.Unmarshal(reqCtx.body, &reqData); err == nil {
-			modelRaw, err := sonic.Marshal(actualModel)
-			if err != nil {
-				return actualModel, bodyToSend
-			}
-			reqData["model"] = modelRaw
-			if modifiedBody, err := sonic.Marshal(reqData); err == nil {
-				bodyToSend = modifiedBody
-			}
-		}
+	// billing/CCH 块是真 Claude Code 请求的身份与签名载体。只有跨协议
+	// 转换时才能删除；Anthropic -> Anthropic 必须保留，供 OAuth finalizer
+	// 识别并保留原生 Claude Code prompt。
+	if reqCtx.clientProtocol == protocol.Anthropic && upstreamProtocol != protocol.Anthropic {
+		bodyToSend = stripAnthropicBillingHeaders(bodyToSend)
 	}
+	bodyToSend = replaceJSONRequestModel(bodyToSend, reqCtx.originalModel, actualModel)
 
 	return actualModel, bodyToSend
+}
+
+func replaceJSONRequestModel(body []byte, originalModel, actualModel string) []byte {
+	if len(body) == 0 || actualModel == "" || actualModel == originalModel {
+		return body
+	}
+	var reqData map[string]json.RawMessage
+	if err := sonic.Unmarshal(body, &reqData); err != nil {
+		return body
+	}
+	modelRaw, err := sonic.Marshal(actualModel)
+	if err != nil {
+		return body
+	}
+	reqData["model"] = modelRaw
+	modifiedBody, err := sonic.Marshal(reqData)
+	if err != nil {
+		return body
+	}
+	return modifiedBody
 }
 
 // stripAnthropicBillingHeaders 从 Anthropic /v1/messages 请求体的 system 数组中
@@ -777,8 +866,11 @@ func extractThinkingEffortFromPayload(payload map[string]any) string {
 	}
 
 	if thinking, ok := payload["thinking"].(map[string]any); ok {
-		if effort := firstStringMapValue(thinking, "effort", "level", "thinkingLevel", "thinking_level", "type"); effort != "" {
+		if effort := firstStringMapValue(thinking, "effort", "level", "thinkingLevel", "thinking_level"); effort != "" {
 			return normalizeThinkingEffort(effort)
+		}
+		if budget, ok := thinking["budget_tokens"].(float64); ok && budget > 0 {
+			return anthropicBudgetToEffort(int(budget))
 		}
 	}
 
@@ -804,24 +896,34 @@ func stringMapValue(values map[string]any, key string) string {
 
 // logEntryParams 日志条目构建参数（避免多个 string 参数顺序混淆）
 type logEntryParams struct {
-	RequestModel   string // 客户端请求的原始模型名称
-	ActualModel    string // 实际转发到上游的模型名称（可能经过重定向）
-	ChannelID      int64
-	StatusCode     int
-	Duration       float64
-	IsStreaming    bool
-	APIKeyUsed     string
-	AuthTokenID    int64
-	ClientIP       string
-	BaseURL        string // 请求使用的上游URL
-	Result         *fwResult
-	ErrMsg         string
-	StartTime      time.Time            // 渠道尝试开始时间（用于日志记录）
-	DebugData      *model.DebugLogEntry // Debug日志数据
-	CostMultiplier float64              // 渠道成本倍率快照（0=免费，<0 视为 1）
-	AttemptIndex   int32                // 重试尝试次数（1-based，全局累计；瞬态，不持久化）
-	RequestID      int64                // 所属请求链 ID（activeReqID；瞬态，仅用于缓存关联）
-	ThinkingEffort string
+	RequestModel     string // 客户端请求的原始模型名称
+	ActualModel      string // 实际转发到上游的模型名称（可能经过重定向）
+	RequestPath      string // 客户端请求路径（用于识别按次计费的特殊端点）
+	ChannelID        int64
+	StatusCode       int
+	Duration         float64
+	IsStreaming      bool
+	APIKeyUsed       string
+	AuthTokenID      int64
+	ClientProtocol   protocol.Protocol
+	UpstreamProtocol protocol.Protocol
+	ClientIP         string
+	BaseURL          string // 请求使用的上游URL
+	Result           *fwResult
+	ErrMsg           string
+	StartTime        time.Time            // 渠道尝试开始时间（用于日志记录）
+	DebugData        *model.DebugLogEntry // Debug日志数据
+	CostMultiplier   float64              // 渠道成本倍率快照（0=免费，<0 视为 1）
+	ThinkingEffort   string
+}
+
+// resolveProxyBillingModel 选择代理请求的计费模型。
+// /v1/alpha/search 无 model/token，固定按 search_call 计费。
+func resolveProxyBillingModel(requestPath, actualModel, requestModel string) string {
+	if protocol.DetectRequestFamily(requestPath) == protocol.RequestFamilyAlphaSearch {
+		return util.BillingModelSearchCall
+	}
+	return util.ResolveBillingModel(actualModel, requestModel)
 }
 
 // buildLogEntry 构建日志条目（消除重复代码，遵循DRY原则）
@@ -830,18 +932,27 @@ func buildLogEntry(p logEntryParams) *model.LogEntry {
 	if logTime.IsZero() {
 		logTime = time.Now() // 兜底：未传入开始时间时使用当前时间
 	}
+	billingModel := resolveProxyBillingModel(p.RequestPath, p.ActualModel, p.RequestModel)
+	modelName := p.RequestModel
+	if modelName == "" {
+		// alpha/search 等无 model 请求：用计费标识落库，避免日志/统计模型列空白
+		modelName = billingModel
+	}
 	entry := &model.LogEntry{
-		Time:        model.JSONTime{Time: logTime},
-		Model:       p.RequestModel,
-		LogSource:   model.LogSourceProxy,
-		ChannelID:   p.ChannelID,
-		StatusCode:  p.StatusCode,
-		Duration:    p.Duration,
-		IsStreaming: p.IsStreaming,
-		APIKeyUsed:  p.APIKeyUsed,
-		AuthTokenID: p.AuthTokenID,
-		ClientIP:    p.ClientIP,
-		BaseURL:     p.BaseURL,
+		Time:              model.JSONTime{Time: logTime},
+		Model:             modelName,
+		LogSource:         model.LogSourceProxy,
+		ChannelID:         p.ChannelID,
+		StatusCode:        p.StatusCode,
+		Duration:          p.Duration,
+		IsStreaming:       p.IsStreaming,
+		UpstreamWebsocket: p.Result != nil && p.Result.UpstreamWebsocket,
+		APIKeyUsed:        p.APIKeyUsed,
+		AuthTokenID:       p.AuthTokenID,
+		ClientProtocol:    string(p.ClientProtocol),
+		UpstreamProtocol:  string(p.UpstreamProtocol),
+		ClientIP:          p.ClientIP,
+		BaseURL:           p.BaseURL,
 	}
 	entry.ThinkingEffort = normalizeThinkingEffort(p.ThinkingEffort)
 
@@ -861,7 +972,16 @@ func buildLogEntry(p logEntryParams) *model.LogEntry {
 		// [FIX] 2026-02: 错误场景下也保留诊断信息（特别是499客户端取消）
 		// 场景：流式请求中途取消，此时已有 FirstByteTime 和 BytesReceived
 		// 将字节数追加到 message 中便于诊断
-		msg := truncateErr(p.ErrMsg)
+		msg := p.ErrMsg
+		if p.StatusCode >= http.StatusInternalServerError && p.Result != nil && p.Result.UpstreamStatus == 0 {
+			msg = fmt.Sprintf("upstream transport error before HTTP response (no response body): %s", msg)
+		}
+		if p.Result != nil && len(p.Result.Body) > 0 {
+			body := strings.TrimSpace(safeBodyToString(p.Result.Body))
+			if body != "" && body != strings.TrimSpace(p.ErrMsg) {
+				msg = fmt.Sprintf("%s: %s", msg, body)
+			}
+		}
 		if p.Result != nil && p.IsStreaming {
 			if p.Result.FirstByteTime > 0 {
 				entry.FirstByteTime = p.Result.FirstByteTime
@@ -870,7 +990,7 @@ func buildLogEntry(p logEntryParams) *model.LogEntry {
 				msg = fmt.Sprintf("%s (received %s)", msg, formatBytes(p.Result.BytesReceived))
 			}
 		}
-		entry.Message = msg
+		entry.Message = truncateErr(msg)
 	} else if p.Result != nil {
 		res := p.Result
 		if p.StatusCode >= 200 && p.StatusCode < 300 {
@@ -880,7 +1000,6 @@ func buildLogEntry(p logEntryParams) *model.LogEntry {
 			} else {
 				entry.Message = "ok"
 			}
-			entry.Message = appendRetryStrategyToMessage(entry.Message, res.RetryStrategy)
 		} else {
 			msg := fmt.Sprintf("upstream status %d", p.StatusCode)
 			// 诊断信息优先：body 已存于 fwResult.Body 可随时查阅，但 diag 仅记录在 Message
@@ -908,15 +1027,18 @@ func buildLogEntry(p logEntryParams) *model.LogEntry {
 		entry.Cache1hInputTokens = res.Cache1hInputTokens
 		entry.ServiceTier = res.ServiceTier
 
-		// 使用实际转发的模型计算成本（重定向时价格可能不同）；
-		// 始终调用以支持按次计费图像模型（tokens=0 时返回固定成本）。
-		costModel := p.ActualModel
-		if costModel == "" {
-			costModel = p.RequestModel
+		if p.StatusCode >= http.StatusOK && p.StatusCode < http.StatusMultipleChoices {
+			// 使用实际转发的模型计算成本（重定向时价格可能不同）；
+			// 始终调用以支持按次计费图像模型（tokens=0 时返回固定成本）。
+			// 优先 actual（重定向可能换价）；无定价时回退 request（渠道第一列作定价别名）
+			// alpha/search 固定按 search_call 计费。
+			entry.Cost = computeRequestCost(billingModel, res.ServiceTier, res) + res.ToolCostUSD
 		}
-		entry.Cost = computeRequestCost(costModel, res.ServiceTier, res) + res.ToolCostUSD
 	} else {
 		entry.Message = "unknown"
+	}
+	if p.Result != nil {
+		entry.Message = appendRetryStrategyToMessage(entry.Message, p.Result.RetryStrategy)
 	}
 
 	if p.Result != nil {
@@ -925,8 +1047,6 @@ func buildLogEntry(p logEntryParams) *model.LogEntry {
 		}
 	}
 	entry.DebugData = p.DebugData
-	entry.AttemptIndex = p.AttemptIndex
-	entry.RequestID = p.RequestID
 	return entry
 }
 
@@ -950,20 +1070,15 @@ func computeRequestCost(model string, serviceTier string, res *fwResult) float64
 	if res == nil {
 		return 0
 	}
-	if serviceTier == "fast" && util.IsFastModeModel(model) {
-		return util.CalculateFastModeCost(
-			res.InputTokens, res.OutputTokens,
-			res.CacheReadInputTokens, res.Cache5mInputTokens, res.Cache1hInputTokens,
-		)
-	}
-	return util.CalculateCostDetailed(
+	return util.CalculateStandardCostBreakdown(
 		model,
+		serviceTier,
 		res.InputTokens,
 		res.OutputTokens,
 		res.CacheReadInputTokens,
 		res.Cache5mInputTokens,
 		res.Cache1hInputTokens,
-	) * util.OpenAIServiceTierMultiplier(model, serviceTier)
+	).Total
 }
 
 // truncateErr 截断错误信息到512字符（防止日志过长）

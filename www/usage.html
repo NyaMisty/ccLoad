@@ -4,18 +4,18 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title data-i18n="www.usage.title">API Usage - ccLoad</title>
-  <meta name="description" data-i18n-content="www.usage.meta.description" content="Use ccLoad with Anthropic, OpenAI, Gemini and Codex-compatible API endpoints. Includes client examples, token setup and admin console guidance.">
+  <meta name="description" data-i18n-content="www.usage.meta.description" content="Use ccLoad with Anthropic, OpenAI, Gemini and Codex-compatible API endpoints, including Responses WebSocket and native Codex Alpha Search passthrough.">
   <link rel="icon" type="image/svg+xml" href="favicon.svg">
   <link rel="icon" type="image/x-icon" href="favicon.ico">
   <link rel="apple-touch-icon" href="apple-touch-icon.png">
 
   <script src="assets/js/theme-init.js?v=20260615-13"></script>
-  <link rel="stylesheet" href="assets/css/www.css?v=breathe-v2-20260615-13">
+  <link rel="stylesheet" href="assets/css/www.css?v=20260729-1">
 
-  <script defer src="assets/locales/zh-CN.js?v=20260615-13"></script>
-  <script defer src="assets/locales/en.js?v=20260615-13"></script>
+  <script defer src="assets/locales/zh-CN.js?v=20260801-1"></script>
+  <script defer src="assets/locales/en.js?v=20260801-1"></script>
   <script defer src="assets/js/i18n.js?v=20260615-13"></script>
-  <script defer src="assets/js/nav.js?v=20260615-13"></script>
+  <script defer src="assets/js/nav.js?v=20260729-1"></script>
   <script defer src="assets/js/www.js?v=20260615-13"></script>
 </head>
 <body class="www-page www-usage">
@@ -24,7 +24,7 @@
       <span class="www-eyebrow">API Usage</span>
       <h1 class="www-page-title" data-i18n="www.usage.title">API Usage</h1>
       <p class="www-page-subtitle" data-i18n="www.usage.subtitle">
-        ccLoad exposes Anthropic, OpenAI, Gemini, and Codex-compatible endpoints. Clients only need a new base URL and token.
+        ccLoad exposes Anthropic, OpenAI, Gemini, and Codex-compatible endpoints, including Responses WebSocket and native Codex Alpha Search passthrough. Clients only need a new base URL and token.
       </p>
       <div class="www-badge-row" aria-label="Compatible protocols">
         <span class="www-badge">Anthropic Messages</span>
@@ -53,13 +53,13 @@
           <div class="www-step">
             <div>
               <h3>Add channels</h3>
-              <p>Open the channel page and configure upstream type, URL, API key, priority, models and limits. Separate multiple URLs with commas.</p>
+              <p>Open the channel page and configure the upstream protocol, URL, API key, priority, models and limits. Separate multiple URLs with commas.</p>
             </div>
           </div>
           <div class="www-step">
             <div>
               <h3>Create access tokens</h3>
-              <p>Create client tokens on the token page, and restrict models, channels or cost when needed. Proxy endpoints return 401 when no token exists.</p>
+              <p>Create client tokens on the token page. Restrict models, choose a channel allowlist or denylist, and cap cost or concurrency when needed. An empty channel list is unrestricted in either mode. Proxy endpoints return 401 when no token exists.</p>
             </div>
           </div>
         </div>
@@ -70,7 +70,7 @@
       <div class="www-container">
         <div class="www-section-header">
           <h2>Endpoint Reference</h2>
-          <p>After protocol transforms are enabled, one upstream channel can serve multiple client protocols. The default upstream mode keeps native upstream semantics whenever possible.</p>
+          <p>All four core client protocols can use every model-compatible channel. In automatic mode, ccLoad tries the client protocol first, then probes OpenAI, Anthropic, Codex, and Gemini without retrying the client protocol. It advances only when the request has not produced output and the endpoint reports a capability mismatch, or when the request cannot be represented in that protocol.</p>
         </div>
 
         <div class="www-data-table-wrapper">
@@ -99,6 +99,16 @@
                 <td>Responses-compatible endpoint for Codex-style requests and streams.</td>
               </tr>
               <tr>
+                <td>Codex WebSocket clients</td>
+                <td><code>GET /v1/responses</code></td>
+                <td>Authenticated Responses WebSocket; the direct-route alias is <code>GET /backend-api/codex/responses</code>.</td>
+              </tr>
+              <tr>
+                <td>Codex Alpha Search</td>
+                <td><code>POST /v1/alpha/search</code></td>
+                <td>Native Codex search passthrough. Only resolved Codex upstreams are eligible.</td>
+              </tr>
+              <tr>
                 <td>Gemini clients</td>
                 <td><code>POST /v1beta/models/{model}:generateContent</code></td>
                 <td>Gemini generateContent-compatible endpoint.</td>
@@ -115,6 +125,36 @@
               </tr>
             </tbody>
           </table>
+        </div>
+      </div>
+    </section>
+
+    <section class="www-section">
+      <div class="www-container">
+        <div class="www-section-header">
+          <h2>Codex Responses WebSocket</h2>
+          <p>The downstream client keeps one authenticated WebSocket while each selected upstream candidate may use native Codex WebSocket or the existing HTTP/SSE bridge.</p>
+        </div>
+
+        <div class="www-doc-grid">
+          <article class="www-info-card">
+            <h3>Channel and session setup</h3>
+            <ul class="www-check-list">
+              <li>Upgrade <code>GET /v1/responses</code> or <code>GET /backend-api/codex/responses</code> with a ccLoad access token.</li>
+              <li>Enable <code>websockets</code> only on channels whose upstream protocol is Codex. Other candidates continue through HTTP/SSE.</li>
+              <li>Keep the API token and <code>Session-Id</code> header stable across reconnects. When <code>Thread-Id</code> is present, ccLoad combines it with <code>Session-Id</code> so concurrent agent transcripts and turn locks stay isolated. Request-body cache hints never identify an execution session.</li>
+              <li><code>upstream_connection_reuse_limit_seconds</code> can rotate old upstream HTTP and WebSocket connections. Active turns drain first; a new native WebSocket reconnects on demand and replays the retained transcript.</li>
+            </ul>
+          </article>
+
+          <article class="www-info-card">
+            <h3>Failover boundary</h3>
+            <ul class="www-check-list">
+              <li>Before semantic output, HTTP/SSE &rarr; HTTP/SSE, native WebSocket &rarr; HTTP/SSE and native WebSocket &rarr; native WebSocket failover happens inside ccLoad.</li>
+              <li>HTTP/SSE &rarr; native WebSocket returns a retryable <code>502/server_error/upstream_unavailable</code> event and closes with code <code>1011</code>; the client must reconnect and replay the complete request.</li>
+              <li>After any semantic output, ccLoad does not switch transports or replay, preventing duplicate text, tool calls and charges.</li>
+            </ul>
+          </article>
         </div>
       </div>
     </section>
@@ -147,6 +187,11 @@
                 <td>Codex upstreams receive the Responses tool form, including search options and tool choice when present.</td>
               </tr>
               <tr>
+                <td>Codex Alpha Search</td>
+                <td><code>POST /v1/alpha/search</code></td>
+                <td>Native passthrough only. This endpoint is never translated to another protocol, and its <code>model</code> field is optional.</td>
+              </tr>
+              <tr>
                 <td>Gemini</td>
                 <td><code>"tools": [{"googleSearch": {}}]</code></td>
                 <td>Gemini channels receive the Google Search tool shape instead of OpenAI or Codex fields.</td>
@@ -170,15 +215,15 @@
       <div class="www-container">
         <div class="www-section-header">
           <h2>API Examples</h2>
-          <p>The `Authorization` header below uses a ccLoad access token, not an upstream provider key.</p>
+          <p>The <code>Authorization</code> header below uses a ccLoad access token, not an upstream provider key.</p>
         </div>
 
         <div class="www-tabs">
           <div class="www-tab-list" role="tablist" aria-label="API examples">
             <button class="www-tab-button active">Anthropic</button>
             <button class="www-tab-button">OpenAI</button>
-            <button class="www-tab-button">Gemini</button>
             <button class="www-tab-button">Codex</button>
+            <button class="www-tab-button">Gemini</button>
             <button class="www-tab-button">Token Count</button>
           </div>
 
@@ -253,6 +298,30 @@
   }'</code></pre>
               </div>
             </div>
+
+            <div class="www-section-header">
+              <h3>Codex Alpha Search</h3>
+              <p>This endpoint preserves the native Codex search payload. The <code>model</code> field is optional, and only channels whose resolved upstream protocol is Codex can handle the request.</p>
+            </div>
+
+            <div class="www-code-block">
+              <div class="www-code-header">
+                <span class="www-code-lang">bash</span>
+                <button class="www-code-copy" data-i18n="www.common.copy">Copy</button>
+              </div>
+              <div class="www-code-content">
+                <pre><code>curl -X POST http://localhost:8080/v1/alpha/search \
+  -H "Authorization: Bearer your_ccload_token" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "query": "golang channels"
+  }'</code></pre>
+              </div>
+            </div>
+
+            <div class="www-callout">
+              Regular channel base URLs automatically append <code>/v1/alpha/search</code>. An exact URL ending in <code>#</code> must already point to that endpoint, for example <code>https://upstream.example.com/v1/alpha/search#</code>. ccLoad removes <code>prompt_cache_key</code> and <code>prompt_cache_retention</code> before forwarding.
+            </div>
           </div>
 
           <div class="www-tab-panel">
@@ -309,11 +378,13 @@
               <p>The console is not decorative; it is the runtime control plane for channel configuration, token limits, log tracing, trend statistics and debug logs.</p>
             </div>
             <ul class="www-check-list">
-              <li>Channels: create, edit, delete and test upstream channels; import or export CSV.</li>
-              <li>Tokens: assign client tokens with model, channel and cost restrictions.</li>
+              <li>Channels: create, edit, delete and test upstream channels; pause individual models without deleting their configuration; detect native WebSocket support; configure provider-specific cooldown rules; import or export CSV.</li>
+              <li>Tokens: assign client tokens with model, channel allowlist or denylist, cost and concurrency restrictions.</li>
               <li>Logs: filter requests by status code, channel, model and token to locate failures.</li>
-              <li>Stats: inspect requests, tokens, cost, first-byte latency and health.</li>
+              <li>Overview: compare traffic by client protocol and inspect seven-day service health.</li>
+              <li>Stats: inspect requests, tokens, cost, first-byte latency and channel health.</li>
               <li>Trends: observe RPM, cost and latency by time range.</li>
+              <li>Model test: run chat-style requests or test models by channel through the real proxy path.</li>
             </ul>
           </div>
           <figure class="www-media-frame">
@@ -345,11 +416,16 @@
   -H "Content-Type: application/json" \
   -d '{
     "name": "Claude-API",
-    "type": "anthropic",
-    "url": "https://api.anthropic.com",
+    "urls": [
+      {"url": "https://api.anthropic.com", "protocols": ["anthropic"]}
+    ],
+    "protocol_transform_mode": "auto",
     "api_key": "sk-ant-xxx",
     "priority": 10,
-    "models": ["claude-sonnet-4-6"],
+    "models": [
+      {"model": "claude-sonnet-4-6"},
+      {"model": "claude-opus-4-6", "disabled": true}
+    ],
     "enabled": true
   }'</code></pre>
               </div>

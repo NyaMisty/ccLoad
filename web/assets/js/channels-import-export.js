@@ -1,11 +1,6 @@
 function setupImportExport() {
-  const exportBtn = document.getElementById('exportCsvBtn');
   const importBtn = document.getElementById('importCsvBtn');
   const importInput = document.getElementById('importCsvInput');
-
-  if (exportBtn) {
-    exportBtn.addEventListener('click', () => exportChannelsCSV(exportBtn));
-  }
 
   if (importBtn && importInput) {
     importBtn.addEventListener('click', () => {
@@ -24,10 +19,18 @@ function setupImportExport() {
   }
 }
 
-async function exportChannelsCSV(buttonEl) {
+async function exportSelectedChannelsCSV() {
+  const channelIDs = typeof getSelectedChannelIDs === 'function' ? getSelectedChannelIDs() : [];
+  if (channelIDs.length === 0) {
+    if (window.showWarning) window.showWarning(window.t('channels.batchNoSelection'));
+    return;
+  }
+
+  const exportButton = document.getElementById('batchExportChannelsBtn');
+  if (exportButton) exportButton.setAttribute('aria-busy', 'true');
+  if (typeof setBatchChannelOperationBusy === 'function') setBatchChannelOperationBusy(true);
   try {
-    if (buttonEl) buttonEl.disabled = true;
-    const res = await fetchWithAuth('/admin/channels/export');
+    const res = await fetchWithAuth(`/admin/channels/export?ids=${channelIDs.join(',')}`);
     if (!res.ok) {
       const errorText = await res.text();
       throw new Error(errorText || window.t('channels.import.exportHttpFailed', { status: res.status }));
@@ -48,8 +51,30 @@ async function exportChannelsCSV(buttonEl) {
     console.error('Export CSV failed', err);
     if (window.showError) window.showError(err.message || window.t('channels.msg.exportFailed'));
   } finally {
-    if (buttonEl) buttonEl.disabled = false;
+    if (exportButton) exportButton.removeAttribute('aria-busy');
+    if (typeof setBatchChannelOperationBusy === 'function') setBatchChannelOperationBusy(false);
   }
+}
+
+function updateCSVImportProgress(state, fileName = '') {
+  const container = document.getElementById('csvImportProgress');
+  const progress = document.getElementById('csvImportProgressBar');
+  const detail = document.getElementById('csvImportProgressDetail');
+  if (!container || !progress || !detail) return;
+
+  container.hidden = false;
+  container.dataset.kind = state;
+  progress.max = 1;
+  if (state === 'pending') {
+    progress.removeAttribute('value');
+    detail.textContent = window.t('channels.import.progressPreparing', { file: fileName });
+    return;
+  }
+
+  progress.value = 1;
+  detail.textContent = window.t(
+    state === 'success' ? 'channels.import.progressComplete' : 'channels.import.progressFailed'
+  );
 }
 
 async function handleImportCSV(event, importBtn) {
@@ -63,6 +88,7 @@ async function handleImportCSV(event, importBtn) {
   formData.append('file', file);
 
   if (importBtn) importBtn.disabled = true;
+  updateCSVImportProgress('pending', file.name);
 
   try {
     const resp = await fetchAPIWithAuth('/admin/channels/import', {
@@ -92,12 +118,18 @@ async function handleImportCSV(event, importBtn) {
       window.showSuccess(window.t('channels.msg.importSuccess'));
     }
 
+    updateCSVImportProgress('success');
     await reloadChannelsList();
   } catch (err) {
     console.error('Import CSV failed', err);
+    updateCSVImportProgress('error');
     if (window.showError) window.showError(err.message || window.t('channels.msg.importFailed'));
   } finally {
     if (importBtn) importBtn.disabled = false;
     input.value = '';
   }
+}
+
+if (typeof module !== 'undefined' && module.exports) {
+  module.exports = { setupImportExport, exportSelectedChannelsCSV, handleImportCSV };
 }

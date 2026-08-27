@@ -10,12 +10,12 @@
   <link rel="apple-touch-icon" href="apple-touch-icon.png">
 
   <script src="assets/js/theme-init.js?v=20260615-13"></script>
-  <link rel="stylesheet" href="assets/css/www.css?v=breathe-v2-20260615-13">
+  <link rel="stylesheet" href="assets/css/www.css?v=20260729-1">
 
-  <script defer src="assets/locales/zh-CN.js?v=20260615-13"></script>
-  <script defer src="assets/locales/en.js?v=20260615-13"></script>
+  <script defer src="assets/locales/zh-CN.js?v=20260801-1"></script>
+  <script defer src="assets/locales/en.js?v=20260801-1"></script>
   <script defer src="assets/js/i18n.js?v=20260615-13"></script>
-  <script defer src="assets/js/nav.js?v=20260615-13"></script>
+  <script defer src="assets/js/nav.js?v=20260729-1"></script>
   <script defer src="assets/js/www.js?v=20260615-13"></script>
 </head>
 <body class="www-page www-config">
@@ -40,7 +40,7 @@
       <div class="www-container">
         <div class="www-section-header">
           <h2>Startup Environment Variables</h2>
-          <p>Startup variables answer one question: can the service boot safely? Runtime policies that can be hot-updated should stay in the admin console, not in environment variables.</p>
+          <p>Environment variables cover bootstrap configuration only — values ccLoad needs before a database connection exists. Storage variables (<code>SQLITE_PATH</code>, <code>SQLITE_JOURNAL_MODE</code>, <code>CCLOAD_MYSQL</code>, <code>CCLOAD_POSTGRES</code>, <code>CCLOAD_ENABLE_SQLITE_REPLICA</code>, <code>CCLOAD_SQLITE_LOG_DAYS</code>) decide <em>how</em> the database is opened, so they cannot live inside that same database and will stay environment variables. Runtime policies belong in the admin console below.</p>
         </div>
 
         <div class="www-data-table-wrapper">
@@ -73,22 +73,46 @@
                 <td>Do not set it to a different value from <code>CCLOAD_API_TOKENS</code>.</td>
               </tr>
               <tr>
+                <td><code>CCLOAD_RELEASE_BASE_URL</code></td>
+                <td>None</td>
+                <td>Complete <code>.../releases/latest/download</code> base URL used for stable release detection and all release asset downloads.</td>
+                <td>Leave unset to let the update manager try <code>gh.monlor.com</code>, <code>fastgit.cc</code>, <code>ghfast.top</code>, then GitHub. Preview metadata always comes from GitHub's Releases feed. Set this only to force one private mirror for stable metadata and all release asset downloads.</td>
+              </tr>
+              <tr>
                 <td><code>CCLOAD_MYSQL</code></td>
                 <td>None</td>
-                <td>MySQL DSN. When set, ccLoad uses MySQL; otherwise it uses SQLite.</td>
-                <td>Set it for multiple instances, long-running Hugging Face deployments or external backup.</td>
+                <td>MySQL DSN. Mutually exclusive with <code>CCLOAD_POSTGRES</code>.</td>
+                <td>Set exactly one primary DSN; when neither is set, ccLoad uses SQLite.</td>
+              </tr>
+              <tr>
+                <td><code>CCLOAD_POSTGRES</code></td>
+                <td>None</td>
+                <td>PostgreSQL DSN in URL or libpq keyword format. Mutually exclusive with <code>CCLOAD_MYSQL</code>.</td>
+                <td>Example: <code>postgres://user:pass@host:5432/ccload?sslmode=require</code>.</td>
               </tr>
               <tr>
                 <td><code>CCLOAD_ENABLE_SQLITE_REPLICA</code></td>
                 <td><code>0</code></td>
-                <td>Hybrid storage switch: write MySQL, read from a SQLite replica.</td>
-                <td>Recommended with MySQL on Hugging Face Spaces.</td>
+                <td>Hybrid storage switch: persist through MySQL/PostgreSQL and read from a local SQLite replica.</td>
+                <td>Requires one primary DSN. Useful on Hugging Face Spaces or with a high-latency primary.</td>
+              </tr>
+              <tr>
+                <td><code>SQLITE_PATH</code></td>
+                <td><code>data/ccload.db</code></td>
+                <td>SQLite database file path. Falls back to a temporary directory when the default is not writable.</td>
+                <td>Set an explicit persistent path in production. Read while opening the database, so it cannot be a system setting.</td>
+              </tr>
+              <tr>
+                <td><code>SQLITE_JOURNAL_MODE</code></td>
+                <td><code>WAL</code></td>
+                <td>SQLite journal mode used to build the connection DSN. Accepts a fixed whitelist; an invalid value stops startup.</td>
+                <td><code>TRUNCATE</code> is safer in containers where WAL sidecar files can be lost. Read before the database exists, so it cannot be a system setting.</td>
               </tr>
               <tr>
                 <td><code>CCLOAD_SQLITE_LOG_DAYS</code></td>
                 <td><code>7</code></td>
-                <td>Number of log days restored from MySQL on hybrid startup.</td>
-                <td><code>-1</code> restores all logs; <code>0</code> restores no logs.</td>
+                <td>Initial log window imported from primary when hybrid SQLite has no logs.</td>
+                <td><code>-1</code> imports all logs; <code>0</code> disables startup log imports. Other values make later startups import only logs newer than SQLite's latest timestamp.</td>
               </tr>
               <tr>
                 <td><code>CCLOAD_ALLOW_INSECURE_TLS</code></td>
@@ -102,18 +126,6 @@
                 <td>Pins upstream hostnames to fixed IPs before dialing. Format: <code>host=ip,host2=ip2</code>.</td>
                 <td>Use for upstream DNS failures, for example <code>anyrouter.top=47.246.23.200</code>. TLS SNI, certificates and Host headers stay unchanged. Invalid entries fail startup.</td>
               </tr>
-              <tr>
-                <td><code>CCLOAD_MAX_CONCURRENCY</code></td>
-                <td><code>1000</code></td>
-                <td>Global maximum concurrent proxy requests.</td>
-                <td>Tune it to machine resources and upstream limits. Do not leave concurrency unbounded.</td>
-              </tr>
-              <tr>
-                <td><code>CCLOAD_MAX_BODY_BYTES</code></td>
-                <td><code>10485760</code></td>
-                <td>Maximum request body size. Images API automatically raises this to 20MB.</td>
-                <td>Keep the default for public deployments to avoid oversized requests overwhelming the service.</td>
-              </tr>
             </tbody>
           </table>
         </div>
@@ -124,7 +136,7 @@
       <div class="www-container">
         <div class="www-section-header">
           <h2>Storage Modes</h2>
-          <p>Choose storage by deployment shape. Do not add MySQL just to look production-grade; SQLite is simpler and has less operational surface for single-instance deployments.</p>
+          <p>Choose storage by deployment shape. Do not add an external database just to look production-grade; SQLite is simpler and has less operational surface for single-instance deployments.</p>
         </div>
 
         <div class="www-data-table-wrapper">
@@ -140,7 +152,7 @@
             <tbody>
               <tr>
                 <td>SQLite only</td>
-                <td>Do not set <code>CCLOAD_MYSQL</code></td>
+                <td>Do not set a primary DSN</td>
                 <td>Local development, personal deployments and single-instance services.</td>
                 <td>Simplest path; not suitable for shared multi-instance state.</td>
               </tr>
@@ -151,10 +163,16 @@
                 <td>Strong persistence; read/write latency depends on the database.</td>
               </tr>
               <tr>
+                <td>PostgreSQL only</td>
+                <td>Set <code>CCLOAD_POSTGRES</code></td>
+                <td>PostgreSQL-based production, external backups and migration across machines.</td>
+                <td>Strong persistence; read/write latency depends on the database.</td>
+              </tr>
+              <tr>
                 <td>Hybrid</td>
-                <td><code>CCLOAD_MYSQL</code> + <code>CCLOAD_ENABLE_SQLITE_REPLICA=1</code></td>
-                <td>Hugging Face Spaces or high-latency MySQL when persistence is still required.</td>
-                <td>Writes go to MySQL and reads use local cache; higher complexity.</td>
+                <td>Primary DSN + <code>CCLOAD_ENABLE_SQLITE_REPLICA=1</code></td>
+                <td>Hugging Face Spaces or a high-latency primary when persistence is still required.</td>
+                <td>Durable data uses the primary and reads use local cache; higher complexity.</td>
               </tr>
             </tbody>
           </table>
@@ -166,7 +184,7 @@
       <div class="www-container">
         <div class="www-section-header">
           <h2>Channel Configuration</h2>
-          <p>Channels are ccLoad's core runtime objects. A channel can have multiple keys, multiple upstream URLs, independent cooldown, RPM/concurrency limits and protocol transform policy.</p>
+          <p>Channels are ccLoad's core runtime objects. Every channel accepts four client protocols and owns multiple keys and URLs, plus independent cooldown and RPM/concurrency limits.</p>
         </div>
 
         <div class="www-doc-grid">
@@ -174,11 +192,14 @@
             <h3>Core fields</h3>
             <ul class="www-check-list">
               <li><code>name</code>: readable channel name used by logs and statistics.</li>
-              <li><code>type</code>: upstream protocol type such as Anthropic, OpenAI, Gemini or Codex.</li>
-              <li><code>url</code>: supports comma-separated URLs; a trailing <code>#</code> marks an exact upstream URL and disables automatic path joining.</li>
+              <li><code>protocol_transform_mode</code>: <code>auto</code> starts with the client protocol, then detects OpenAI → Anthropic → Codex → Gemini without retrying it; <code>upstream</code> is client-protocol passthrough-only; <code>local</code> translates to URL-declared protocols.</li>
+              <li><code>urls</code>: an ordered list of URLs with optional <code>protocols</code>. Local mode prioritizes declared URLs; if all are undeclared it tries Anthropic → Codex → OpenAI → Gemini. <code>exact: true</code> disables automatic path joining.</li>
               <li><code>api_key</code>: supports one or multiple keys. ccLoad performs key-level retries inside the channel.</li>
+              <li><code>models</code>: each entry can redirect to a different upstream model or be disabled independently. A disabled entry stays persisted but is excluded from routing and fuzzy matching.</li>
               <li><code>priority</code>: higher priority is selected first; equal priority uses smooth weighted round-robin.</li>
               <li><code>proxy_url</code>: optional per-channel proxy. Supports <code>http</code>, <code>https</code>, <code>socks5</code> and <code>socks5h</code>; empty uses the process environment proxy.</li>
+              <li><code>available_time_start</code> / <code>available_time_end</code>: optional server-local daily availability window in <code>HH:MM</code>; leave both empty for all day, and overnight windows such as <code>22:00</code>–<code>08:00</code> are supported.</li>
+              <li><code>websockets</code>: for channels with a Codex-capable URL. Reuse a native upstream Responses WebSocket; use the built-in detector before enabling it.</li>
             </ul>
           </article>
 
@@ -186,7 +207,7 @@
             <h3>Protection fields</h3>
             <ul class="www-check-list">
               <li><code>rpm_limit</code>: rolling 60-second request cap for the channel; <code>0</code> means unlimited.</li>
-              <li><code>max_concurrency</code>: maximum in-flight requests for each API key in the channel. A full key is skipped, and streaming requests release the slot only when the stream ends.</li>
+              <li><code>max_concurrency</code>: maximum in-flight requests for the channel. Streaming requests release the slot only when the stream ends.</li>
               <li><code>daily_cost_limit</code>: daily channel cost limit. The channel is skipped after the limit is reached.</li>
               <li><code>cost_multiplier</code>: channel multiplier used for effective-cost limits and accounting.</li>
               <li><code>scheduled_check_enabled</code>: enables scheduled probing, usually paired with a check model.</li>
@@ -195,10 +216,19 @@
         </div>
 
         <div class="www-callout www-mt-8">
+          <strong>Auto mode learns protocol capability at runtime.</strong> For each URL and request family, ccLoad tries the client protocol first, then falls back through OpenAI, Anthropic, Codex and Gemini while skipping the protocol already attempted. A working protocol remains cached until restart or channel configuration changes; an all-unsupported result is probed again after 10 minutes. It advances only after an uncommitted HTTP 400, a non-model 404/405, a structured 500 with <code>convert_request_failed</code> plus <code>not implemented</code>, a pre-origin Cloudflare 403 block page, or a transform that cannot represent the request. Exact URLs marked with <code>#</code> translate directly when a conversion exists. Choose <code>upstream</code> or <code>local</code> when the route must be strict.
+        </div>
+        <div class="www-callout www-mt-8">
           <strong>Multiple URLs are channel-internal resilience, not a replacement for channel priority.</strong> ccLoad explores URLs first, then selects by 1/EWMA latency weighting. Failed URLs back off independently and do not drag down other URLs in the same channel.
         </div>
         <div class="www-callout www-mt-4">
-          <strong>Provider fixed-window quota is treated as a real channel cooldown.</strong> When an upstream response includes a concrete reset time, ccLoad waits for that reset instead of guessing with exponential backoff.
+          <strong>An explicit channel-wide fixed-window quota is treated as a real channel cooldown.</strong> When the upstream provides a concrete channel reset time, ccLoad waits for that reset instead of guessing with exponential backoff.
+        </div>
+        <div class="www-callout www-mt-4">
+          <strong>Provider-specific failures belong in channel cooldown detection rules.</strong> Rules run in priority order and the first match wins. Match status and response text, choose key/model/channel scope, then use a fixed duration or parse the provider's reset time. Test an unsaved rule against a raw response or standard upstream log before saving; no match or an unusable reset time falls back to the built-in classifier.
+        </div>
+        <div class="www-callout www-mt-4">
+          <strong>Bulk model cleanup is explicit.</strong> After refreshing selected channels, the console can lowercase model names or remove source prefixes in one operation. Review the selected channels first because these actions change the persisted model list.
         </div>
       </div>
     </section>
@@ -207,29 +237,34 @@
       <div class="www-container">
         <div class="www-section-header">
           <h2>Runtime Settings in the Admin Console</h2>
-          <p>These settings are stored in the database and can be adjusted at runtime. They are policy, not startup configuration.</p>
+          <p>These settings are stored in the database and can be adjusted from <code>/web/settings.html</code>. Saving a change writes the new value and restarts the process about two seconds later; the restart is what applies it. There is no hot reload — in-flight requests finish before the process exits.</p>
         </div>
 
         <div class="www-doc-grid www-doc-grid-3">
           <article class="www-doc-card">
             <span class="www-doc-icon">🔁</span>
             <h3>Retries and cooldown</h3>
-            <p>Key-level errors retry another key inside the channel; 5xx, 598 and 599 channel-level errors trigger channel failover. Cooldown uses exponential backoff and defaults to a 30-minute cap.</p>
+            <p>Initial cooldown durations are settings, not environment variables: <code>cooldown_auth_seconds</code>, <code>cooldown_server_seconds</code>, <code>cooldown_timeout_seconds</code> and <code>cooldown_rate_limit_seconds</code>, bounded by <code>cooldown_min_seconds</code> and <code>cooldown_max_seconds</code>. An inverted floor/ceiling pair falls back to both defaults. Key errors (401/403) cool only the current key. Model-scoped errors — structured <code>model_cooldown</code> responses, upstream HTTP 5xx, key-level 429 rate limits, and model-unavailable 404 — cool only the actual upstream model. The channel is cooled only after every enabled key or every configured model is cooling. Network failures plus internal 598/599 errors remain channel-scoped; key and channel cooldowns use exponential backoff, while model cooldown uses the upstream reset time or a fixed five-minute fallback.</p>
           </article>
           <article class="www-doc-card">
             <span class="www-doc-icon">⏱️</span>
             <h3>Protocol timeouts</h3>
-            <p>Supports global first-byte timeout and non-stream timeout, plus Anthropic, Codex, OpenAI and Gemini overrides by upstream protocol.</p>
+            <p><code>upstream_first_byte_timeout</code> limits time to the first valid streaming content, <code>stream_timeout</code> limits total stream duration, and <code>non_stream_timeout</code> defaults to 120 seconds. A zero value disables each global limit. Anthropic, Codex, OpenAI and Gemini can override first-byte and non-stream limits; zero on an override inherits the global value.</p>
+          </article>
+          <article class="www-doc-card">
+            <span class="www-doc-icon">🔌</span>
+            <h3>Upstream connection lifetime</h3>
+            <p><code>upstream_connection_reuse_limit_seconds</code> limits how long HTTP/1.1, HTTP/2 and WebSocket connections may be reused. <code>0</code> keeps the existing unlimited behavior. At the limit, idle connections close immediately; active connections stop accepting work and close after draining, while new requests reconnect on demand.</p>
           </article>
           <article class="www-doc-card">
             <span class="www-doc-icon">📈</span>
             <h3>Health-based sorting</h3>
-            <p>When enabled, ccLoad adjusts effective priority by historical success rate and uses a confidence factor to avoid over-penalizing small samples.</p>
+            <p>When enabled, ccLoad subtracts a confidence-weighted failure penalty from priority. Optional TTFB scoring also penalizes channels slower than the current candidate median without applying full weight to small samples.</p>
           </article>
           <article class="www-doc-card">
             <span class="www-doc-icon">💳</span>
             <h3>Token limits</h3>
-            <p>Auth tokens can restrict allowed models, allowed channels, cost limits and statistics scope. Costs use integer micro-dollars to avoid floating-point drift.</p>
+            <p>Auth tokens can restrict models, cap concurrency and cost, and scope statistics. Channel access combines <code>allowed_channel_ids</code> with <code>channel_restriction_mode</code>: <code>allow</code> treats the list as an allowlist, while <code>deny</code> treats it as a denylist. An empty list is unrestricted in either mode. Costs use integer micro-dollars to avoid floating-point drift.</p>
           </article>
           <article class="www-doc-card">
             <span class="www-doc-icon">🧩</span>
@@ -242,10 +277,29 @@
             <p>Manual and scheduled checks both count toward channel RPM limits. Use a low-cost, stable model for checks.</p>
           </article>
           <article class="www-doc-card">
+            <span class="www-doc-icon">🚦</span>
+            <h3>Concurrency and body limits</h3>
+            <p><code>max_concurrency</code> caps simultaneous proxy requests; <code>max_body_bytes</code> and <code>max_image_body_bytes</code> cap request bodies for regular and Images API paths respectively. All three take effect after the automatic restart that follows a settings change, and the body limits also bound Responses WebSocket frames and transcripts.</p>
+          </article>
+          <article class="www-doc-card">
+            <span class="www-doc-icon">🔗</span>
+            <h3>WebSocket sessions</h3>
+            <p><code>responses_ws_max_sessions</code> caps process-wide execution sessions; <code>0</code> uses the default of 32. <code>responses_ws_session_ttl_minutes</code> controls idle transcript retention. A stable <code>Session-Id</code>, combined with <code>Thread-Id</code> when present, isolates transcripts and turn locks. Runtime usage is exposed by <code>GET /admin/runtime-metrics</code>.</p>
+          </article>
+          <article class="www-doc-card">
+            <span class="www-doc-icon">📚</span>
+            <h3>Model catalog sync</h3>
+            <p><code>model_catalog_sync_interval_hours</code> refreshes models and pricing from models.dev every 6 hours by default. Set it to <code>0</code> to disable network sync; startup falls back from the last-good cache to the embedded catalog.</p>
+          </article>
+          <article class="www-doc-card">
             <span class="www-doc-icon">⬆️</span>
             <h3>Auto updates</h3>
-            <p>ccLoad checks GitHub Releases every 12 hours by default. Change <code>auto_update_interval_hours</code> in admin settings, or set it to <code>0</code> to disable checks.</p>
+            <p>For non-container deployments, one update manager checks releases at startup and every 12 hours by default. Stable checks try <code>gh.monlor.com</code>, <code>fastgit.cc</code>, and <code>ghfast.top</code> before GitHub; preview checks use GitHub's Releases feed. Set <code>auto_update_interval_hours</code> to <code>0</code> to disable all checks, or use <code>CCLOAD_RELEASE_BASE_URL</code> to force one private mirror for stable metadata and all release asset downloads. Container deployments switch versions with the <code>latest</code> and <code>beta</code> image Tags instead.</p>
           </article>
+        </div>
+
+        <div class="www-callout www-mt-8">
+          <strong>Dynamic channel sorting is opt-in.</strong> Enable <code>enable_health_score</code> for success-rate scoring, then enable <code>enable_ttfb_score</code> to add relative first-byte scoring. Tune the two penalties independently with <code>success_rate_penalty_weight</code>, <code>health_min_confident_sample</code>, <code>ttfb_penalty_weight</code>, <code>ttfb_max_slow_ratio</code> and <code>ttfb_min_confident_sample</code>.
         </div>
       </div>
     </section>
@@ -262,9 +316,9 @@
             <h3>Pre-production checklist</h3>
             <ul class="www-check-list">
               <li>Store the strong password in Secrets, not in the repository.</li>
-              <li>Create at least one API access token; otherwise `/v1/*` returns 401 by design.</li>
+              <li>Create at least one API access token; otherwise <code>/v1/*</code> returns 401 by design.</li>
               <li>Restrict admin-console access on public deployments or place it behind a protected network.</li>
-              <li>Do not use `CCLOAD_ALLOW_INSECURE_TLS` as a long-term setting.</li>
+              <li>Do not use <code>CCLOAD_ALLOW_INSECURE_TLS</code> as a long-term setting.</li>
             </ul>
           </article>
           <article class="www-info-card">
@@ -278,8 +332,11 @@
                 <pre><code>CCLOAD_PASS=your_strong_admin_password
 CCLOAD_API_TOKENS=client_token|production
 
-# Optional: MySQL / hybrid mode
+# Optional: choose exactly one primary database
 CCLOAD_MYSQL=user:pass@tcp(host:3306)/ccload?charset=utf8mb4
+# CCLOAD_POSTGRES=postgres://user:pass@host:5432/ccload?sslmode=require
+
+# Optional: add a local SQLite read replica
 CCLOAD_ENABLE_SQLITE_REPLICA=1
 CCLOAD_SQLITE_LOG_DAYS=7
 

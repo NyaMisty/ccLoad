@@ -4,14 +4,20 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"strconv"
 	"strings"
 
+	"ccLoad/internal/config"
+	"ccLoad/internal/model"
 	"ccLoad/internal/storage/schema"
 )
 
 const (
-	channelModelsRedirectMigrationVersion = "v1_channel_models_redirect"
-	channelModelsOrderRepairVersion       = "v2_channel_models_created_at_order"
+	channelModelsRedirectMigrationVersion  = "v1_channel_models_redirect"
+	channelModelsOrderRepairVersion        = "v2_channel_models_created_at_order"
+	structuredChannelURLsMigrationVersion  = "v4_structured_channel_urls"
+	clientProtocolBackfillMigrationVersion = "v5_logs_client_protocol_backfill"
+	previousAntigravitySensitiveWords      = `["API","proxy"]`
 )
 
 // Dialect 数据库方言
@@ -23,6 +29,8 @@ const (
 	DialectSQLite Dialect = iota
 	// DialectMySQL MySQL数据库方言
 	DialectMySQL
+	// DialectPostgres PostgreSQL数据库方言
+	DialectPostgres
 )
 
 // migrateSQLite 执行SQLite数据库迁移
@@ -40,19 +48,27 @@ func migrateMySQL(ctx context.Context, db *sql.DB) error {
 	return migrate(ctx, db, DialectMySQL)
 }
 
+// migratePostgres 执行 PostgreSQL 数据库迁移
+func migratePostgres(ctx context.Context, db *sql.DB) error {
+	return migrate(ctx, db, DialectPostgres)
+}
+
 // migrate 统一迁移逻辑
 func migrate(ctx context.Context, db *sql.DB, dialect Dialect) error {
+	// 迁移约束：不得在启动迁移中删除废弃字段或表。
+	// 新库由当前 schema 决定不创建；旧库保留原结构和数据，以支持版本回退。
+	// 确需执行破坏性迁移时，必须脱离启动路径，由显式运维操作完成。
 	// 表定义（顺序重要：外键依赖）
 	tables := []func() *schema.TableBuilder{
 		schema.DefineSchemaMigrationsTable, // 迁移版本表必须最先创建
 		schema.DefineChannelsTable,
 		schema.DefineAPIKeysTable,
 		schema.DefineChannelModelsTable,
-		schema.DefineChannelProtocolTransformsTable,
+		schema.DefineChannelModelCooldownsTable,
 		schema.DefineChannelURLStatesTable,
 		schema.DefineAuthTokensTable,
 		schema.DefineSystemSettingsTable,
-		schema.DefineAdminSessionsTable,
+		schema.DefineWebSessionsTable,
 		schema.DefineLogsTable,
 		schema.DefineDebugLogsTable,
 	}
@@ -75,6 +91,9 @@ func migrate(ctx context.Context, db *sql.DB, dialect Dialect) error {
 			if err := relaxDebugLogsRespBodyNullable(ctx, db, dialect); err != nil {
 				return fmt.Errorf("relax debug_logs.resp_body nullability: %w", err)
 			}
+			if err := rebuildDebugLogsForProtocolPayloads(ctx, db, dialect); err != nil {
+				return fmt.Errorf("rebuild debug_logs for protocol payloads: %w", err)
+			}
 			delete(allIndexes, "debug_logs")
 		}
 
@@ -91,6 +110,11 @@ func migrate(ctx context.Context, db *sql.DB, dialect Dialect) error {
 		if _, err := db.ExecContext(ctx, buildDDL(tb, dialect)); err != nil {
 			return fmt.Errorf("create %s table: %w", tb.Name(), err)
 		}
+		if tb.Name() == "debug_logs" {
+			if err := ensureDebugLogsProtocolMetadata(ctx, db, dialect); err != nil {
+				return fmt.Errorf("migrate debug_logs protocol metadata: %w", err)
+			}
+		}
 
 		// 增量迁移：确保logs表新字段存在（2025-12新增）
 		if tb.Name() == "logs" {
@@ -99,6 +123,15 @@ func migrate(ctx context.Context, db *sql.DB, dialect Dialect) error {
 			}
 			if err := ensureLogsCostMultiplier(ctx, db, dialect); err != nil {
 				return fmt.Errorf("migrate logs cost_multiplier: %w", err)
+			}
+			if err := ensureLogsUpstreamWebsocket(ctx, db, dialect); err != nil {
+				return fmt.Errorf("migrate logs upstream_websocket: %w", err)
+			}
+			if err := ensureLogsClientProtocol(ctx, db, dialect); err != nil {
+				return fmt.Errorf("migrate logs client_protocol: %w", err)
+			}
+			if err := ensureLogsUpstreamProtocol(ctx, db, dialect); err != nil {
+				return fmt.Errorf("migrate logs upstream_protocol: %w", err)
 			}
 		}
 
@@ -113,9 +146,6 @@ func migrate(ctx context.Context, db *sql.DB, dialect Dialect) error {
 			if err := ensureChannelsMaxConcurrency(ctx, db, dialect); err != nil {
 				return fmt.Errorf("migrate channels max_concurrency: %w", err)
 			}
-			if err := ensureChannelsProtocolTransformMode(ctx, db, dialect); err != nil {
-				return fmt.Errorf("migrate channels protocol_transform_mode: %w", err)
-			}
 			if err := ensureChannelsScheduledCheckEnabled(ctx, db, dialect); err != nil {
 				return fmt.Errorf("migrate channels scheduled_check_enabled: %w", err)
 			}
@@ -125,15 +155,39 @@ func migrate(ctx context.Context, db *sql.DB, dialect Dialect) error {
 			if err := ensureChannelsCustomRequestRules(ctx, db, dialect); err != nil {
 				return fmt.Errorf("migrate channels custom_request_rules: %w", err)
 			}
+			if err := ensureChannelsCooldownDetectionRules(ctx, db, dialect); err != nil {
+				return fmt.Errorf("migrate channels cooldown_detection_rules: %w", err)
+			}
 			if err := ensureChannelsCostMultiplier(ctx, db, dialect); err != nil {
 				return fmt.Errorf("migrate channels cost_multiplier: %w", err)
 			}
 			if err := ensureChannelsProxyURL(ctx, db, dialect); err != nil {
 				return fmt.Errorf("migrate channels proxy_url: %w", err)
 			}
+			if err := ensureChannelsAvailableTime(ctx, db, dialect); err != nil {
+				return fmt.Errorf("migrate channels available time: %w", err)
+			}
+			if err := ensureChannelsRetryOtherKeysOnFailure(ctx, db, dialect); err != nil {
+				return fmt.Errorf("migrate channels retry_other_keys_on_failure: %w", err)
+			}
+			if err := ensureChannelsWebsockets(ctx, db, dialect); err != nil {
+				return fmt.Errorf("migrate channels websockets: %w", err)
+			}
+			if err := ensureChannelsProtocolTransformMode(ctx, db, dialect); err != nil {
+				return fmt.Errorf("migrate channels protocol_transform_mode: %w", err)
+			}
+			if err := ensureChannelsAuthType(ctx, db, dialect); err != nil {
+				return fmt.Errorf("migrate channels auth_type: %w", err)
+			}
+			if err := ensureChannelsOAuthCredential(ctx, db, dialect); err != nil {
+				return fmt.Errorf("migrate channels oauth_credential: %w", err)
+			}
 			// 增量迁移：将url字段从VARCHAR(191)扩展为TEXT（支持多URL存储）
 			if err := migrateChannelsURLToText(ctx, db, dialect); err != nil {
 				return fmt.Errorf("migrate channels url to text: %w", err)
+			}
+			if err := migrateChannelURLsToStructuredJSON(ctx, db, dialect); err != nil {
+				return fmt.Errorf("migrate channels url to structured JSON: %w", err)
 			}
 		}
 
@@ -167,13 +221,22 @@ func migrate(ctx context.Context, db *sql.DB, dialect Dialect) error {
 			if err := validateAuthTokensAllowedChannelIDsJSON(ctx, db); err != nil {
 				return fmt.Errorf("validate auth_tokens allowed_channel_ids: %w", err)
 			}
+			if err := ensureAuthTokensChannelRestrictionMode(ctx, db, dialect); err != nil {
+				return fmt.Errorf("migrate auth_tokens channel_restriction_mode: %w", err)
+			}
+			if err := validateAuthTokensChannelRestrictionMode(ctx, db); err != nil {
+				return fmt.Errorf("validate auth_tokens channel_restriction_mode: %w", err)
+			}
 			if err := ensureAuthTokensCostLimit(ctx, db, dialect); err != nil {
 				return fmt.Errorf("migrate auth_tokens cost_limit: %w", err)
+			}
+			if err := ensureAuthTokensPeriodCostLimits(ctx, db, dialect); err != nil {
+				return fmt.Errorf("migrate auth_tokens period cost limits: %w", err)
 			}
 			if err := ensureAuthTokensMaxConcurrency(ctx, db, dialect); err != nil {
 				return fmt.Errorf("migrate auth_tokens max_concurrency: %w", err)
 			}
-			if err := backfillAuthTokensCostLimitMaxConcurrency(ctx, db); err != nil {
+			if err := backfillAuthTokensCostLimitMaxConcurrency(ctx, db, dialect); err != nil {
 				return fmt.Errorf("backfill auth_tokens max_concurrency: %w", err)
 			}
 			if err := validateAuthTokensMaxConcurrency(ctx, db); err != nil {
@@ -186,8 +249,17 @@ func migrate(ctx context.Context, db *sql.DB, dialect Dialect) error {
 			if err := migrateChannelModelsSchema(ctx, db, dialect); err != nil {
 				return fmt.Errorf("migrate channel_models schema: %w", err)
 			}
+			if err := ensureChannelModelsDisabled(ctx, db, dialect); err != nil {
+				return fmt.Errorf("migrate channel_models disabled: %w", err)
+			}
 			if err := repairLegacyChannelModelOrder(ctx, db, dialect); err != nil {
 				return fmt.Errorf("repair legacy channel_models order: %w", err)
+			}
+		}
+
+		if tb.Name() == "channel_model_cooldowns" {
+			if err := ensureModelCooldownDuration(ctx, db, dialect); err != nil {
+				return fmt.Errorf("migrate channel_model_cooldowns cooldown_duration_ms: %w", err)
 			}
 		}
 
@@ -203,9 +275,18 @@ func migrate(ctx context.Context, db *sql.DB, dialect Dialect) error {
 		}
 	}
 
+	// 旧管理员会话不携带身份作用域，不能迁移为新的 Web 会话。
+	if _, err := db.ExecContext(ctx, "DROP TABLE IF EXISTS admin_sessions"); err != nil {
+		return fmt.Errorf("drop obsolete admin_sessions table: %w", err)
+	}
+
 	// effective_cost_usd 的历史回填依赖 logs.cost_multiplier，必须等 logs 增量迁移完成后再执行。
 	if err := ensureAuthTokensEffectiveCost(ctx, db, dialect); err != nil {
 		return fmt.Errorf("migrate auth_tokens effective_cost: %w", err)
+	}
+
+	if err := backfillLogsClientProtocol(ctx, db, dialect); err != nil {
+		return fmt.Errorf("backfill logs client_protocol: %w", err)
 	}
 
 	// 初始化默认配置
@@ -234,11 +315,8 @@ func cleanupRemovedSettings(ctx context.Context, db *sql.DB, dialect Dialect) er
 }
 
 func deleteSystemSetting(ctx context.Context, db *sql.DB, dialect Dialect, key string) error {
-	query := "DELETE FROM system_settings WHERE key = ?"
-	if dialect == DialectMySQL {
-		query = "DELETE FROM system_settings WHERE `key` = ?"
-	}
-	if _, err := db.ExecContext(ctx, query, key); err != nil {
+	query := fmt.Sprintf("DELETE FROM system_settings WHERE %s = ?", quoteKeyIdent(dialect))
+	if _, err := db.ExecContext(ctx, rebindIfPostgres(dialect, query), key); err != nil {
 		return fmt.Errorf("delete system setting %s: %w", key, err)
 	}
 	return nil
@@ -246,21 +324,21 @@ func deleteSystemSetting(ctx context.Context, db *sql.DB, dialect Dialect, key s
 
 // hasSystemSetting 检查系统设置是否存在（用于配置迁移和旧版标记兼容）
 func hasSystemSetting(ctx context.Context, db *sql.DB, dialect Dialect, key string) bool {
-	query := "SELECT 1 FROM system_settings WHERE key = ? LIMIT 1"
-	if dialect == DialectMySQL {
-		query = "SELECT 1 FROM system_settings WHERE `key` = ? LIMIT 1"
-	}
+	query := fmt.Sprintf("SELECT 1 FROM system_settings WHERE %s = ? LIMIT 1", quoteKeyIdent(dialect))
 	var exists int
-	err := db.QueryRowContext(ctx, query, key).Scan(&exists)
+	err := db.QueryRowContext(ctx, rebindIfPostgres(dialect, query), key).Scan(&exists)
 	return err == nil
 }
 
 // loadAllExistingIndexes 一次性查询整个数据库下所有表的现有索引集合
 func loadAllExistingIndexes(ctx context.Context, db *sql.DB, dialect Dialect) (map[string]map[string]bool, error) {
 	var query string
-	if dialect == DialectMySQL {
+	switch dialect {
+	case DialectMySQL:
 		query = "SELECT DISTINCT TABLE_NAME, INDEX_NAME FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = DATABASE()"
-	} else {
+	case DialectPostgres:
+		query = "SELECT tablename, indexname FROM pg_indexes WHERE schemaname = current_schema()"
+	default:
 		query = "SELECT tbl_name, name FROM sqlite_master WHERE type='index' AND tbl_name IS NOT NULL"
 	}
 	rows, err := db.QueryContext(ctx, query)
@@ -287,17 +365,25 @@ func loadAllExistingIndexes(ctx context.Context, db *sql.DB, dialect Dialect) (m
 }
 
 func buildDDL(tb *schema.TableBuilder, dialect Dialect) string {
-	if dialect == DialectMySQL {
+	switch dialect {
+	case DialectMySQL:
 		return tb.BuildMySQL()
+	case DialectPostgres:
+		return tb.BuildPostgres()
+	default:
+		return tb.BuildSQLite()
 	}
-	return tb.BuildSQLite()
 }
 
 func buildIndexes(tb *schema.TableBuilder, dialect Dialect) []schema.IndexDef {
-	if dialect == DialectMySQL {
+	switch dialect {
+	case DialectMySQL:
 		return tb.GetIndexesMySQL()
+	case DialectPostgres:
+		return tb.GetIndexesPostgres()
+	default:
+		return tb.GetIndexesSQLite()
 	}
-	return tb.GetIndexesSQLite()
 }
 
 func createIndex(ctx context.Context, db *sql.DB, idx schema.IndexDef, dialect Dialect) error {
@@ -315,127 +401,246 @@ func createIndex(ctx context.Context, db *sql.DB, idx schema.IndexDef, dialect D
 			return nil
 		}
 	}
+	if dialect == DialectPostgres {
+		errMsg := err.Error()
+		if strings.Contains(errMsg, "already exists") {
+			return nil
+		}
+	}
 
 	return fmt.Errorf("create index: %w", err)
 }
 
 func initDefaultSettings(ctx context.Context, db *sql.DB, dialect Dialect) error {
+	healthDefaults := model.DefaultHealthScoreConfig()
+	responsesWSMaxSessionsDescription := fmt.Sprintf(
+		"Responses WebSocket execution session limit (process-wide, 0 = use default %d)",
+		config.DefaultResponsesWebsocketMaxSessions,
+	)
+	responsesWSSessionTTLDescription := fmt.Sprintf(
+		"Responses WebSocket idle session retention (minutes, 0 = use default %d)",
+		config.DefaultResponsesWebsocketSessionTTLMinutes,
+	)
+	responsesWSMaxTranscriptBytesDescription := fmt.Sprintf(
+		"Responses WebSocket transcript payload budget (process-wide bytes, 0 = use default %d MiB)",
+		config.DefaultResponsesWebsocketMaxTranscriptBytes/(1024*1024),
+	)
+	responsesWSMaxConnectionsDescription := fmt.Sprintf(
+		"Responses WebSocket downstream connection limit (process-wide, 0 = use default %d)",
+		config.DefaultResponsesWebsocketMaxConnections,
+	)
+	responsesWSMaxConnectionsPerTokenDescription := fmt.Sprintf(
+		"Responses WebSocket downstream connection limit per API token (0 = use default %d)",
+		config.DefaultResponsesWebsocketMaxConnectionsPerToken,
+	)
 	settings := []struct {
 		key, value, valueType, desc, defaultVal string
 	}{
+		{config.CodexBaseURLSettingKey, "", "string", "Codex OAuth 完整 Responses URL(留空使用渠道URL；填写后覆盖渠道URL)", ""},
+		{config.XAIBaseURLSettingKey, "", "string", "xAI OAuth API根地址(通常以/v1结尾；留空使用渠道URL；填写后覆盖渠道URL)", ""},
+		{config.AntigravityURLSettingKey, "", "string", "Antigravity OAuth API根地址(留空使用渠道URL；填写后覆盖渠道URL)", ""},
+		{config.AnthropicBaseURLSettingKey, "", "string", "Anthropic OAuth API根地址(留空使用渠道URL；填写后覆盖渠道URL)", ""},
 		{"log_retention_days", "7", "int", "日志保留天数(-1永久保留,1-365天)", "7"},
 		{"max_key_retries", "3", "int", "单渠道最大Key重试次数", "3"},
-		{"upstream_first_byte_timeout", "0", "duration", "上游首个有效流内容超时(秒,0=禁用，仅流式)", "0"},
+		{"max_concurrency", "1000", "int", "最大并发请求数(限制同时处理的代理请求数量)", "1000"},
+		{"http_read_timeout_seconds", "0", "duration", "下游请求读取超时(秒,覆盖请求头+请求体的整段读取,0=使用内建默认值120秒)", "0"},
+		{"max_body_bytes", "10485760", "int", "请求体最大字节数(默认10MB)", "10485760"},
+		{"max_image_body_bytes", "20971520", "int", "Images API 请求体最大字节数(默认20MB)", "20971520"},
+		{"cooldown_auth_seconds", "300", "int", "认证错误(401/402/403)初始冷却时间(秒)", "300"},
+		{"cooldown_server_seconds", "120", "int", "服务器错误(5xx)初始冷却时间(秒)", "120"},
+		{"cooldown_timeout_seconds", "60", "int", "超时错误(597/598)初始冷却时间(秒)", "60"},
+		{"cooldown_rate_limit_seconds", "60", "int", "限流错误(429)初始冷却时间(秒)", "60"},
+		{"cooldown_max_seconds", "1800", "int", "指数退避冷却上限(秒,>=1且必须>=cooldown_min_seconds)", "1800"},
+		{"cooldown_min_seconds", "10", "int", "指数退避冷却下限(秒,>=1且必须<=cooldown_max_seconds)", "10"},
+		{config.CodexMap429To503SettingKey, "false", "bool", "所有上游候选均失败时，将返回给官方 Codex 客户端的最终 429 映射为 503，使其按 5xx 重试", "false"},
+		{"global_cooldown_detection_rules", "{}", "json", "未配置渠道专属规则时继承的全局冷却探测规则", "{}"},
+		{"antigravity_sensitive_words", config.DefaultAntigravitySensitiveWordsJSON, "json", "Antigravity systemInstruction 中使用零宽字符替换的敏感词 JSON 字符串数组", config.DefaultAntigravitySensitiveWordsJSON},
+		{"upstream_first_byte_timeout", "0", "duration", "流式请求首个有效内容超时(秒,0=禁用)", "0"},
+		{"upstream_connection_reuse_limit_seconds", "0", "duration", "上游连接最长复用时间(秒,0=不限制;达到时限后不接收新请求,在途请求完成后关闭)", "0"},
+		{"stream_timeout", "0", "duration", "流式请求总超时(秒,0=禁用)", "0"},
 		{"non_stream_timeout", "120", "duration", "非流式请求超时(秒,0=禁用)", "120"},
-		{"anthropic_first_byte_timeout", "0", "duration", "Anthropic首个有效流内容超时(秒,0=使用全局upstream_first_byte_timeout)", "0"},
+		{"anthropic_first_byte_timeout", "0", "duration", "Anthropic流式请求首个有效内容超时(秒,0=使用全局upstream_first_byte_timeout)", "0"},
 		{"anthropic_non_stream_timeout", "0", "duration", "Anthropic非流式请求超时(秒,0=使用全局non_stream_timeout)", "0"},
-		{"codex_first_byte_timeout", "0", "duration", "Codex首个有效流内容超时(秒,0=使用全局upstream_first_byte_timeout)", "0"},
+		{"codex_first_byte_timeout", "0", "duration", "Codex流式请求首个有效内容超时(秒,0=使用全局upstream_first_byte_timeout)", "0"},
 		{"codex_non_stream_timeout", "0", "duration", "Codex非流式请求超时(秒,0=使用全局non_stream_timeout)", "0"},
-		{"openai_first_byte_timeout", "0", "duration", "OpenAI首个有效流内容超时(秒,0=使用全局upstream_first_byte_timeout)", "0"},
+		{"openai_first_byte_timeout", "0", "duration", "OpenAI流式请求首个有效内容超时(秒,0=使用全局upstream_first_byte_timeout)", "0"},
 		{"openai_non_stream_timeout", "0", "duration", "OpenAI非流式请求超时(秒,0=使用全局non_stream_timeout)", "0"},
-		{"gemini_first_byte_timeout", "0", "duration", "Gemini首个有效流内容超时(秒,0=使用全局upstream_first_byte_timeout)", "0"},
+		{"gemini_first_byte_timeout", "0", "duration", "Gemini流式请求首个有效内容超时(秒,0=使用全局upstream_first_byte_timeout)", "0"},
 		{"gemini_non_stream_timeout", "0", "duration", "Gemini非流式请求超时(秒,0=使用全局non_stream_timeout)", "0"},
 		{"model_fuzzy_match", "false", "bool", "模型匹配失败时，使用子串模糊匹配(多匹配时选最新版本)", "false"},
-		{"channel_test_content", "sonnet 4.0的发布日期是什么", "string", "渠道测试默认内容", "sonnet 4.0的发布日期是什么"},
-		{"channel_check_interval_hours", "5", "float", "渠道定时检测间隔(小时,支持小数如0.5=30分钟,0=关闭,修改后重启生效)", "5"},
-		{"auto_update_interval_hours", "12", "int", "自动更新检测间隔(小时整数,0=关闭,启用时最低1小时)", "12"},
-		{"log_channel_click_action", "edit", "string", "日志页点击渠道名行为(edit=打开编辑器,navigate=跳转到渠道管理定位)", "edit"},
-		{"channel_stats_range", "today", "string", "渠道管理费用统计范围", "today"},
+		{"channel_test_content", config.DefaultChannelTestContent, "string", "渠道测试默认内容（不能为空）", config.DefaultChannelTestContent},
+		{"channel_check_interval_hours", strconv.FormatFloat(config.DefaultChannelCheckIntervalHours, 'f', -1, 64), "float", "渠道定时检测间隔(小时,支持小数如0.5=30分钟,0=关闭)", strconv.FormatFloat(config.DefaultChannelCheckIntervalHours, 'f', -1, 64)},
+		{"model_catalog_sync_interval_hours", "6", "float", "从 models.dev 同步官方模型定价目录的间隔（小时，支持小数）；0 仅关闭网络同步，继续使用最近缓存或内置定价；不影响渠道模型列表", "6"},
+		{"auto_update_interval_hours", "12", "int", "非容器部署的版本检查间隔（整数小时；0=关闭检查；启用时最低1小时）", "12"},
+		{"auto_update_channel", "stable", "string", "非容器部署的版本检查和自动更新渠道（stable=稳定版，preview=稳定版和测试版）", "stable"},
+		{"log_channel_click_action", "edit", "string", "日志页点击渠道名后的操作", "edit"},
+		{"channel_stats_range", "today", "string", "渠道管理页费用统计时间范围（today/yesterday/day_before_yesterday/this_week/last_week/this_month/last_month）", "today"},
 		// 健康度排序配置
 		{"enable_health_score", "false", "bool", "启用基于健康度的渠道动态排序", "false"},
-		{"success_rate_penalty_weight", "100", "int", "成功率惩罚权重(乘以失败率)", "100"},
-		{"health_score_window_minutes", "30", "int", "成功率统计时间窗口(分钟)", "30"},
-		{"health_score_update_interval", "30", "int", "成功率缓存更新间隔(秒)", "30"},
-		{"health_min_confident_sample", "20", "int", "置信样本量阈值(样本量达到此值时惩罚全额生效)", "20"},
+		{"success_rate_penalty_weight", strconv.Itoa(healthDefaults.SuccessRatePenaltyWeight), "int", "成功率惩罚权重(乘以失败率,>=0)", strconv.Itoa(healthDefaults.SuccessRatePenaltyWeight)},
+		{"health_score_window_minutes", strconv.Itoa(healthDefaults.WindowMinutes), "int", "成功率统计时间窗口(分钟,>=1)", strconv.Itoa(healthDefaults.WindowMinutes)},
+		{"health_score_update_interval", strconv.Itoa(healthDefaults.UpdateIntervalSeconds), "int", "成功率缓存更新间隔(秒,>=1)", strconv.Itoa(healthDefaults.UpdateIntervalSeconds)},
+		{"health_min_confident_sample", strconv.Itoa(healthDefaults.MinConfidentSample), "int", "置信样本量阈值(>=1;样本量达到此值时惩罚全额生效)", strconv.Itoa(healthDefaults.MinConfidentSample)},
+		{"enable_ttfb_score", "false", "bool", "启用渠道首字相对延迟惩罚(需同时开启「启用健康度排序」)", "false"},
+		{"ttfb_penalty_weight", strconv.FormatFloat(healthDefaults.TTFBPenaltyWeight, 'f', -1, 64), "float", "首字惩罚权重(>=0;相对中位慢1倍时全置信惩罚值)", strconv.FormatFloat(healthDefaults.TTFBPenaltyWeight, 'f', -1, 64)},
+		{"ttfb_max_slow_ratio", strconv.FormatFloat(healthDefaults.TTFBMaxSlowRatio, 'f', -1, 64), "float", "首字相对慢速比(s-1)上限(>=0)", strconv.FormatFloat(healthDefaults.TTFBMaxSlowRatio, 'f', -1, 64)},
+		{"ttfb_min_confident_sample", strconv.Itoa(healthDefaults.TTFBMinConfidentSample), "int", "首字置信样本量阈值(>=1)", strconv.Itoa(healthDefaults.TTFBMinConfidentSample)},
 		// 冷却兜底配置
 		{"cooldown_fallback_enabled", "true", "bool", "所有渠道冷却时选最优渠道兜底(关闭则直接拒绝请求)", "true"},
 		// Debug日志配置
 		{"debug_log_enabled", "false", "bool", "启用Debug日志(记录上游请求/响应原始数据)", "false"},
-		{"debug_log_retention_minutes", "2", "int", "Debug日志保留时长(分钟,1-1440)", "2"},
+		{"debug_log_retention_minutes", strconv.Itoa(config.DefaultDebugLogRetentionMinutes), "int", "Debug日志保留时长(分钟,1-1440)", strconv.Itoa(config.DefaultDebugLogRetentionMinutes)},
 		// 前端自动刷新
-		{"auto_refresh_interval_seconds", "0", "int", "页面自动刷新间隔(秒,0=禁用,建议≥30;有对话框打开时跳过本次刷新)", "0"},
+		{"auto_refresh_interval_seconds", "0", "int", "页面自动刷新间隔(秒,>=0;0=禁用,建议≥30;有对话框打开时跳过本次刷新)", "0"},
+		{config.ActiveRequestTitleEnabledSettingKey, "false", "bool", "有请求处理时在浏览器标题栏显示请求数量并闪烁", "false"},
+		// Responses WebSocket
+		{"responses_ws_max_sessions", "0", "int", responsesWSMaxSessionsDescription, "0"},
+		{"responses_ws_session_ttl_minutes", "0", "int", responsesWSSessionTTLDescription, "0"},
+		{"responses_ws_max_transcript_bytes", "0", "int", responsesWSMaxTranscriptBytesDescription, "0"},
+		{"responses_ws_max_connections", "0", "int", responsesWSMaxConnectionsDescription, "0"},
+		{"responses_ws_max_connections_per_token", "0", "int", responsesWSMaxConnectionsPerTokenDescription, "0"},
 	}
 
 	var query string
-	if dialect == DialectMySQL {
+	switch dialect {
+	case DialectMySQL:
 		query = "INSERT IGNORE INTO system_settings (`key`, value, value_type, description, default_value, updated_at) VALUES (?, ?, ?, ?, ?, UNIX_TIMESTAMP())"
-	} else {
+	case DialectPostgres:
+		query = `INSERT INTO system_settings ("key", value, value_type, description, default_value, updated_at) VALUES (?, ?, ?, ?, ?, EXTRACT(EPOCH FROM NOW())::BIGINT) ON CONFLICT ("key") DO NOTHING`
+	default:
 		query = "INSERT OR IGNORE INTO system_settings (key, value, value_type, description, default_value, updated_at) VALUES (?, ?, ?, ?, ?, unixepoch())"
 	}
 
 	for _, s := range settings {
-		if _, err := db.ExecContext(ctx, query, s.key, s.value, s.valueType, s.desc, s.defaultVal); err != nil {
+		if _, err := db.ExecContext(ctx, rebindIfPostgres(dialect, query), s.key, s.value, s.valueType, s.desc, s.defaultVal); err != nil {
 			return fmt.Errorf("insert default setting %s: %w", s.key, err)
+		}
+	}
+
+	// 默认词表在 CLIProxyAPI 示例的 ["API","proxy"] 基础上加入 Claude/Anthropic。
+	// 仅迁移仍保持旧默认值的记录；其他值视为用户配置，不覆盖。
+	{
+		keyCol := quoteKeyIdent(dialect)
+		//nolint:gosec // G201: keyCol 仅为 "key" 或 "`key`"，由内部逻辑控制
+		valueSQL := fmt.Sprintf("UPDATE system_settings SET value = ? WHERE %s = ? AND value = default_value AND default_value IN (?, ?)", keyCol)
+		if _, err := db.ExecContext(ctx, rebindIfPostgres(dialect, valueSQL),
+			config.DefaultAntigravitySensitiveWordsJSON,
+			"antigravity_sensitive_words",
+			"[]",
+			previousAntigravitySensitiveWords,
+		); err != nil {
+			return fmt.Errorf("migrate setting value antigravity_sensitive_words: %w", err)
+		}
+		//nolint:gosec // G201: keyCol 仅为 "key" 或 "`key`"，由内部逻辑控制
+		metaSQL := fmt.Sprintf("UPDATE system_settings SET default_value = ?, value_type = ? WHERE %s = ?", keyCol)
+		if _, err := db.ExecContext(ctx, rebindIfPostgres(dialect, metaSQL), config.DefaultAntigravitySensitiveWordsJSON, "json", "antigravity_sensitive_words"); err != nil {
+			return fmt.Errorf("refresh setting metadata antigravity_sensitive_words: %w", err)
 		}
 	}
 
 	// 刷新部分配置项的元信息（description/default/value_type），避免"代码语义已变但DB描述仍旧"。
 	{
-		keyCol := "key"
-		if dialect == DialectMySQL {
-			keyCol = "`key`"
+		keyCol := quoteKeyIdent(dialect)
+		descriptionRefreshKeys := map[string]bool{
+			"antigravity_sensitive_words":            true,
+			"channel_test_content":                   true,
+			"channel_check_interval_hours":           true,
+			"channel_stats_range":                    true,
+			"success_rate_penalty_weight":            true,
+			"health_score_window_minutes":            true,
+			"health_score_update_interval":           true,
+			"health_min_confident_sample":            true,
+			"ttfb_penalty_weight":                    true,
+			"ttfb_max_slow_ratio":                    true,
+			"ttfb_min_confident_sample":              true,
+			"cooldown_min_seconds":                   true,
+			"cooldown_max_seconds":                   true,
+			"debug_log_retention_minutes":            true,
+			"auto_refresh_interval_seconds":          true,
+			"responses_ws_max_sessions":              true,
+			"responses_ws_session_ttl_minutes":       true,
+			"responses_ws_max_transcript_bytes":      true,
+			"responses_ws_max_connections":           true,
+			"responses_ws_max_connections_per_token": true,
 		}
 		//nolint:gosec // G201: keyCol 仅为 "key" 或 "`key`"，由内部逻辑控制
+		descriptionSQL := fmt.Sprintf("UPDATE system_settings SET description = ?, value_type = ? WHERE %s = ?", keyCol)
+		for _, setting := range settings {
+			if !descriptionRefreshKeys[setting.key] {
+				continue
+			}
+			if _, err := db.ExecContext(ctx, rebindIfPostgres(dialect, descriptionSQL), setting.desc, setting.valueType, setting.key); err != nil {
+				return fmt.Errorf("refresh setting description %s: %w", setting.key, err)
+			}
+		}
+
+		websocketResetDefaultSQL := fmt.Sprintf("UPDATE system_settings SET default_value = '0' WHERE %s = ?", keyCol)
+		for _, key := range []string{
+			"responses_ws_max_sessions",
+			"responses_ws_session_ttl_minutes",
+			"responses_ws_max_transcript_bytes",
+			"responses_ws_max_connections",
+			"responses_ws_max_connections_per_token",
+		} {
+			if _, err := db.ExecContext(ctx, rebindIfPostgres(dialect, websocketResetDefaultSQL), key); err != nil {
+				return fmt.Errorf("refresh setting reset default %s: %w", key, err)
+			}
+		}
+
+		//nolint:gosec // G201: keyCol 仅为 "key" 或 "`key`"，由内部逻辑控制
 		metaSQL := fmt.Sprintf("UPDATE system_settings SET description = ?, default_value = ?, value_type = ? WHERE %s = ?", keyCol)
-		if _, err := db.ExecContext(ctx, metaSQL,
-			"上游首个有效流内容超时(秒,0=禁用，仅流式)",
+		if _, err := db.ExecContext(ctx, rebindIfPostgres(dialect, metaSQL),
+			"流式请求首个有效内容超时(秒,0=禁用)",
 			"0",
 			"duration",
 			"upstream_first_byte_timeout",
 		); err != nil {
 			return fmt.Errorf("refresh setting metadata upstream_first_byte_timeout: %w", err)
 		}
-		if _, err := db.ExecContext(ctx, metaSQL,
+		if _, err := db.ExecContext(ctx, rebindIfPostgres(dialect, metaSQL),
 			"Debug日志保留时长(分钟,1-1440)",
-			"2",
+			strconv.Itoa(config.DefaultDebugLogRetentionMinutes),
 			"int",
 			"debug_log_retention_minutes",
 		); err != nil {
 			return fmt.Errorf("refresh setting metadata debug_log_retention_minutes: %w", err)
 		}
-		if _, err := db.ExecContext(ctx, metaSQL,
-			"自动更新检测间隔(小时整数,0=关闭,启用时最低1小时)",
+		if _, err := db.ExecContext(ctx, rebindIfPostgres(dialect, metaSQL),
+			"非容器部署的版本检查间隔（整数小时；0=关闭检查；启用时最低1小时）",
 			"12",
 			"int",
 			"auto_update_interval_hours",
 		); err != nil {
 			return fmt.Errorf("refresh setting metadata auto_update_interval_hours: %w", err)
 		}
+		if _, err := db.ExecContext(ctx, rebindIfPostgres(dialect, metaSQL),
+			"非容器部署的版本检查和自动更新渠道（stable=稳定版，preview=稳定版和测试版）",
+			"stable",
+			"string",
+			"auto_update_channel",
+		); err != nil {
+			return fmt.Errorf("refresh setting metadata auto_update_channel: %w", err)
+		}
 	}
 
 	// 迁移 success_rate_penalty_weight 类型：float → int（2026-01 类型修正）
 	{
-		keyCol := "key"
-		if dialect == DialectMySQL {
-			keyCol = "`key`"
-		}
+		keyCol := quoteKeyIdent(dialect)
 		//nolint:gosec // G201: keyCol 仅为 "key" 或 "`key`"，由内部逻辑控制
 		typeSQL := fmt.Sprintf("UPDATE system_settings SET value_type = 'int' WHERE %s = 'success_rate_penalty_weight' AND value_type = 'float'", keyCol)
-		if _, err := db.ExecContext(ctx, typeSQL); err != nil {
+		if _, err := db.ExecContext(ctx, rebindIfPostgres(dialect, typeSQL)); err != nil {
 			return fmt.Errorf("migrate success_rate_penalty_weight type: %w", err)
 		}
 	}
 
-	// 清理已废弃的配置项
-
 	// 迁移 channel_check_interval_hours 类型：int → float（支持分钟级小数间隔）
 	{
-		keyCol := "key"
-		if dialect == DialectMySQL {
-			keyCol = "`key`"
-		}
+		keyCol := quoteKeyIdent(dialect)
 		//nolint:gosec // G201: keyCol 仅为 "key" 或 "`key`"，由内部逻辑控制
-		typeSQL := fmt.Sprintf("UPDATE system_settings SET value_type = 'float', description = '渠道定时检测间隔(小时,支持小数如0.5=30分钟,0=关闭,修改后重启生效)', default_value = '5' WHERE %s = 'channel_check_interval_hours' AND value_type = 'int'", keyCol)
-		if _, err := db.ExecContext(ctx, typeSQL); err != nil {
+		typeSQL := fmt.Sprintf("UPDATE system_settings SET value_type = 'float', description = '渠道定时检测间隔(小时,支持小数如0.5=30分钟,0=关闭)', default_value = '5' WHERE %s = 'channel_check_interval_hours' AND value_type = 'int'", keyCol)
+		if _, err := db.ExecContext(ctx, rebindIfPostgres(dialect, typeSQL)); err != nil {
 			return fmt.Errorf("migrate channel_check_interval_hours type: %w", err)
 		}
-	}
-
-	obsoleteKeys := []string{
-		"88code_free_only", // 2026-01移除：88code免费订阅限制功能已删除
-	}
-	for _, key := range obsoleteKeys {
-		_ = deleteSystemSetting(ctx, db, dialect, key)
 	}
 
 	// 迁移旧 migration marker 从 system_settings 到 schema_migrations
@@ -454,14 +659,11 @@ func initDefaultSettings(ctx context.Context, db *sql.DB, dialect Dialect) error
 		const oldKey = "cooldown_fallback_threshold"
 		const newKey = "cooldown_fallback_enabled"
 
-		keyCol := "key"
-		if dialect == DialectMySQL {
-			keyCol = "`key`"
-		}
+		keyCol := quoteKeyIdent(dialect)
 
 		//nolint:gosec // G201: keyCol 仅为 "key" 或 "`key`"，由内部逻辑控制
 		valueMigrateSQL := fmt.Sprintf(`UPDATE system_settings SET value = CASE WHEN value = '0' THEN 'false' ELSE 'true' END WHERE %s = ? AND value_type = 'int'`, keyCol)
-		if _, err := db.ExecContext(ctx, valueMigrateSQL, oldKey); err != nil {
+		if _, err := db.ExecContext(ctx, rebindIfPostgres(dialect, valueMigrateSQL), oldKey); err != nil {
 			return fmt.Errorf("migrate setting value %s: %w", oldKey, err)
 		}
 
@@ -472,7 +674,7 @@ func initDefaultSettings(ctx context.Context, db *sql.DB, dialect Dialect) error
 		} else {
 			//nolint:gosec // G201: keyCol 仅为 "key" 或 "`key`"，由内部逻辑控制
 			renameSQL := fmt.Sprintf("UPDATE system_settings SET %s = ?, description = ?, default_value = ?, value_type = ? WHERE %s = ?", keyCol, keyCol)
-			if _, err := db.ExecContext(ctx, renameSQL, newKey, "所有渠道冷却时选最优渠道兜底(关闭则直接拒绝请求)", "true", "bool", oldKey); err != nil {
+			if _, err := db.ExecContext(ctx, rebindIfPostgres(dialect, renameSQL), newKey, "所有渠道冷却时选最优渠道兜底(关闭则直接拒绝请求)", "true", "bool", oldKey); err != nil {
 				return fmt.Errorf("rename setting %s to %s: %w", oldKey, newKey, err)
 			}
 		}
@@ -481,40 +683,29 @@ func initDefaultSettings(ctx context.Context, db *sql.DB, dialect Dialect) error
 	return nil
 }
 
-// isMigrationApplied 检查迁移是否已执行
-func isMigrationApplied(ctx context.Context, db *sql.DB, version string) (bool, error) {
+// hasMigration 检查迁移是否已执行；查询失败时按未执行处理。
+func hasMigration(ctx context.Context, db *sql.DB, version string, dialect Dialect) bool {
 	var count int
 	err := db.QueryRowContext(ctx,
-		"SELECT COUNT(*) FROM schema_migrations WHERE version = ?", version,
+		rebindIfPostgres(dialect, "SELECT COUNT(*) FROM schema_migrations WHERE version = ?"), version,
 	).Scan(&count)
 	if err != nil {
 		// 表不存在时视为未执行
-		return false, nil
+		return false
 	}
-	return count > 0, nil
-}
-
-// hasMigration 检查迁移是否已执行（简化版，忽略错误）
-func hasMigration(ctx context.Context, db *sql.DB, version string) bool {
-	applied, _ := isMigrationApplied(ctx, db, version)
-	return applied
+	return count > 0
 }
 
 // recordMigration 记录迁移已执行
 func recordMigration(ctx context.Context, db *sql.DB, version string, dialect Dialect) error {
-	var insertSQL string
-	if dialect == DialectMySQL {
-		insertSQL = `INSERT IGNORE INTO schema_migrations (version, applied_at) VALUES (?, UNIX_TIMESTAMP())`
-	} else {
-		insertSQL = `INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?, unixepoch())`
-	}
-	_, err := db.ExecContext(ctx, insertSQL, version)
+	insertSQL := insertIgnoreSchemaMigrationSQL(dialect)
+	_, err := db.ExecContext(ctx, rebindIfPostgres(dialect, insertSQL), version)
 	return err
 }
 
-func migrationAppliedAt(ctx context.Context, db *sql.DB, version string) (int64, bool, error) {
+func migrationAppliedAt(ctx context.Context, db *sql.DB, version string, dialect Dialect) (int64, bool, error) {
 	var appliedAt int64
-	err := db.QueryRowContext(ctx, `SELECT applied_at FROM schema_migrations WHERE version = ?`, version).Scan(&appliedAt)
+	err := db.QueryRowContext(ctx, rebindIfPostgres(dialect, `SELECT applied_at FROM schema_migrations WHERE version = ?`), version).Scan(&appliedAt)
 	if err == nil {
 		return appliedAt, true, nil
 	}
@@ -525,13 +716,8 @@ func migrationAppliedAt(ctx context.Context, db *sql.DB, version string) (int64,
 }
 
 func recordMigrationTx(ctx context.Context, tx *sql.Tx, version string, dialect Dialect) error {
-	var insertSQL string
-	if dialect == DialectMySQL {
-		insertSQL = `INSERT IGNORE INTO schema_migrations (version, applied_at) VALUES (?, UNIX_TIMESTAMP())`
-	} else {
-		insertSQL = `INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?, unixepoch())`
-	}
-	_, err := tx.ExecContext(ctx, insertSQL, version)
+	insertSQL := insertIgnoreSchemaMigrationSQL(dialect)
+	_, err := tx.ExecContext(ctx, rebindIfPostgres(dialect, insertSQL), version)
 	return err
 }
 

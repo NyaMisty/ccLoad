@@ -19,6 +19,10 @@ var authHeaderBlacklist = map[string]struct{}{
 }
 
 // applyHeaderRules 按配置顺序改写请求头；认证头受黑名单保护，规则被静默忽略并记录警告。
+//
+// 每条规则先把头名对齐到请求里已存在的同名键：Claude Code CLI 与 ZCode 指纹路径按
+// 线上原样大小写写头（如 "anthropic-beta"），而 http.Header 的 Set/Add/Del 只认
+// canonical 键，直接调用会让同一个头以两种大小写并存并一起发给上游。
 func applyHeaderRules(h http.Header, rules []model.CustomHeaderRule) {
 	if h == nil || len(rules) == 0 {
 		return
@@ -33,16 +37,28 @@ func applyHeaderRules(h http.Header, rules []model.CustomHeaderRule) {
 				"rule_index", idx, "action", rule.Action, "header", name)
 			continue
 		}
+		key, exists := existingHeaderKey(h, name)
 		switch rule.Action {
 		case model.RuleActionRemove:
+			if !exists {
+				continue
+			}
 			if target := strings.TrimSpace(rule.Value); target != "" {
-				removeHeaderToken(h, name, target)
+				removeHeaderToken(h, key, target)
 			} else {
-				h.Del(name)
+				delete(h, key)
 			}
 		case model.RuleActionOverride:
+			if exists {
+				h[key] = []string{rule.Value}
+				continue
+			}
 			h.Set(name, rule.Value)
 		case model.RuleActionAppend:
+			if exists {
+				h[key] = append(h[key], rule.Value)
+				continue
+			}
 			h.Add(name, rule.Value)
 		default:
 			slog.Warn("custom_request_rules: unknown header action",
@@ -51,11 +67,26 @@ func applyHeaderRules(h http.Header, rules []model.CustomHeaderRule) {
 	}
 }
 
+// existingHeaderKey 返回请求头里与 name 大小写无关相等的真实键，供规则就地改写，
+// 避免 canonical 化产生第二个同名头。
+func existingHeaderKey(h http.Header, name string) (string, bool) {
+	if _, ok := h[name]; ok {
+		return name, true
+	}
+	for existing := range h {
+		if strings.EqualFold(existing, name) {
+			return existing, true
+		}
+	}
+	return name, false
+}
+
 // removeHeaderToken 按逗号 token 精确移除。每条值按 "," 切分、trim 后等值剔除；
 // 若某条值所有 token 全部移除则该条值被丢弃；全部为空时整个头被删除。
 // 典型用例：从 Anthropic-Beta CSV 头中移除单个 flag，而保留其他 flag。
-func removeHeaderToken(h http.Header, name, target string) {
-	values := h.Values(name)
+// key 必须是 h 中真实存在的键（见 existingHeaderKey），内部只做 map 操作。
+func removeHeaderToken(h http.Header, key, target string) {
+	values := h[key]
 	if len(values) == 0 {
 		return
 	}
@@ -74,10 +105,11 @@ func removeHeaderToken(h http.Header, name, target string) {
 			newValues = append(newValues, strings.Join(kept, ", "))
 		}
 	}
-	h.Del(name)
-	for _, v := range newValues {
-		h.Add(name, v)
+	if len(newValues) == 0 {
+		delete(h, key)
+		return
 	}
+	h[key] = newValues
 }
 
 // applyBodyRules 尝试对 JSON body 按规则改写；非 JSON body（空/类型不匹配/解析失败）原样返回。
@@ -147,6 +179,32 @@ func applyBodyRules(contentType string, body []byte, rules []model.CustomBodyRul
 		return body
 	}
 	return marshaled
+}
+
+// resolveModelAfterBodyRules 返回顶层 body.model 规则生效后的模型身份。
+// 非字符串 model 没有可持久化的模型键，返回空字符串让错误响应中的 model 兜底。
+func resolveModelAfterBodyRules(modelName string, rules []model.CustomBodyRule) string {
+	resolved := strings.TrimSpace(modelName)
+	for _, rule := range rules {
+		segs := splitJSONPath(rule.Path)
+		if len(segs) != 1 || segs[0] != "model" {
+			continue
+		}
+		switch rule.Action {
+		case model.RuleActionRemove:
+			resolved = ""
+		case model.RuleActionOverride:
+			var value string
+			if err := sonic.Unmarshal(rule.Value, &value); err != nil {
+				if sonic.Valid(rule.Value) {
+					resolved = ""
+				}
+				continue
+			}
+			resolved = strings.TrimSpace(value)
+		}
+	}
+	return resolved
 }
 
 // isJSONContentType 判断 Content-Type 是否为 JSON 家族。

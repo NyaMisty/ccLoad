@@ -39,16 +39,16 @@ type sseUsageParser struct {
 	usageAccumulator
 
 	// 内部状态（增量解析）
-	buffer      bytes.Buffer // 未完成的数据缓冲区
-	bufferSize  int          // 当前缓冲区大小
-	eventType   string       // 当前正在解析的事件类型（跨Feed保存）
-	dataLines   []string     // 当前事件的data行（跨Feed保存）
-	oversized   bool         // 当前事件超出大小限制，丢弃到事件边界后恢复解析
-	channelType string       // 渠道类型(anthropic/openai/codex/gemini),用于精确平台判断
-	discardTail string       // 丢弃超大事件时保留少量尾部，用于识别跨chunk的空行边界
-	scanner     jsonUsageParser
-	scanVersion int
-	sanitizer   sseLargeFieldSanitizer
+	buffer           bytes.Buffer // 未完成的数据缓冲区
+	bufferSize       int          // 当前缓冲区大小
+	eventType        string       // 当前正在解析的事件类型（跨Feed保存）
+	dataLines        []string     // 当前事件的data行（跨Feed保存）
+	oversized        bool         // 当前事件超出大小限制，丢弃到事件边界后恢复解析
+	upstreamProtocol string       // 实际上游协议，用于精确平台判断。
+	discardTail      string       // 丢弃超大事件时保留少量尾部，用于识别跨chunk的空行边界
+	scanner          jsonUsageParser
+	scanVersion      int
+	sanitizer        sseLargeFieldSanitizer
 
 	// [INFO] 新增：存储SSE流中检测到的error事件（用于1308等错误的延迟处理）
 	lastError []byte // 最后一个error事件的完整JSON（data字段内容）
@@ -61,14 +61,20 @@ type sseUsageParser struct {
 	// hasStreamOutput 表示已经看到应转发给客户端的非心跳流事件。
 	// ping 只是上游保活，不能让 200 空流被误判为成功。
 	hasStreamOutput bool
+	// hasResponsesMetadata 表示已经看到 Responses 元数据事件。
+	// 这算上游已返回数据（首字），但不构成语义输出，不阻断故障切换。
+	hasResponsesMetadata bool
+
+	responsesTurnResult responsesWebsocketTurnResult
+	hasResponsesTurn    bool
 }
 
 type jsonUsageParser struct {
 	usageAccumulator
-	buffer      bytes.Buffer
-	truncated   bool
-	channelType string // 渠道类型(anthropic/openai/codex/gemini),用于精确平台判断
-	hasBody     bool
+	buffer           bytes.Buffer
+	truncated        bool
+	upstreamProtocol string // 实际上游协议，用于精确平台判断。
+	hasBody          bool
 
 	scanInString       bool
 	scanEscape         bool
@@ -106,9 +112,11 @@ type usageParser interface {
 	GetToolCostUSD() float64                                       // 返回 Responses 工具调用的额外费用
 	GetThinkingEffort() string
 	GetReasoningTokens() int
-	GetLastError() []byte   // [INFO] 返回SSE流中检测到的最后一个error事件（用于1308等错误的延迟处理）
-	IsStreamComplete() bool // [INFO] 返回是否检测到流结束标志（[DONE]/message_stop）
-	HasStreamOutput() bool  // 返回是否已经看到非心跳的可见响应内容
+	GetLastError() []byte       // [INFO] 返回SSE流中检测到的最后一个error事件（用于1308等错误的延迟处理）
+	IsStreamComplete() bool     // [INFO] 返回是否检测到流结束标志（[DONE]/message_stop）
+	HasStreamOutput() bool      // 语义输出，提交给客户端后不可再内部切渠道
+	HasResponsesMetadata() bool // Responses 元数据（created 等），算上游已返回数据，但不提交
+	GetResponsesTurnResult() (responsesWebsocketTurnResult, bool)
 }
 
 // GetCacheBreakdown 由 sseUsageParser/jsonUsageParser 通过嵌入共享。
@@ -140,19 +148,19 @@ const (
 )
 
 // newSSEUsageParser 创建SSE usage解析器
-// channelType: 渠道类型(anthropic/openai/codex/gemini),用于精确识别平台usage格式
-func newSSEUsageParser(channelType string) *sseUsageParser {
+// upstreamProtocol 用于精确识别平台 usage 格式。
+func newSSEUsageParser(upstreamProtocol string) *sseUsageParser {
 	p := &sseUsageParser{
-		channelType: channelType,
+		upstreamProtocol: upstreamProtocol,
 	}
-	p.scanner.channelType = channelType
+	p.scanner.upstreamProtocol = upstreamProtocol
 	return p
 }
 
 // newJSONUsageParser 创建JSON响应的usage解析器
-// channelType: 渠道类型(anthropic/openai/codex/gemini),用于精确识别平台usage格式
-func newJSONUsageParser(channelType string) *jsonUsageParser {
-	return &jsonUsageParser{channelType: channelType}
+// upstreamProtocol 用于精确识别平台 usage 格式。
+func newJSONUsageParser(upstreamProtocol string) *jsonUsageParser {
+	return &jsonUsageParser{upstreamProtocol: upstreamProtocol}
 }
 
 // Feed 喂入数据进行解析（供streamCopySSE调用）
@@ -430,19 +438,8 @@ func (p *sseUsageParser) parseBuffer() error {
 
 		if after, ok := strings.CutPrefix(line, "event:"); ok {
 			p.eventType = strings.TrimSpace(after)
-			// [INFO] 流结束标志检测（按事件类型）
-			// - Anthropic: event: message_stop
-			// - OpenAI Responses API: event: response.completed
-			if p.eventType == "message_stop" || p.eventType == "response.completed" {
-				p.streamComplete = true
-			}
 		} else if after0, ok0 := strings.CutPrefix(line, "data:"); ok0 {
 			dataLine := strings.TrimSpace(after0)
-			// [INFO] OpenAI 流结束标志: data: [DONE]
-			if dataLine == "[DONE]" {
-				p.streamComplete = true
-				continue // [DONE]不是JSON，跳过追加
-			}
 			p.dataLines = append(p.dataLines, dataLine)
 		} else if line == "" && len(p.dataLines) > 0 {
 			// 事件结束，解析数据
@@ -472,19 +469,46 @@ func (p *sseUsageParser) parseEvent(eventType, data string) error {
 	// 问题：anyrouter等聚合服务使用非标准事件类型（如"."），导致usage丢失
 	// 方案：改为黑名单模式 - 只过滤已知无用事件，其他都尝试解析
 
-	// 特殊处理：error事件（记录日志 + 存储错误体用于后续冷却处理）
-	// 兼容不带 event: error 行的不规范上游（如 sub2api），与 isHeartbeatEvent 的 JSON 回退对称。
-	if eventType == "error" || isErrorPayload(data) {
+	if data == "[DONE]" {
+		p.streamComplete = true
+		return nil
+	}
+	if isHeartbeatEvent(eventType, data) {
+		return nil
+	}
+
+	// 先解析 usage。失败终态也可能包含已经消耗的 token，计费不能因为
+	// response.failed 提前返回而静默归零。
+	var event map[string]any
+	if err := json.Unmarshal([]byte(data), &event); err != nil {
+		return fmt.Errorf("json unmarshal failed: %w", err)
+	}
+	if usage := extractUsage(event); usage != nil {
+		p.applyUsage(usage, p.upstreamProtocol)
+	}
+	p.applyToolUsageFromPayload(event)
+
+	// 特殊处理：error 事件（记录日志 + 存储错误体用于后续冷却处理）
+	// - Anthropic/聚合站：event: error 或 data 顶层 type=error / error 对象
+	// - OpenAI Responses：event/type=response.failed，error 嵌在 response.error
+	// 兼容不带 event 行的不规范上游（如 sub2api），与 isHeartbeatEvent 的 JSON 回退对称。
+	if eventType == "error" || eventType == "response.failed" || isErrorPayload(data) {
 		log.Printf("[WARN]  [SSE错误事件] 上游返回error内容(eventType=%q): %s", eventType, data)
 		p.lastError = []byte(data)
 		return nil // 不解析usage，避免误判
 	}
 
-	if isHeartbeatEvent(eventType, data) {
-		return nil
-	}
+	payloadType, _ := event["type"].(string)
 
-	p.hasStreamOutput = true
+	// Responses 元数据事件不构成语义输出：客户端可以在这些事件后重新开始回合，
+	// 与原生 WS 路径的 isCodexWebsocketSemanticEvent 判定对齐。event: 行与
+	// JSON type 都要认，和 isSuccessfulResponsesTerminal 一样。只有真正的内容
+	// 事件才标记为有流输出，以便 deferredWriter 在 error 到来前不会过早 commit。
+	if isResponsesMetadataEvent(payloadType) || isResponsesMetadataEvent(eventType) {
+		p.hasResponsesMetadata = true
+	} else {
+		p.hasStreamOutput = true
+	}
 
 	// 已知无用事件（不包含usage）
 	ignoredEvents := []string{
@@ -495,11 +519,24 @@ func (p *sseUsageParser) parseEvent(eventType, data string) error {
 	if eventType != "" && slices.Contains(ignoredEvents, eventType) {
 		return nil // 跳过已知无用事件
 	}
-
-	// 解析JSON数据
-	var event map[string]any
-	if err := json.Unmarshal([]byte(data), &event); err != nil {
-		return fmt.Errorf("json unmarshal failed: %w", err)
+	isAnthropicTerminal := payloadType == "message_stop" || (payloadType == "" && eventType == "message_stop")
+	if isAnthropicTerminal || isSuccessfulResponsesTerminal(eventType) || isSuccessfulResponsesTerminal(payloadType) {
+		p.streamComplete = true
+	}
+	if isSuccessfulResponsesTerminal(payloadType) {
+		if response, ok := event["response"].(map[string]any); ok {
+			output, _ := json.Marshal(response["output"])
+			if len(output) == 0 || string(output) == "null" {
+				output = []byte("[]")
+			}
+			responseID, _ := response["id"].(string)
+			p.responsesTurnResult = responsesWebsocketTurnResult{
+				completedOutput:     output,
+				completedResponseID: strings.TrimSpace(responseID),
+				pendingToolCallIDs:  responsesWebsocketPendingToolCallIDs(output),
+			}
+			p.hasResponsesTurn = true
+		}
 	}
 
 	// 提取 service_tier（OpenAI Chat/Responses API 顶层字段）
@@ -517,7 +554,6 @@ func (p *sseUsageParser) parseEvent(eventType, data string) error {
 	usage := extractUsage(event)
 
 	if usage == nil {
-		p.applyToolUsageFromPayload(event)
 		return nil
 	}
 
@@ -526,32 +562,37 @@ func (p *sseUsageParser) parseEvent(eventType, data string) error {
 		p.ServiceTier = "fast"
 	}
 
-	p.applyUsage(usage, p.channelType)
-	p.applyToolUsageFromPayload(event)
-
 	return nil
 }
 
 // GetUsage 获取累积的usage统计
 // 重要: 返回的inputTokens已归一化为"可计费输入token"
-// - OpenAI/Codex: prompt_tokens包含cached_tokens，已自动扣除避免双计
+// - OpenAI/Codex: input/prompt_tokens 包含 cached_tokens 与 cache_write_tokens，已自动扣除避免双计
 // - Gemini: promptTokenCount包含cachedContentTokenCount，已自动扣除
 // - Claude: input_tokens本身就是非缓存部分，无需处理
 func (p *sseUsageParser) GetUsage() (inputTokens, outputTokens, cacheRead, cacheCreation int) {
-	return p.normalizedUsage(p.channelType)
+	return p.normalizedUsage(p.upstreamProtocol)
 }
 
-func (u *usageAccumulator) normalizedUsage(channelType string) (inputTokens, outputTokens, cacheRead, cacheCreation int) {
+func (u *usageAccumulator) normalizedUsage(upstreamProtocol string) (inputTokens, outputTokens, cacheRead, cacheCreation int) {
 	billableInput := u.InputTokens
 
-	// OpenAI/Codex/Gemini语义归一化: prompt_tokens包含cached_tokens，需扣除
+	// OpenAI/Codex/Gemini语义归一化: prompt_tokens/input_tokens 包含缓存分项，需扣除避免双计
+	// - cached_tokens / cache_read → CacheReadInputTokens
+	// - cache_write_tokens / cache_creation → CacheCreationInputTokens（仅 openai/codex 计入 input）
 	// 设计原则: 平台差异在解析层处理，计费层无需关心
-	if (channelType == "openai" || channelType == "codex" || channelType == "gemini") && u.CacheReadInputTokens > 0 {
-		if u.CacheReadInputTokens <= u.InputTokens {
-			billableInput = u.InputTokens - u.CacheReadInputTokens
-		} else {
-			log.Printf("[WARN] %s usage 中 cacheReadTokens(%d) > inputTokens(%d)，将 inputTokens 视为非缓存 token",
-				channelType, u.CacheReadInputTokens, u.InputTokens)
+	if upstreamProtocol == "openai" || upstreamProtocol == "codex" || upstreamProtocol == "gemini" {
+		includedCache := u.CacheReadInputTokens
+		if upstreamProtocol == "openai" || upstreamProtocol == "codex" {
+			includedCache += u.CacheCreationInputTokens
+		}
+		if includedCache > 0 {
+			if includedCache <= u.InputTokens {
+				billableInput = u.InputTokens - includedCache
+			} else {
+				log.Printf("[WARN] %s usage 中 cacheRead(%d)+cacheCreation(%d) > inputTokens(%d)，将 inputTokens 视为非缓存 token",
+					upstreamProtocol, u.CacheReadInputTokens, u.CacheCreationInputTokens, u.InputTokens)
+			}
 		}
 	}
 
@@ -572,6 +613,36 @@ func (p *sseUsageParser) HasStreamOutput() bool {
 	return p.hasStreamOutput
 }
 
+func (p *sseUsageParser) HasResponsesMetadata() bool {
+	return p.hasResponsesMetadata
+}
+
+func (p *sseUsageParser) GetResponsesTurnResult() (responsesWebsocketTurnResult, bool) {
+	return p.responsesTurnResult, p.hasResponsesTurn
+}
+
+// isResponsesMetadataEvent 判断 Responses 流事件是否只是元数据（非语义输出）。
+// response.created/queued/in_progress 不算语义输出，出现 error 时仍可切换渠道重试。
+// 空字符串不是元数据：Chat Completions 没有 type，必须算有流输出。
+func isResponsesMetadataEvent(payloadType string) bool {
+	switch payloadType {
+	case "response.created", "response.queued", "response.in_progress",
+		"codex.rate_limits", "codex.response.metadata":
+		return true
+	default:
+		return false
+	}
+}
+
+func isSuccessfulResponsesTerminal(eventType string) bool {
+	switch eventType {
+	case "response.completed", "response.done", "response.incomplete":
+		return true
+	default:
+		return false
+	}
+}
+
 func isHeartbeatEvent(eventType, data string) bool {
 	if eventType == "ping" {
 		return true
@@ -586,23 +657,52 @@ func isHeartbeatEvent(eventType, data string) bool {
 }
 
 // isErrorPayload 检测 data 是否为 error 事件 JSON，用于兼容不带 event: error 行的不规范上游。
-// 判定：顶层 type=="error"（Anthropic 风格）或顶层 error 字段为非空对象（聚合站风格）。
+// 判定：
+//  1. 顶层 type=="error"（Anthropic 风格）
+//  2. 顶层 type=="response.failed"（OpenAI Responses 失败终态）
+//  3. 顶层 error 字段为非空对象（聚合站风格）
+//  4. response.error 为非空对象，或 response.status=="failed"
 func isErrorPayload(data string) bool {
-	if data == "" || !strings.Contains(data, `"error"`) {
+	if data == "" {
+		return false
+	}
+	// 快速过滤：常见错误帧至少包含 error / failed 关键字之一
+	if !strings.Contains(data, `"error"`) &&
+		!strings.Contains(data, `"response.failed"`) &&
+		!strings.Contains(data, `"failed"`) {
 		return false
 	}
 	var event struct {
-		Type  string          `json:"type"`
-		Error json.RawMessage `json:"error"`
+		Type     string          `json:"type"`
+		Error    json.RawMessage `json:"error"`
+		Response *struct {
+			Status string          `json:"status"`
+			Error  json.RawMessage `json:"error"`
+		} `json:"response"`
 	}
 	if json.Unmarshal([]byte(data), &event) != nil {
 		return false
 	}
-	if event.Type == "error" {
+	switch event.Type {
+	case "error", "response.failed":
 		return true
 	}
-	// error 字段存在且为非空的 JSON 对象（排除 null / 空对象 / 空串）
-	trimmed := strings.TrimSpace(string(event.Error))
+	if isNonEmptyJSONObject(event.Error) {
+		return true
+	}
+	if event.Response != nil {
+		if strings.EqualFold(strings.TrimSpace(event.Response.Status), "failed") {
+			return true
+		}
+		if isNonEmptyJSONObject(event.Response.Error) {
+			return true
+		}
+	}
+	return false
+}
+
+func isNonEmptyJSONObject(raw json.RawMessage) bool {
+	trimmed := strings.TrimSpace(string(raw))
 	if trimmed == "" || trimmed == "null" || trimmed == "{}" {
 		return false
 	}
@@ -801,7 +901,7 @@ func (p *jsonUsageParser) applyUsageMap(usage map[string]any) {
 	if speed, ok := usage["speed"].(string); ok && speed == "fast" {
 		p.ServiceTier = "fast"
 	}
-	p.applyUsage(usage, p.channelType)
+	p.applyUsage(usage, p.upstreamProtocol)
 }
 
 func (p *jsonUsageParser) clearJSONPendingKey() {
@@ -815,17 +915,17 @@ func isJSONWhitespace(b byte) bool {
 
 func (p *jsonUsageParser) GetUsage() (inputTokens, outputTokens, cacheRead, cacheCreation int) {
 	if p.truncated {
-		return p.normalizedUsage(p.channelType)
+		return p.normalizedUsage(p.upstreamProtocol)
 	}
 	if p.buffer.Len() == 0 {
-		return p.normalizedUsage(p.channelType)
+		return p.normalizedUsage(p.upstreamProtocol)
 	}
 
 	data := p.buffer.Bytes()
 
 	// 兼容 text/plain SSE 回退：上游偶尔用 text/plain 发送 SSE 事件
 	if looksLikeSSE(data) {
-		sseParser := newSSEUsageParser(p.channelType)
+		sseParser := newSSEUsageParser(p.upstreamProtocol)
 		if err := sseParser.Feed(data); err != nil {
 			log.Printf("[WARN] 类 SSE 格式的 usage 解析失败: %v", err)
 		} else {
@@ -860,7 +960,7 @@ func (p *jsonUsageParser) GetUsage() (inputTokens, outputTokens, cacheRead, cach
 		}
 	}
 
-	return p.normalizedUsage(p.channelType)
+	return p.normalizedUsage(p.upstreamProtocol)
 }
 
 // [INFO] GetLastError 返回nil（jsonUsageParser不处理SSE error事件）
@@ -875,6 +975,14 @@ func (p *jsonUsageParser) IsStreamComplete() bool {
 
 func (p *jsonUsageParser) HasStreamOutput() bool {
 	return p.hasBody
+}
+
+func (p *jsonUsageParser) HasResponsesMetadata() bool {
+	return false
+}
+
+func (p *jsonUsageParser) GetResponsesTurnResult() (responsesWebsocketTurnResult, bool) {
+	return responsesWebsocketTurnResult{}, false
 }
 
 func (u *usageAccumulator) applyToolUsageFromPayload(payload map[string]any) {
@@ -1057,15 +1165,14 @@ func usageFirstInt(m map[string]any, keys ...string) int {
 	return 0
 }
 
-func (u *usageAccumulator) applyUsage(usage map[string]any, channelType string) {
+func (u *usageAccumulator) applyUsage(usage map[string]any, upstreamProtocol string) {
 	if usage == nil {
 		return
 	}
 	u.usageVersion++
 
-	// 平台判断:优先使用channelType(配置明确),fallback到字段特征检测
-	// 设计原则:Trust Configuration > Guess from Data
-	switch channelType {
+	// 优先使用本次请求的实际上游协议，缺失时才回退到字段特征检测。
+	switch upstreamProtocol {
 	case "gemini":
 		// Gemini平台:usageMetadata包装或直接字段
 		u.applyGeminiUsage(usage)
@@ -1088,8 +1195,7 @@ func (u *usageAccumulator) applyUsage(usage map[string]any, channelType string) 
 		u.applyAnthropicOrResponsesUsage(usage)
 
 	default:
-		// 未知channelType,fallback到字段特征检测(向后兼容)
-		log.Printf("[WARN] 未知 channel_type '%s'，回退到字段探测", channelType)
+		log.Printf("[WARN] 未知 upstream_protocol '%s'，回退到字段探测", upstreamProtocol)
 		switch {
 		case hasGeminiUsageFields(usage):
 			u.applyGeminiUsage(usage)
@@ -1098,7 +1204,7 @@ func (u *usageAccumulator) applyUsage(usage map[string]any, channelType string) 
 		case hasAnthropicUsageFields(usage):
 			u.applyAnthropicOrResponsesUsage(usage)
 		default:
-			log.Printf("[ERROR] 无法识别 channel_type '%s' 的 usage 格式，keys: %v", channelType, getUsageKeys(usage))
+			log.Printf("[ERROR] 无法识别 upstream_protocol '%s' 的 usage 格式，keys: %v", upstreamProtocol, getUsageKeys(usage))
 		}
 	}
 }
@@ -1208,6 +1314,7 @@ func (u *usageAccumulator) applyOpenAIChatUsage(usage map[string]any) {
 	if val := usageFirstInt(usage, "reasoning_tokens", "thinking_tokens"); val > 0 {
 		u.ReasoningTokens = val
 	}
+	u.applyBillingUsageOpenAIReasoning(usage)
 }
 
 // applyAnthropicOrResponsesUsage 处理Anthropic或OpenAI Responses API格式
@@ -1250,10 +1357,22 @@ func (u *usageAccumulator) applyAnthropicOrResponsesUsage(usage map[string]any) 
 		u.Cache5mInputTokens = u.CacheCreationInputTokens
 	}
 
-	// OpenAI Responses API缓存字段: input_tokens_details.cached_tokens
+	// OpenAI Responses / Codex 缓存字段:
+	// input_tokens_details.cached_tokens      → 缓存读
+	// input_tokens_details.cache_write_tokens → 缓存建（写入）
 	if details, ok := usage["input_tokens_details"].(map[string]any); ok {
 		if val, ok := details["cached_tokens"].(float64); ok {
 			u.CacheReadInputTokens = int(val)
+		}
+		// 仅在尚未拿到 Anthropic 风格 cache_creation 字段时采用 cache_write_tokens
+		if !hasAggregateCacheCreation && !hasDetailedCacheCreation {
+			if val, ok := details["cache_write_tokens"].(float64); ok {
+				u.CacheCreationInputTokens = int(val)
+				if u.CacheCreationInputTokens > 0 {
+					// OpenAI cache write 无 5m/1h 细分，按 5m 写价（1.25x）计费
+					u.Cache5mInputTokens = u.CacheCreationInputTokens
+				}
+			}
 		}
 	}
 
@@ -1266,6 +1385,40 @@ func (u *usageAccumulator) applyAnthropicOrResponsesUsage(usage map[string]any) 
 		"reasoning_tokens", "thinking_tokens",
 		"total_thought_tokens", "totalThoughtTokens",
 	); val > 0 {
+		u.ReasoningTokens = val
+	}
+	// NewAPI 等网关在 Claude 风格 usage 外包一层 billing_usage.openai_usage，
+	// 真实 reasoning_tokens 只在 completion_tokens_details 里。
+	u.applyBillingUsageOpenAIReasoning(usage)
+}
+
+// applyBillingUsageOpenAIReasoning 从 NewAPI 风格 billing_usage.openai_usage 补齐推理 token。
+// 仅在尚未从标准字段拿到 reasoning 时回填，避免覆盖原生路径。
+func (u *usageAccumulator) applyBillingUsageOpenAIReasoning(usage map[string]any) {
+	if u.ReasoningTokens > 0 || usage == nil {
+		return
+	}
+	billing, ok := usage["billing_usage"].(map[string]any)
+	if !ok {
+		return
+	}
+	oai, ok := billing["openai_usage"].(map[string]any)
+	if !ok {
+		return
+	}
+	if details, ok := oai["completion_tokens_details"].(map[string]any); ok {
+		if val := usageFirstInt(details, "reasoning_tokens", "thinking_tokens"); val > 0 {
+			u.ReasoningTokens = val
+			return
+		}
+	}
+	if details, ok := oai["output_tokens_details"].(map[string]any); ok {
+		if val := usageFirstInt(details, "reasoning_tokens", "thinking_tokens"); val > 0 {
+			u.ReasoningTokens = val
+			return
+		}
+	}
+	if val := usageFirstInt(oai, "reasoning_tokens", "thinking_tokens"); val > 0 {
 		u.ReasoningTokens = val
 	}
 }

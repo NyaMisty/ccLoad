@@ -2,500 +2,709 @@ package storage
 
 import (
 	"context"
+	"database/sql"
+	"errors"
 	"fmt"
+	"os"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"ccLoad/internal/codexauth"
 	"ccLoad/internal/model"
+	"ccLoad/internal/oauthcost"
 	sqlstore "ccLoad/internal/storage/sql"
 )
 
-// createTestSQLiteStore 创建测试用的 SQLite store
 func createTestSQLiteStore(t *testing.T) *sqlstore.SQLStore {
 	t.Helper()
-	tmpDB := t.TempDir() + "/hybrid_test.db"
-	store, err := CreateSQLiteStore(tmpDB)
+	store, err := CreateSQLiteStore(t.TempDir() + "/hybrid_test.db")
 	if err != nil {
 		t.Fatalf("创建测试 SQLite 失败: %v", err)
 	}
 	return store.(*sqlstore.SQLStore)
 }
 
-func TestHybridStore_BasicOperations(t *testing.T) {
-	// 创建两个独立的 SQLite：一个模拟 MySQL（主存储），一个作为 SQLite 缓存
-	mysql := createTestSQLiteStore(t)  // 用 SQLite 模拟 MySQL（主存储）
-	sqlite := createTestSQLiteStore(t) // SQLite 缓存
-	defer func() {
-		_ = sqlite.Close()
-		_ = mysql.Close()
-	}()
-
-	hybrid := NewHybridStore(sqlite, mysql)
-	defer func() { _ = hybrid.Close() }()
-
-	ctx := context.Background()
-
-	// 测试 CreateConfig - 应该先写 MySQL，再同步到 SQLite
-	cfg := &model.Config{
-		Name:        "test-channel",
-		ChannelType: "openai",
-		URL:         "https://api.openai.com",
-		Priority:    100,
-		Enabled:     true,
-	}
-
-	created, err := hybrid.CreateConfig(ctx, cfg)
-	if err != nil {
-		t.Fatalf("CreateConfig 失败: %v", err)
-	}
-	if created.ID == 0 {
-		t.Error("创建的配置 ID 不应为 0")
-	}
-
-	// 验证 MySQL（主存储）有数据
-	mysqlCfg, err := mysql.GetConfig(ctx, created.ID)
-	if err != nil {
-		t.Fatalf("MySQL 主存储应该有数据: %v", err)
-	}
-	if mysqlCfg.Name != cfg.Name {
-		t.Errorf("MySQL 数据不匹配: got %s, want %s", mysqlCfg.Name, cfg.Name)
-	}
-
-	// 测试 GetConfig（从 SQLite 缓存读取）
-	got, err := hybrid.GetConfig(ctx, created.ID)
-	if err != nil {
-		t.Fatalf("GetConfig 失败: %v", err)
-	}
-	if got.Name != cfg.Name {
-		t.Errorf("GetConfig 返回名称不匹配: got %s, want %s", got.Name, cfg.Name)
-	}
-
-	// 测试 ListConfigs
-	list, err := hybrid.ListConfigs(ctx)
-	if err != nil {
-		t.Fatalf("ListConfigs 失败: %v", err)
-	}
-	if len(list) != 1 {
-		t.Errorf("ListConfigs 返回数量不匹配: got %d, want 1", len(list))
-	}
-
-	// 测试 UpdateConfig
-	cfg.Name = "updated-channel"
-	updated, err := hybrid.UpdateConfig(ctx, created.ID, cfg)
-	if err != nil {
-		t.Fatalf("UpdateConfig 失败: %v", err)
-	}
-	if updated.Name != "updated-channel" {
-		t.Errorf("UpdateConfig 返回名称不匹配: got %s, want updated-channel", updated.Name)
-	}
-
-	// 验证 MySQL 主存储已更新
-	mysqlCfg, err = mysql.GetConfig(ctx, created.ID)
-	if err != nil {
-		t.Fatalf("MySQL GetConfig 失败: %v", err)
-	}
-	if mysqlCfg.Name != "updated-channel" {
-		t.Errorf("MySQL 数据未更新: got %s, want updated-channel", mysqlCfg.Name)
-	}
-
-	// 测试 DeleteConfig
-	err = hybrid.DeleteConfig(ctx, created.ID)
-	if err != nil {
-		t.Fatalf("DeleteConfig 失败: %v", err)
-	}
-
-	// 验证 MySQL 主存储已删除
-	_, err = mysql.GetConfig(ctx, created.ID)
-	if err == nil {
-		t.Error("删除后 MySQL 应该返回错误")
-	}
-
-	// 验证 SQLite 缓存也已清理
-	_, err = hybrid.GetConfig(ctx, created.ID)
-	if err == nil {
-		t.Error("删除后 SQLite 缓存应该返回错误")
-	}
-}
-
-func TestHybridStore_AuthToken_IDFromMySQL(t *testing.T) {
-	mysql := createTestSQLiteStore(t)
-	sqlite := createTestSQLiteStore(t)
-	defer func() {
-		_ = sqlite.Close()
-		_ = mysql.Close()
-	}()
-
-	hybrid := NewHybridStore(sqlite, mysql)
-	defer func() { _ = hybrid.Close() }()
-
-	ctx := context.Background()
-
-	token := &model.AuthToken{
-		Token:       fmt.Sprintf("token-%d", time.Now().UnixNano()),
-		Description: "test",
-		IsActive:    true,
-	}
-	if err := hybrid.CreateAuthToken(ctx, token); err != nil {
-		t.Fatalf("CreateAuthToken 失败: %v", err)
-	}
-	if token.ID == 0 {
-		t.Fatalf("token.ID 不应为 0")
-	}
-
-	// ID 来自 MySQL 主存储
-	mysqlToken, err := mysql.GetAuthToken(ctx, token.ID)
-	if err != nil {
-		t.Fatalf("MySQL GetAuthToken 失败: %v", err)
-	}
-	if mysqlToken.Token != token.Token {
-		t.Fatalf("MySQL token 不匹配")
-	}
-
-	// SQLite 缓存也应该有相同数据
-	sqliteToken, err := sqlite.GetAuthToken(ctx, token.ID)
-	if err != nil {
-		t.Fatalf("SQLite GetAuthToken 失败: %v", err)
-	}
-	if sqliteToken.ID != token.ID {
-		t.Fatalf("SQLite token ID 不匹配: got %d, want %d", sqliteToken.ID, token.ID)
-	}
-}
-
-func TestHybridStore_ImportChannelBatch(t *testing.T) {
-	mysql := createTestSQLiteStore(t)
-	sqlite := createTestSQLiteStore(t)
-	defer func() {
-		_ = sqlite.Close()
-		_ = mysql.Close()
-	}()
-
-	hybrid := NewHybridStore(sqlite, mysql)
-	defer func() { _ = hybrid.Close() }()
-
-	ctx := context.Background()
-
-	channels := []*model.ChannelWithKeys{
-		{
-			Config: &model.Config{
-				Name:        "import-chan",
-				ChannelType: "codex",
-				URL:         "https://example.com",
-				Priority:    10,
-				Enabled:     true,
-				ModelEntries: []model.ModelEntry{
-					{Model: "gpt-4.1"},
-				},
-			},
-			APIKeys: []model.APIKey{
-				{KeyIndex: 0, APIKey: "sk-test-0", KeyStrategy: model.KeyStrategySequential},
-				{KeyIndex: 1, APIKey: "sk-test-1", KeyStrategy: model.KeyStrategySequential},
-			},
-		},
-	}
-
-	created, updated, err := hybrid.ImportChannelBatch(ctx, channels)
-	if err != nil {
-		t.Fatalf("ImportChannelBatch 失败: %v", err)
-	}
-	if created != 1 || updated != 0 {
-		t.Fatalf("ImportChannelBatch 计数不符合预期: created=%d updated=%d", created, updated)
-	}
-	if channels[0].Config.ID == 0 {
-		t.Fatalf("导入后 channels[0].Config.ID 不应为 0")
-	}
-	id := channels[0].Config.ID
-
-	// MySQL 主存储应该有数据
-	mysqlCfg, err := mysql.GetConfig(ctx, id)
-	if err != nil {
-		t.Fatalf("MySQL GetConfig 失败: %v", err)
-	}
-	if mysqlCfg.Name != "import-chan" {
-		t.Fatalf("MySQL 渠道名称不匹配: got %s, want %s", mysqlCfg.Name, "import-chan")
-	}
-
-	// SQLite 缓存也应该有数据
-	sqliteCfg, err := sqlite.GetConfig(ctx, id)
-	if err != nil {
-		t.Fatalf("SQLite GetConfig 失败: %v", err)
-	}
-	if sqliteCfg.Name != "import-chan" {
-		t.Fatalf("SQLite 渠道名称不匹配: got %s, want %s", sqliteCfg.Name, "import-chan")
-	}
-
-	// 验证 API Keys
-	keys, err := mysql.GetAPIKeys(ctx, id)
-	if err != nil {
-		t.Fatalf("MySQL GetAPIKeys 失败: %v", err)
-	}
-	if len(keys) != 2 {
-		t.Fatalf("MySQL API Keys 数量不匹配: got %d, want %d", len(keys), 2)
-	}
-}
-
-func TestHybridStore_LogsAsync_ClonesInputs(t *testing.T) {
-	mysql := createTestSQLiteStore(t)
-	sqlite := createTestSQLiteStore(t)
-	defer func() {
-		_ = sqlite.Close()
-		_ = mysql.Close()
-	}()
-
-	hybrid := NewHybridStore(sqlite, mysql)
-	defer func() { _ = hybrid.Close() }()
-
-	ctx := context.Background()
-
-	// logs 写 SQLite + 异步同步到 MySQL
-	// AddLog 返回后修改入参对象，不应与后台同步产生数据竞争
-	entry := &model.LogEntry{
-		Time:       model.JSONTime{Time: time.Now()},
-		ChannelID:  1,
-		Model:      "gpt-4",
-		StatusCode: 200,
-		Duration:   1.5,
-	}
-	if err := hybrid.AddLog(ctx, entry); err != nil {
-		t.Fatalf("AddLog 失败: %v", err)
-	}
-
-	// 并发修改入参（测试克隆是否正确）
-	stop := make(chan struct{})
-	go func() {
-		for {
-			select {
-			case <-stop:
-				return
-			default:
-				entry.Message = fmt.Sprintf("m-%d", time.Now().UnixNano())
-				entry.Duration += 0.001
-			}
-		}
-	}()
-	time.Sleep(100 * time.Millisecond)
-	close(stop)
-
-	// 验证 SQLite 有数据
-	logs, err := hybrid.ListLogs(ctx, time.Now().Add(-1*time.Hour), 10, 0, nil)
-	if err != nil {
-		t.Fatalf("ListLogs 失败: %v", err)
-	}
-	if len(logs) != 1 {
-		t.Errorf("ListLogs 返回数量不匹配: got %d, want 1", len(logs))
-	}
-}
-
-func TestHybridStore_SyncQueueLen(t *testing.T) {
-	mysql := createTestSQLiteStore(t)
-	sqlite := createTestSQLiteStore(t)
-	defer func() {
-		_ = sqlite.Close()
-		_ = mysql.Close()
-	}()
-
-	hybrid := NewHybridStore(sqlite, mysql)
-	defer func() { _ = hybrid.Close() }()
-
-	// 初始队列应该为空
-	if qLen := hybrid.SyncQueueLen(); qLen != 0 {
-		t.Errorf("初始队列长度应为 0, got %d", qLen)
-	}
-}
-
-func TestHybridStore_AddLog(t *testing.T) {
-	mysql := createTestSQLiteStore(t)
-	sqlite := createTestSQLiteStore(t)
-	defer func() {
-		_ = sqlite.Close()
-		_ = mysql.Close()
-	}()
-
-	hybrid := NewHybridStore(sqlite, mysql)
-	defer func() { _ = hybrid.Close() }()
-
-	ctx := context.Background()
-
-	entry := &model.LogEntry{
-		Time:       model.JSONTime{Time: time.Now()},
-		ChannelID:  1,
-		Model:      "gpt-4",
-		StatusCode: 200,
-		Duration:   1.5,
-	}
-
-	err := hybrid.AddLog(ctx, entry)
-	if err != nil {
-		t.Fatalf("AddLog 失败: %v", err)
-	}
-
-	// 验证 SQLite 有数据（日志先写 SQLite）
-	logs, err := hybrid.ListLogs(ctx, time.Now().Add(-1*time.Hour), 10, 0, nil)
-	if err != nil {
-		t.Fatalf("ListLogs 失败: %v", err)
-	}
-	if len(logs) != 1 {
-		t.Errorf("ListLogs 返回数量不匹配: got %d, want 1", len(logs))
-	}
-
-	// 等待异步同步到 MySQL（条件等待，避免固定 sleep 造成漂移/假绿）
-	deadline := time.Now().Add(2 * time.Second)
-	for {
-		mysqlLogs, err := mysql.ListLogs(ctx, time.Now().Add(-1*time.Hour), 10, 0, nil)
-		if err != nil {
-			t.Fatalf("MySQL ListLogs 失败: %v", err)
-		}
-		if len(mysqlLogs) == 1 {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("等待 MySQL 异步同步超时：got %d logs, want 1", len(mysqlLogs))
+func waitForCondition(t *testing.T, timeout time.Duration, condition func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if condition() {
+			return
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
+	if !condition() {
+		t.Fatal("等待条件超时")
+	}
 }
 
-func TestHybridStore_BatchAddLogs_DoesNotDuplicateSurvivingLogsAfterDeletedChannelFilter(t *testing.T) {
-	mysql := createTestSQLiteStore(t)
+func TestHybridStore_SQLiteSuccessDoesNotWaitForPrimary(t *testing.T) {
+	primary := createTestSQLiteStore(t)
 	sqlite := createTestSQLiteStore(t)
-	defer func() {
-		_ = sqlite.Close()
-		_ = mysql.Close()
-	}()
-
-	hybrid := NewHybridStore(sqlite, mysql)
-	defer func() { _ = hybrid.Close() }()
+	hybrid := NewHybridStore(sqlite, primary)
+	t.Cleanup(func() { _ = hybrid.Close() })
+	if err := primary.Close(); err != nil {
+		t.Fatalf("关闭主库: %v", err)
+	}
 
 	ctx := context.Background()
 	created, err := hybrid.CreateConfig(ctx, &model.Config{
-		Name:    "deleted-channel",
-		URL:     "https://api.example.com",
+		Name:     "sqlite-authority",
+		AuthType: model.AuthTypeAPIKey,
+		URLs:     model.ChannelURLs{{URL: "https://example.com"}},
+		Enabled:  true,
+	})
+	if err != nil {
+		t.Fatalf("主库故障不应阻塞 SQLite 写入: %v", err)
+	}
+	got, err := hybrid.GetConfig(ctx, created.ID)
+	if err != nil || got.Name != "sqlite-authority" {
+		t.Fatalf("SQLite 权威读取 = (%+v, %v)", got, err)
+	}
+
+	logEntry := &model.LogEntry{Time: model.JSONTime{Time: time.Now()}, StatusCode: 200, Message: "local"}
+	if err := hybrid.AddLog(ctx, logEntry); err != nil {
+		t.Fatalf("主库故障不应阻塞日志写入: %v", err)
+	}
+	logs, err := hybrid.ListLogs(ctx, time.Time{}, 10, 0, nil)
+	if err != nil || len(logs) != 1 {
+		t.Fatalf("SQLite 日志 = (%d, %v)", len(logs), err)
+	}
+
+	waitForCondition(t, time.Second, func() bool {
+		metrics := hybrid.RuntimeMetrics()
+		return metrics.PrimarySyncPending > 0 && metrics.PrimarySyncFailures > 0
+	})
+	if err := hybrid.Ping(ctx); err != nil {
+		t.Fatalf("主库故障不应让混合模式离线: %v", err)
+	}
+}
+
+func TestHybridStore_ChannelFinalStateConvergesToPrimary(t *testing.T) {
+	primary := createTestSQLiteStore(t)
+	sqlite := createTestSQLiteStore(t)
+	hybrid := NewHybridStore(sqlite, primary)
+	t.Cleanup(func() { _ = hybrid.Close() })
+	ctx := context.Background()
+
+	created, err := hybrid.CreateConfig(ctx, &model.Config{
+		Name:     "initial",
+		AuthType: model.AuthTypeAPIKey,
+		URLs: model.ChannelURLs{
+			{URL: "https://one.example.com"},
+			{URL: "https://two.example.com"},
+		},
 		Enabled: true,
 	})
 	if err != nil {
-		t.Fatalf("create config: %v", err)
+		t.Fatalf("CreateConfig: %v", err)
 	}
-	if err := hybrid.DeleteConfig(ctx, created.ID); err != nil {
-		t.Fatalf("delete config: %v", err)
+	if err := hybrid.CreateAPIKeysBatch(ctx, []*model.APIKey{{
+		ChannelID: created.ID,
+		KeyIndex:  0,
+		APIKey:    "secret",
+	}}); err != nil {
+		t.Fatalf("CreateAPIKeysBatch: %v", err)
+	}
+	if err := hybrid.SetAPIKeyDisabled(ctx, created.ID, 0, true); err != nil {
+		t.Fatalf("SetAPIKeyDisabled: %v", err)
+	}
+	if err := hybrid.SetURLDisabled(ctx, created.ID, "https://two.example.com", true); err != nil {
+		t.Fatalf("SetURLDisabled: %v", err)
+	}
+	if _, err := hybrid.BumpModelCooldown(ctx, created.ID, "upstream-model", time.Now(), 429); err != nil {
+		t.Fatalf("BumpModelCooldown: %v", err)
+	}
+	updated := created.Clone()
+	updated.Name = "final"
+	if _, err := hybrid.UpdateConfig(ctx, created.ID, updated); err != nil {
+		t.Fatalf("UpdateConfig: %v", err)
 	}
 
-	now := time.Now()
-	if err := hybrid.BatchAddLogs(ctx, []*model.LogEntry{
-		{
-			Time:       model.JSONTime{Time: now},
-			ChannelID:  created.ID,
-			Model:      "stale-channel-log",
-			StatusCode: 200,
-		},
-		{
-			Time:       model.JSONTime{Time: now},
-			ChannelID:  0,
-			Model:      "system-log",
-			StatusCode: 503,
-		},
+	waitForCondition(t, 3*time.Second, func() bool {
+		cfg, cfgErr := primary.GetConfig(ctx, created.ID)
+		keys, keysErr := primary.GetAPIKeys(ctx, created.ID)
+		disabled, disabledErr := primary.LoadDisabledURLs(ctx)
+		// The model cooldown replicates as its own queued entity, so waiting on
+		// the channel state alone can observe a queue that is still draining.
+		return cfgErr == nil && cfg.Name == "final" &&
+			keysErr == nil && len(keys) == 1 && keys[0].Disabled &&
+			disabledErr == nil && len(disabled[created.ID]) == 1 &&
+			hybrid.RuntimeMetrics().PrimarySyncPending == 0
+	})
+	if pending := hybrid.RuntimeMetrics().PrimarySyncPending; pending != 0 {
+		t.Fatalf("同步后仍有 %d 个待处理任务", pending)
+	}
+	var localUntil, localDuration, primaryUntil, primaryDuration int64
+	if err := sqlite.QueryRowContext(ctx, `
+		SELECT cooldown_until, cooldown_duration_ms FROM channel_model_cooldowns
+		WHERE channel_id = ? AND model = ?
+	`, created.ID, "upstream-model").Scan(&localUntil, &localDuration); err != nil {
+		t.Fatal(err)
+	}
+	if err := primary.QueryRowContext(ctx, `
+		SELECT cooldown_until, cooldown_duration_ms FROM channel_model_cooldowns
+		WHERE channel_id = ? AND model = ?
+	`, created.ID, "upstream-model").Scan(&primaryUntil, &primaryDuration); err != nil {
+		t.Fatal(err)
+	}
+	if localUntil != primaryUntil || localDuration != primaryDuration {
+		t.Fatalf("模型冷却终态不一致: local=(%d,%d) primary=(%d,%d)",
+			localUntil, localDuration, primaryUntil, primaryDuration)
+	}
+}
+
+func TestHybridStore_OAuthQuotaCostConvergesWithoutReplicaDoubleCount(t *testing.T) {
+	primary := createTestSQLiteStore(t)
+	sqlite := createTestSQLiteStore(t)
+	hybrid := NewHybridStore(sqlite, primary)
+	t.Cleanup(func() { _ = hybrid.Close() })
+	ctx := context.Background()
+	now := time.Now().UTC().Truncate(time.Second)
+	credentialJSON, err := (&codexauth.Credential{
+		Type: codexauth.ChannelType, AccessToken: "access", RefreshToken: "refresh",
+		Expired: now.Add(time.Hour).Format(time.RFC3339),
+		QuotaCostUsage: &oauthcost.Usage{Windows: []*oauthcost.Window{{
+			Key: "codex|secondary", WindowSeconds: 7 * 24 * 60 * 60,
+			StartedAt: now.Add(-24 * time.Hour).Unix(), ResetAt: now.Add(6 * 24 * time.Hour).Unix(),
+		}}},
+	}).JSON()
+	if err != nil {
+		t.Fatal(err)
+	}
+	created, err := hybrid.CreateConfig(ctx, &model.Config{
+		Name: "oauth-cost", AuthType: model.AuthTypeCodexOAuth, OAuthCredential: credentialJSON,
+		URLs: model.ChannelURLs{{URL: "https://example.com", Protocols: []string{"codex"}}}, Enabled: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitForCondition(t, 3*time.Second, func() bool {
+		_, getErr := primary.GetConfig(ctx, created.ID)
+		return getErr == nil
+	})
+
+	if err := hybrid.AddLog(ctx, &model.LogEntry{
+		Time: model.JSONTime{Time: now}, ChannelID: created.ID, StatusCode: 200,
+		Cost: 2.25, CostMultiplier: 9,
 	}); err != nil {
-		t.Fatalf("batch add logs: %v", err)
+		t.Fatal(err)
 	}
-
-	deadline := time.Now().Add(2 * time.Second)
-	var logs []*model.LogEntry
-	for {
-		logs, err = mysql.ListLogsRange(ctx, now.Add(-time.Minute), now.Add(time.Minute), 10, 0, nil)
-		if err != nil {
-			t.Fatalf("mysql.ListLogsRange failed: %v", err)
+	readCost := func(store *sqlstore.SQLStore) (int64, bool) {
+		cfg, getErr := store.GetConfig(ctx, created.ID)
+		if getErr != nil {
+			return 0, false
 		}
-		if len(logs) > 0 {
-			break
+		credential, parseErr := codexauth.ParseCredential([]byte(cfg.OAuthCredential))
+		if parseErr != nil {
+			return 0, false
 		}
-		if time.Now().After(deadline) {
-			t.Fatal("expected surviving system log to sync to MySQL")
+		window := oauthcost.Find(credential.QuotaCostUsage, "codex|secondary")
+		if window == nil {
+			return 0, false
 		}
-		time.Sleep(10 * time.Millisecond)
+		return window.StandardCostMicroUSD, true
 	}
-
-	if len(logs) != 1 {
-		t.Fatalf("expected exactly one surviving log synced to MySQL, got %+v", logs)
+	if cost, ok := readCost(sqlite); !ok || cost != 2_250_000 {
+		t.Fatalf("SQLite quota cost = (%d, %t), want 2250000", cost, ok)
 	}
-	if logs[0].ChannelID != 0 || logs[0].Model != "system-log" {
-		t.Fatalf("unexpected synced log: %+v", logs[0])
-	}
+	waitForCondition(t, 3*time.Second, func() bool {
+		cost, ok := readCost(primary)
+		if !ok || cost != 2_250_000 {
+			return false
+		}
+		logs, listErr := primary.ListLogs(ctx, now.Add(-time.Minute), 10, 0, nil)
+		return listErr == nil && len(logs) == 1
+	})
 }
 
-func TestHybridStore_GracefulClose(t *testing.T) {
-	mysql := createTestSQLiteStore(t)
+func TestHybridStore_CreateUpdateDeleteKeepsTombstone(t *testing.T) {
+	primary := createTestSQLiteStore(t)
 	sqlite := createTestSQLiteStore(t)
-
-	hybrid := NewHybridStore(sqlite, mysql)
-
+	hybrid := NewHybridStore(sqlite, primary)
+	t.Cleanup(func() { _ = hybrid.Close() })
 	ctx := context.Background()
 
-	// 添加一些日志触发异步同步任务
-	for i := 0; i < 10; i++ {
-		entry := &model.LogEntry{
-			Time:       model.JSONTime{Time: time.Now()},
-			ChannelID:  int64(i),
-			Model:      "gpt-4",
-			StatusCode: 200,
-			Duration:   1.5,
-		}
-		_ = hybrid.AddLog(ctx, entry)
-	}
-
-	// 关闭应该等待同步任务完成
-	err := hybrid.Close()
+	created, err := hybrid.CreateConfig(ctx, &model.Config{
+		Name: "short-lived", AuthType: model.AuthTypeAPIKey,
+		URLs: model.ChannelURLs{{URL: "https://example.com"}}, Enabled: true,
+	})
 	if err != nil {
-		t.Errorf("Close 失败: %v", err)
+		t.Fatalf("CreateConfig: %v", err)
 	}
-
-	// 多次关闭应该是幂等的
-	err = hybrid.Close()
+	token := &model.AuthToken{
+		Token:                  "hybrid-delete-channel-token",
+		Description:            "hybrid channel restriction",
+		IsActive:               true,
+		AllowedChannelIDs:      []int64{created.ID},
+		ChannelRestrictionMode: model.ChannelRestrictionModeAllow,
+	}
+	if err := hybrid.CreateAuthToken(ctx, token); err != nil {
+		t.Fatalf("CreateAuthToken: %v", err)
+	}
+	waitForCondition(t, 3*time.Second, func() bool {
+		primaryToken, tokenErr := primary.GetAuthToken(ctx, token.ID)
+		return tokenErr == nil && len(primaryToken.AllowedChannelIDs) == 1 &&
+			hybrid.RuntimeMetrics().PrimarySyncPending == 0
+	})
+	if err := hybrid.DeleteConfig(ctx, created.ID); err != nil {
+		t.Fatalf("DeleteConfig: %v", err)
+	}
+	waitForCondition(t, 3*time.Second, func() bool {
+		_, getErr := primary.GetConfig(ctx, created.ID)
+		primaryToken, tokenErr := primary.GetAuthToken(ctx, token.ID)
+		return getErr != nil && tokenErr == nil && !primaryToken.IsActive && len(primaryToken.AllowedChannelIDs) == 0 &&
+			hybrid.RuntimeMetrics().PrimarySyncPending == 0
+	})
+	if _, err := hybrid.GetConfig(ctx, created.ID); err == nil {
+		t.Fatal("SQLite 中被删除的渠道不应复活")
+	}
+	localToken, err := hybrid.GetAuthToken(ctx, token.ID)
 	if err != nil {
-		t.Errorf("第二次 Close 失败: %v", err)
+		t.Fatalf("GetAuthToken: %v", err)
+	}
+	if len(localToken.AllowedChannelIDs) != 0 {
+		t.Fatalf("SQLite allowed_channel_ids=%v, want empty", localToken.AllowedChannelIDs)
+	}
+	if localToken.IsActive {
+		t.Fatal("SQLite token must be disabled after its last allowed channel is deleted")
 	}
 }
 
-func TestHybridStore_SQLiteCacheFailureDoesNotBlockWrite(t *testing.T) {
-	mysql := createTestSQLiteStore(t)
+func TestHybridStore_ChannelReplicaUpdateIsAtomic(t *testing.T) {
+	primary := createTestSQLiteStore(t)
 	sqlite := createTestSQLiteStore(t)
-	defer func() {
-		_ = mysql.Close()
+	hybrid := NewHybridStore(sqlite, primary)
+	hybrid.primarySync.retry = 20 * time.Millisecond
+	t.Cleanup(func() { _ = hybrid.Close() })
+	ctx := context.Background()
+
+	created, err := hybrid.CreateConfig(ctx, &model.Config{
+		Name: "before", AuthType: model.AuthTypeAPIKey,
+		URLs: model.ChannelURLs{{URL: "https://example.com"}}, Enabled: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := hybrid.CreateAPIKeysBatch(ctx, []*model.APIKey{{
+		ChannelID: created.ID, KeyIndex: 0, APIKey: "key",
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	waitForCondition(t, 3*time.Second, func() bool { return hybrid.RuntimeMetrics().PrimarySyncPending == 0 })
+
+	if _, err := primary.ExecContext(ctx, `
+		CREATE TRIGGER reject_replica_key_insert
+		BEFORE INSERT ON api_keys
+		BEGIN
+			SELECT RAISE(FAIL, 'reject key replica');
+		END
+	`); err != nil {
+		t.Fatal(err)
+	}
+	updated := created.Clone()
+	updated.Name = "after"
+	if _, err := hybrid.UpdateConfig(ctx, created.ID, updated); err != nil {
+		t.Fatal(err)
+	}
+	waitForCondition(t, time.Second, func() bool { return hybrid.RuntimeMetrics().PrimarySyncFailures > 0 })
+	primaryConfig, err := primary.GetConfig(ctx, created.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if primaryConfig.Name != "before" {
+		t.Fatalf("聚合事务部分提交: primary name=%q", primaryConfig.Name)
+	}
+	if _, err := primary.ExecContext(ctx, `DROP TRIGGER reject_replica_key_insert`); err != nil {
+		t.Fatal(err)
+	}
+	waitForCondition(t, 3*time.Second, func() bool {
+		cfg, getErr := primary.GetConfig(ctx, created.ID)
+		return getErr == nil && cfg.Name == "after" && hybrid.RuntimeMetrics().PrimarySyncPending == 0
+	})
+}
+
+func TestHybridStore_StaleNaturalKeysConvergeToSQLiteIDs(t *testing.T) {
+	primary := createTestSQLiteStore(t)
+	sqlite := createTestSQLiteStore(t)
+	ctx := context.Background()
+	staleChannel, err := primary.CreateConfig(ctx, &model.Config{
+		Name: "reused-name", AuthType: model.AuthTypeAPIKey,
+		URLs: model.ChannelURLs{{URL: "https://old.example.com"}}, Enabled: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	filler, err := sqlite.CreateConfig(ctx, &model.Config{
+		Name: "filler", AuthType: model.AuthTypeAPIKey,
+		URLs: model.ChannelURLs{{URL: "https://filler.example.com"}}, Enabled: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = filler
+
+	tokenHash := model.HashToken("reused-token")
+	staleToken := &model.AuthToken{Token: tokenHash, Description: "old", IsActive: true, CreatedAt: time.Now()}
+	if err := primary.CreateAuthToken(ctx, staleToken); err != nil {
+		t.Fatal(err)
+	}
+	fillerToken := &model.AuthToken{Token: model.HashToken("filler"), Description: "filler", IsActive: true, CreatedAt: time.Now()}
+	if err := sqlite.CreateAuthToken(ctx, fillerToken); err != nil {
+		t.Fatal(err)
+	}
+
+	hybrid := NewHybridStore(sqlite, primary)
+	t.Cleanup(func() { _ = hybrid.Close() })
+	currentChannel, err := hybrid.CreateConfig(ctx, &model.Config{
+		Name: "reused-name", AuthType: model.AuthTypeAPIKey,
+		URLs: model.ChannelURLs{{URL: "https://new.example.com"}}, Enabled: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	currentToken := &model.AuthToken{Token: tokenHash, Description: "new", IsActive: true, CreatedAt: time.Now()}
+	if err := hybrid.CreateAuthToken(ctx, currentToken); err != nil {
+		t.Fatal(err)
+	}
+	if currentChannel.ID == staleChannel.ID || currentToken.ID == staleToken.ID {
+		t.Fatal("测试前提失败：SQLite 应分配不同 ID")
+	}
+
+	waitForCondition(t, 3*time.Second, func() bool {
+		cfg, cfgErr := primary.GetConfig(ctx, currentChannel.ID)
+		token, tokenErr := primary.GetAuthTokenByValue(ctx, tokenHash)
+		return cfgErr == nil && cfg.Name == "reused-name" &&
+			tokenErr == nil && token.ID == currentToken.ID &&
+			hybrid.RuntimeMetrics().PrimarySyncPending == 0
+	})
+	if _, err := primary.GetConfig(ctx, staleChannel.ID); err == nil {
+		t.Fatal("主库旧渠道 ID 未清理")
+	}
+}
+
+func TestHybridStore_OAuthCASHasSingleSQLiteWinner(t *testing.T) {
+	primary := createTestSQLiteStore(t)
+	sqlite := createTestSQLiteStore(t)
+	hybrid := NewHybridStore(sqlite, primary)
+	t.Cleanup(func() { _ = hybrid.Close() })
+	ctx := context.Background()
+
+	created, err := hybrid.CreateConfig(ctx, &model.Config{
+		Name: "oauth", AuthType: model.AuthTypeCodexOAuth,
+		OAuthCredential: "old", URLs: model.ChannelURLs{{URL: "https://example.com"}}, Enabled: true,
+	})
+	if err != nil {
+		t.Fatalf("CreateConfig: %v", err)
+	}
+
+	var winners atomic.Int64
+	var wg sync.WaitGroup
+	for _, next := range []string{"winner-a", "winner-b"} {
+		wg.Add(1)
+		go func(credential string) {
+			defer wg.Done()
+			updated, casErr := hybrid.CompareAndSwapOAuthCredential(
+				ctx, created.ID, model.AuthTypeCodexOAuth, "old", credential,
+			)
+			if casErr != nil {
+				t.Errorf("CAS: %v", casErr)
+				return
+			}
+			if updated {
+				winners.Add(1)
+			}
+		}(next)
+	}
+	wg.Wait()
+	if got := winners.Load(); got != 1 {
+		t.Fatalf("CAS winners=%d, want 1", got)
+	}
+	got, err := hybrid.GetConfig(ctx, created.ID)
+	if err != nil || (got.OAuthCredential != "winner-a" && got.OAuthCredential != "winner-b") {
+		t.Fatalf("winner credential = (%q, %v)", got.OAuthCredential, err)
+	}
+	waitForCondition(t, 3*time.Second, func() bool {
+		primaryConfig, primaryErr := primary.GetConfig(ctx, created.ID)
+		return primaryErr == nil && primaryConfig.OAuthCredential == got.OAuthCredential &&
+			hybrid.RuntimeMetrics().PrimarySyncPending == 0
+	})
+	if err := hybrid.SetChannelCooldown(ctx, created.ID, time.Now().Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := hybrid.GetConfig(ctx, created.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	disabled, err := hybrid.DisableConfigIfOAuthSnapshotMatches(ctx, snapshot)
+	if err != nil || !disabled {
+		t.Fatalf("disable OAuth winner = (%v, %v), want (true, nil)", disabled, err)
+	}
+	local, err := hybrid.GetConfig(ctx, created.ID)
+	if err != nil || local.Enabled || local.CooldownUntil != 0 || local.CooldownDurationMs != 0 {
+		t.Fatalf("SQLite rejected OAuth state = (%+v, %v)", local, err)
+	}
+	waitForCondition(t, 3*time.Second, func() bool {
+		primaryConfig, primaryErr := primary.GetConfig(ctx, created.ID)
+		return primaryErr == nil && !primaryConfig.Enabled && primaryConfig.CooldownUntil == 0 &&
+			primaryConfig.CooldownDurationMs == 0 && hybrid.RuntimeMetrics().PrimarySyncPending == 0
+	})
+}
+
+func TestHybridStore_ChannelAuthTypeChangeConvergesByReplacingPrimaryAggregate(t *testing.T) {
+	ctx := context.Background()
+	sqlite := createTestSQLiteStore(t)
+	primary := createTestSQLiteStore(t)
+	if _, err := primary.CreateConfig(ctx, &model.Config{
+		Name: "old-api-key", AuthType: model.AuthTypeAPIKey,
+		URLs: model.ChannelURLs{{URL: "https://old.example"}}, Enabled: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	hybrid := NewHybridStore(sqlite, primary)
+	t.Cleanup(func() { _ = hybrid.Close() })
+	created, err := hybrid.CreateConfig(ctx, &model.Config{
+		Name: "new-oauth", AuthType: model.AuthTypeCodexOAuth, OAuthCredential: `{"access_token":"new"}`,
+		URLs: model.ChannelURLs{{URL: "https://new.example"}}, Enabled: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitForCondition(t, time.Second, func() bool {
+		cfg, getErr := primary.GetConfig(ctx, created.ID)
+		return getErr == nil && cfg.Name == "new-oauth" && cfg.AuthType == model.AuthTypeCodexOAuth
+	})
+}
+
+func TestHybridStore_HighCardinalityDirtyStateCollapsesToFullReconcile(t *testing.T) {
+	ctx := context.Background()
+	sqlite := createTestSQLiteStore(t)
+	primary := createTestSQLiteStore(t)
+	release := make(chan struct{})
+	hybrid := newHybridStore(sqlite, primary, func(initCtx context.Context) error {
+		select {
+		case <-release:
+			return nil
+		case <-initCtx.Done():
+			return initCtx.Err()
+		}
+	})
+	hybrid.primarySync.configureReconcile(2, hybrid.reconcilePrimary, hybrid.markPrimaryReconcileDirty)
+	t.Cleanup(func() { _ = hybrid.Close() })
+
+	const configCount = primaryReconcilePageSize + 5
+	for i := 0; i < configCount; i++ {
+		if _, err := hybrid.CreateConfig(ctx, &model.Config{
+			Name: fmt.Sprintf("bounded-%d", i), AuthType: model.AuthTypeAPIKey,
+			URLs: model.ChannelURLs{{URL: "https://example.com"}}, Enabled: true,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if pending := hybrid.RuntimeMetrics().PrimarySyncPending; pending != 2 {
+		t.Fatalf("pending=%d, want initializer + one full reconciliation", pending)
+	}
+	close(release)
+	waitForCondition(t, 2*time.Second, func() bool {
+		configs, listErr := primary.ListConfigs(ctx)
+		return listErr == nil && len(configs) == configCount && hybrid.RuntimeMetrics().PrimarySyncPending == 0
+	})
+}
+
+func TestHybridStore_AnalyticsReadFailureCanUsePrimaryHistory(t *testing.T) {
+	primary := createTestSQLiteStore(t)
+	sqlite := createTestSQLiteStore(t)
+	hybrid := NewHybridStore(sqlite, primary)
+	t.Cleanup(func() { _ = hybrid.Close() })
+	ctx := context.Background()
+	if err := primary.AddLog(ctx, &model.LogEntry{
+		Time: model.JSONTime{Time: time.Now()}, StatusCode: 200, Message: "history",
+	}); err != nil {
+		t.Fatalf("seed primary log: %v", err)
+	}
+	if err := sqlite.Close(); err != nil {
+		t.Fatalf("close sqlite: %v", err)
+	}
+	logs, err := hybrid.ListLogs(ctx, time.Time{}, 10, 0, nil)
+	if err != nil || len(logs) != 1 || logs[0].Message != "history" {
+		t.Fatalf("history fallback = (%+v, %v)", logs, err)
+	}
+	if !hybrid.RuntimeMetrics().AnalyticsReadsPrimary {
+		t.Fatal("分析读取失败后应记录主库降级")
+	}
+}
+
+func TestHybridStore_AuthoritativeSQLiteFailureIsReturned(t *testing.T) {
+	primary := createTestSQLiteStore(t)
+	sqlite := createTestSQLiteStore(t)
+	hybrid := NewHybridStore(sqlite, primary)
+	t.Cleanup(func() { _ = hybrid.Close() })
+	if err := sqlite.Close(); err != nil {
+		t.Fatalf("close sqlite: %v", err)
+	}
+	_, err := hybrid.CreateConfig(context.Background(), &model.Config{
+		Name: "must-fail", AuthType: model.AuthTypeAPIKey,
+		URLs: model.ChannelURLs{{URL: "https://example.com"}}, Enabled: true,
+	})
+	if err == nil {
+		t.Fatal("SQLite 权威写失败不能伪装成功")
+	}
+	if err := hybrid.Ping(context.Background()); err == nil {
+		t.Fatal("SQLite 故障必须让健康检查失败")
+	}
+}
+
+func TestPrimaryWriteBehindDoesNotClearNewGeneration(t *testing.T) {
+	w := newPrimaryWriteBehind(10*time.Millisecond, time.Second)
+	t.Cleanup(w.close)
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var final atomic.Int64
+	w.enqueue("same", "old", func(context.Context) error {
+		close(started)
+		<-release
+		final.Store(1)
+		return nil
+	})
+	<-started
+	w.enqueue("same", "new", func(context.Context) error {
+		final.Store(2)
+		return nil
+	})
+	close(release)
+	waitForCondition(t, time.Second, func() bool { return final.Load() == 2 && w.pending() == 0 })
+}
+
+func TestPrimaryWriteBehindRetriesFailedFinalState(t *testing.T) {
+	w := newPrimaryWriteBehind(10*time.Millisecond, time.Second)
+	t.Cleanup(w.close)
+	var attempts atomic.Int64
+	w.enqueue("state", "retry", func(context.Context) error {
+		if attempts.Add(1) == 1 {
+			return errors.New("temporary")
+		}
+		return nil
+	})
+	waitForCondition(t, time.Second, func() bool { return attempts.Load() >= 2 && w.pending() == 0 })
+	if failures := w.failures.Load(); failures != 1 {
+		t.Fatalf("failures=%d, want 1", failures)
+	}
+}
+
+func TestPrimaryWriteBehindDoesNotRetryBestEffortLogs(t *testing.T) {
+	w := newPrimaryWriteBehind(10*time.Millisecond, time.Second)
+	t.Cleanup(w.close)
+	var attempts atomic.Int64
+	w.enqueueBestEffort("logs/latest", "logs", func(context.Context) error {
+		attempts.Add(1)
+		return errors.New("unavailable")
+	})
+	waitForCondition(t, time.Second, func() bool { return w.pending() == 0 })
+	time.Sleep(30 * time.Millisecond)
+	if attempts.Load() != 1 || w.dropped.Load() != 1 {
+		t.Fatalf("best effort attempts=%d dropped=%d", attempts.Load(), w.dropped.Load())
+	}
+}
+
+func TestPrimaryWriteBehindPublishesReconcileOnlyAfterDirtyMarker(t *testing.T) {
+	w := newPrimaryWriteBehind(10*time.Millisecond, time.Second)
+	t.Cleanup(w.close)
+	dirtyStarted := make(chan struct{})
+	releaseDirty := make(chan struct{})
+	var dirtyOnce sync.Once
+	var reconcileRuns atomic.Int64
+	w.configureReconcile(1, func(context.Context) error {
+		reconcileRuns.Add(1)
+		return nil
+	}, func() {
+		dirtyOnce.Do(func() { close(dirtyStarted) })
+		<-releaseDirty
+	})
+
+	w.enqueue("first", "first", func(context.Context) error {
+		return errors.New("keep pending")
+	})
+	enqueued := make(chan struct{})
+	go func() {
+		w.enqueue("second", "second", func(context.Context) error { return nil })
+		close(enqueued)
 	}()
+	<-dirtyStarted
+	time.Sleep(20 * time.Millisecond)
+	if reconcileRuns.Load() != 0 {
+		close(releaseDirty)
+		<-enqueued
+		t.Fatal("reconciliation ran before its dirty marker was committed")
+	}
+	close(releaseDirty)
+	<-enqueued
+	waitForCondition(t, time.Second, func() bool { return reconcileRuns.Load() > 0 })
+}
 
-	hybrid := NewHybridStore(sqlite, mysql)
+func TestHybridStore_CloseIsIdempotent(t *testing.T) {
+	hybrid := NewHybridStore(createTestSQLiteStore(t), createTestSQLiteStore(t))
+	if err := hybrid.Close(); err != nil {
+		t.Fatalf("first Close: %v", err)
+	}
+	if err := hybrid.Close(); err != nil {
+		t.Fatalf("second Close: %v", err)
+	}
+}
 
+func TestHybridStore_MySQLWriteBehindIntegration(t *testing.T) {
+	dsn := os.Getenv("CCLOAD_TEST_MYSQL_DSN")
+	if dsn == "" {
+		t.Skip("CCLOAD_TEST_MYSQL_DSN 未设置")
+	}
+	db, err := sql.Open("mysql", dsn)
+	if err != nil {
+		t.Fatalf("打开 MySQL 测试库: %v", err)
+	}
+	pingCtx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	if err := db.PingContext(pingCtx); err != nil {
+		_ = db.Close()
+		t.Fatalf("连接 MySQL 测试库: %v", err)
+	}
+	primary := sqlstore.NewSQLStore(db, "mysql")
+	sqlite := createTestSQLiteStore(t)
+	hybrid := NewHybridStore(sqlite, primary)
+	t.Cleanup(func() { _ = hybrid.Close() })
 	ctx := context.Background()
+	suffix := time.Now().UnixNano()
+	localWriteStarted := time.Now()
 
-	// 创建一个配置
-	cfg := &model.Config{
-		Name:        "test-channel",
-		ChannelType: "openai",
-		URL:         "https://api.openai.com",
-		Priority:    100,
-		Enabled:     true,
-	}
-
-	created, err := hybrid.CreateConfig(ctx, cfg)
+	created, err := hybrid.CreateConfig(ctx, &model.Config{
+		Name:     "writebehind-integration-" + time.Unix(0, suffix).Format("150405.000000000"),
+		AuthType: model.AuthTypeAPIKey,
+		URLs:     model.ChannelURLs{{URL: "https://example.com"}},
+		Enabled:  true,
+	})
 	if err != nil {
-		t.Fatalf("CreateConfig 失败: %v", err)
+		t.Fatalf("SQLite CreateConfig: %v", err)
+	}
+	if err := hybrid.CreateAPIKeysBatch(ctx, []*model.APIKey{{
+		ChannelID: created.ID, KeyIndex: 0, APIKey: "integration-secret",
+	}}); err != nil {
+		t.Fatalf("SQLite CreateAPIKeysBatch: %v", err)
+	}
+	localWriteElapsed := time.Since(localWriteStarted)
+	t.Logf("SQLite 请求侧两次写入耗时: %v", localWriteElapsed)
+	if localWriteElapsed > 2*time.Second {
+		t.Fatalf("主库延迟泄漏到请求侧: 本地写入耗时 %v", localWriteElapsed)
 	}
 
-	// 关闭 SQLite（模拟缓存失败）
-	_ = sqlite.Close()
-
-	// 更新操作应该成功（MySQL 写入成功即可）
-	cfg.Name = "updated-channel"
-	_, err = hybrid.UpdateConfig(ctx, created.ID, cfg)
-	if err != nil {
-		t.Fatalf("UpdateConfig 应该成功（MySQL 是主存储）: %v", err)
+	waitForCondition(t, 20*time.Second, func() bool {
+		cfg, cfgErr := primary.GetConfig(ctx, created.ID)
+		keys, keyErr := primary.GetAPIKeys(ctx, created.ID)
+		return cfgErr == nil && cfg.Name == created.Name && keyErr == nil && len(keys) == 1
+	})
+	if failures := hybrid.RuntimeMetrics().PrimarySyncFailures; failures != 0 {
+		t.Fatalf("MySQL 同步失败次数=%d", failures)
 	}
-
-	// 验证 MySQL 有更新
-	mysqlCfg, err := mysql.GetConfig(ctx, created.ID)
-	if err != nil {
-		t.Fatalf("MySQL GetConfig 失败: %v", err)
+	if err := primary.DeleteConfig(ctx, created.ID); err != nil {
+		t.Fatalf("清理 MySQL 测试渠道: %v", err)
 	}
-	if mysqlCfg.Name != "updated-channel" {
-		t.Errorf("MySQL 数据未更新: got %s, want updated-channel", mysqlCfg.Name)
-	}
-
-	_ = hybrid.Close()
 }

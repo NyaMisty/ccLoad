@@ -1,0 +1,73 @@
+# kind|field1|field2[|field3|field4|field5]
+# root rows define deterministic upstream -> local path mapping.
+# review rows are the exact non-excluded core + provider delta for the latest atomic sync.
+# delete rows record an upstream removal, its removed local path, and the base blob.
+# skip-test rows require an exact newly-added upstream test symbol and a review reason.
+snapshot|internal/protocol/cliproxy
+root|internal/translator|internal/protocol/cliproxy
+root|internal/signature|internal/protocol/cliproxy/signature
+root|internal/thinking|internal/protocol/cliproxy/thinking
+root|internal/util|internal/protocol/cliproxy/util
+
+# Special mappings whose names or destinations are not covered by a root row.
+file|source|internal/misc/mime-type.go|internal/protocol/cliproxy/misc/mime_type.go|6c7fcafd6003880c81a3c9f964684bc74acbf31d|6c7fcafd6003880c81a3c9f964684bc74acbf31d
+file|source|internal/registry/models/models.json|internal/protocol/cliproxy/registry/models/models.json|546692c482b47defb0b3bcbb19c686b1a535e71e|546692c482b47defb0b3bcbb19c686b1a535e71e
+
+# ccLoad-owned pure wire helpers with no direct upstream source file.
+local|source|internal/protocol/cliproxy/common/anthropic_response.go|ccload-native-anthropic-wire|c018c7ac308d69eadbb8b38193b8a57b44591fa0
+local|source|internal/protocol/cliproxy/registry/models.go|static-catalog-loader|8dc84eccf81ffa3d7a015ca7f561f3f74012b01b
+local|source|internal/protocol/cliproxy/util/function_name.go|ccload-function-name-normalization|a08a75d94b772b9fe3b79a9cd3b2e9288196f39b
+
+# Translator runtime registration, unsupported protocols, no-op paths, and benchmarks.
+exclude|internal/translator/init.go|dynamic-registry
+exclude|internal/translator/*/init.go|dynamic-registry
+exclude|internal/translator/*/noop_optimization_test.go|private-allocation-behavior
+exclude|internal/translator/*_benchmark_test.go|performance-only
+exclude|internal/translator/interactions/*.go|unsupported-interactions-wire
+exclude|internal/translator/*/interactions/*.go|unsupported-interactions-wire
+exclude|internal/translator/common/interactions_usage.go|interactions-only
+exclude|internal/translator/gemini/gemini/*.go|same-protocol-passthrough
+exclude|internal/translator/openai/openai/chat-completions/*.go|same-protocol-passthrough
+exclude|internal/translator/translator/*.go|sdk-dynamic-registry
+
+# Runtime thinking application is intentionally outside the pure conversion core.
+exclude|internal/thinking/apply.go|runtime-thinking-application
+exclude|internal/thinking/apply_*_test.go|runtime-thinking-application
+exclude|internal/thinking/errors.go|runtime-thinking-application
+exclude|internal/thinking/kimi_max_clamp_repro_test.go|runtime-thinking-application
+exclude|internal/thinking/provider/*.go|runtime-provider-policy
+exclude|internal/thinking/strip.go|runtime-thinking-application
+exclude|internal/thinking/summary.go|runtime-thinking-application
+exclude|internal/thinking/summary_test.go|runtime-thinking-application
+exclude|internal/thinking/validate.go|runtime-thinking-application
+
+# Unrelated runtime utilities. New util files remain unclassified and fail closed.
+exclude|internal/util/claude_model.go|runtime-model-helper
+exclude|internal/util/claude_model_test.go|runtime-model-helper
+exclude|internal/util/claude_tool_result_test.go|private-helper-test
+exclude|internal/util/header_helpers.go|runtime-http-helper
+exclude|internal/util/header_helpers_test.go|runtime-http-helper
+exclude|internal/util/image.go|runtime-image-helper
+exclude|internal/util/nocopy_invariant_test.go|private-allocation-behavior
+exclude|internal/util/provider.go|runtime-provider-helper
+exclude|internal/util/proxy.go|runtime-proxy-helper
+exclude|internal/util/sanitize_test.go|runtime-sanitizer-test
+exclude|internal/util/ssh_helper.go|runtime-network-helper
+exclude|internal/util/util.go|runtime-general-helper
+
+# Reviewed atomic delta: --base-commit -> UPSTREAM.md target.
+review|source|internal/registry/models/models.json|546692c482b47defb0b3bcbb19c686b1a535e71e|546692c482b47defb0b3bcbb19c686b1a535e71e
+review|source|internal/translator/claude/openai/chat-completions/claude_openai_request.go|443b57e710a0ea20d8601e1fd4155d87a23235b7|76a24b814d9fc69416abf6332ca710a0358c61a8
+review|test|internal/translator/claude/openai/chat-completions/claude_openai_request_test.go|f3de6fba885f7b07e6804c2d1251b9e694aff372|f0d7b1c6c36e8f2eb73ddf33ba4fc8a80060a119
+review|source|internal/translator/claude/openai/responses/claude_openai-responses_request.go|3813bf8679f21e027c577400dbb5f2a15fbf04f0|d633f5a9d208c51e5e54ce6c324f9fe86c488394
+review|test|internal/translator/claude/openai/responses/claude_openai-responses_request_test.go|c6480f184176c545a4489f2203a22e608d82d523|13ef7d4ffc893a6189a8d83b23d20cc4bfd2db80
+review|source|internal/translator/gemini/openai/responses/gemini_openai-responses_request.go|4569ac8007e4af3faba56524dd45817c60afe03c|baa8ac32e92c7973c84edfaca3bbf5fc328c9340
+review|test|internal/translator/gemini/openai/responses/gemini_openai-responses_request_test.go|43a5c7a264607942411019f1733f1d561ebae648|5f3fcd5ad1f9144020c782f866f6a07d337fa53d
+review|source|internal/translator/openai/claude/openai_claude_request.go|42f2783c343579bd8630ed9029d25a8cb41e190d|8d356e62180166ba92b872e270c17b1d586df718
+review|test|internal/translator/openai/claude/openai_claude_request_test.go|4b698bf85120b598a6376fd79b3f0e33b6d20c2a|c758d3f3dc621f05c28c60d49a275f0270ffdaab
+review|source|internal/util/claude_attribution.go|9cd43e8f20c4530f965234b3bba1c3336ac07f35|9cd43e8f20c4530f965234b3bba1c3336ac07f35
+review|test|internal/util/claude_attribution_test.go|7cc6357213ce703767cc56cd4a164aa8759e3ed0|7cc6357213ce703767cc56cd4a164aa8759e3ed0
+review|source|internal/util/gemini_schema.go|48b6615ea29a50fd828ef9edbdb9f60683ea0cfa|8159eeabbf966d9fb1cc73c18f7ed5a652cec63d
+review|test|internal/util/gemini_schema_test.go|4cea339773c399b7445aa91114c99795901831da|0beaacfa784572df3a236df59da870d13697a981
+review|source|internal/translator/antigravity/openai/chat-completions/antigravity_openai_request.go|11fc14609edd52162953e036882190639a7fbc74|78f0e990b1a6606547183cd3e448227f4a95dd31
+review|test|internal/translator/antigravity/openai/chat-completions/antigravity_openai_request_test.go|3f3f934b507dba7bf5107db2c670aab0ca4b3f2a|3f3f934b507dba7bf5107db2c670aab0ca4b3f2a

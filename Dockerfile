@@ -5,10 +5,10 @@
 # ============================================
 # 阶段1: 基础工具链 (与 TARGETPLATFORM 无关，可复用)
 # ============================================
-FROM --platform=$BUILDPLATFORM golang:1.25-alpine AS base
+FROM --platform=$BUILDPLATFORM golang:1.26-alpine AS base
 
 # 安装交叉编译工具链（这层很少变，缓存命中率高）
-COPY --from=tonistiigi/xx:1.6.1 / /
+COPY --from=tonistiigi/xx:1.9.0 / /
 RUN apk add --no-cache git ca-certificates tzdata clang lld
 
 WORKDIR /app
@@ -63,7 +63,7 @@ RUN --mount=type=cache,target=/root/.cache/go-build \
 # ============================================
 # 阶段4: 运行时镜像 (最小化)
 # ============================================
-FROM alpine:3.21
+FROM alpine:3.24.1
 
 # 安装运行时依赖
 RUN apk --no-cache add ca-certificates tzdata
@@ -87,7 +87,8 @@ EXPOSE 8080
 
 ENV PORT=8080 \
     SQLITE_PATH=/app/data/ccload.db \
-    GIN_MODE=release
+    GIN_MODE=release \
+    CCLOAD_CONTAINER=1
 
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
     CMD wget --no-verbose --tries=1 --spider http://localhost:8080/health || exit 1

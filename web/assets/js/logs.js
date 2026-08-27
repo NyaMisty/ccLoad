@@ -4,13 +4,14 @@ let currentLogsPage = 1;
 let logsPageSize = 15;
 let totalLogsPages = 1;
 let totalLogs = 0;
-let currentChannelType = 'all'; // 当前选中的渠道类型
 let currentLogsCustomTimeRange = null;
 let authTokens = []; // 令牌列表
 let logsChannelNameCombobox = null; // 渠道名筛选组合框
 let logsModelCombobox = null; // 模型筛选组合框
+let logsStatusCombobox = null; // 状态码筛选组合框
 window.logsChannels = []; // 渠道列表（来自 /admin/models）
 window.availableLogsModels = []; // 可用模型列表
+window.availableLogsStatusCodes = []; // 可用状态码列表
 let logsExactChannelNameValue = '';
 let logsExactModelValue = '';
 let logsDefaultTestContent = 'sonnet 4.0的发布日期是什么'; // 默认测试内容（从设置加载）
@@ -269,16 +270,11 @@ function formatBytes(bytes) {
 function buildActiveRequestInfoContent(req) {
   const bytesInfo = formatBytes(req?.bytes_received);
   const hasBytes = !!bytesInfo;
-  const infoDisplay = hasBytes ? `已接收 ${bytesInfo}` : '请求处理中...';
+  const infoDisplay = hasBytes
+    ? t('logs.receivedBytes', { bytes: bytesInfo })
+    : (req?.debug_log_available ? t('logs.upstreamDetails') : '-');
   const infoColor = hasBytes ? 'var(--success-600)' : 'var(--neutral-500)';
-  let infoHtml = `<span style="color: ${infoColor};">${escapeHtml(infoDisplay)}</span>`;
-
-  // 尝试次数标记（attempt_index > 1 表示正在重试）
-  const attemptIndex = Number(req?.attempt_index);
-  if (Number.isFinite(attemptIndex) && attemptIndex > 1) {
-    infoHtml += ` <span class="logs-attempt-badge" style="color: var(--warning-600); font-weight: 600;" title="已重试次数">↻${attemptIndex}</span>`;
-  }
-
+  const infoHtml = `<span style="color: ${infoColor};">${escapeHtml(infoDisplay)}</span>`;
   const activeRequestId = Number(req?.id);
 
   if (!req?.debug_log_available || !Number.isFinite(activeRequestId) || activeRequestId <= 0) {
@@ -330,17 +326,47 @@ function buildChannelTrigger(channelId, channelName, baseURL = '') {
 
 function buildActiveRequestChannelDisplay(req) {
   if (!req.channel_id || !req.channel_name) {
-    return '<span style="color: var(--neutral-500);">选择中...</span>';
+    return '<span style="color: var(--neutral-500);">-</span>';
   }
 
   const channelHtml = buildChannelTrigger(req.channel_id, req.channel_name, req.base_url || '');
-  const multiplier = Number(req.cost_multiplier);
-  if (!Number.isFinite(multiplier) || multiplier < 0 || Math.abs(multiplier - 1) < 1e-9) {
-    return channelHtml;
-  }
+  return buildLogChannelCell(channelHtml, req.cost_multiplier, req.upstream_websocket);
+}
 
-  const multiplierText = `${Number(multiplier.toFixed(2)).toString()}x`;
-  return `<span class="log-channel-cell">${channelHtml}<sup class="log-channel-multiplier-badge">${multiplierText}</sup></span>`;
+function activeRequestStatusLabel(req) {
+  switch (req?.upstream_status) {
+    case 'receiving':
+      return t('logs.upstreamStatusReceiving');
+    case 'retrying':
+      return t('logs.upstreamStatusRetrying');
+    case 'requesting':
+      return t('logs.upstreamStatusRequesting');
+    default:
+      return '-';
+  }
+}
+
+function buildActiveRequestStatusHtml(req) {
+  return `<span class="status-pending active-upstream-status">${escapeHtml(activeRequestStatusLabel(req))}</span>`;
+}
+
+function buildLogChannelCell(channelHtml, multiplierValue, upstreamWebsocket) {
+  const badges = [];
+  if (upstreamWebsocket === true) {
+    badges.push('<sup class="log-channel-badge log-channel-websocket-badge">ws</sup>');
+  }
+  const multiplier = Number(multiplierValue);
+  if (Number.isFinite(multiplier) && multiplier >= 0 && Math.abs(multiplier - 1) >= 1e-9) {
+    const multiplierText = formatMultiplierText(multiplier);
+    badges.push(`<sup class="log-channel-badge log-channel-multiplier-badge">${multiplierText}</sup>`);
+  }
+  if (badges.length === 0) return channelHtml;
+
+  return `<span class="log-channel-cell">${channelHtml}<span class="log-channel-badges">${badges.join('')}</span></span>`;
+}
+
+function formatMultiplierText(multiplier) {
+  return `${Number(multiplier.toFixed(2)).toString()}x`;
 }
 
 function buildLogChannelDisplay(entry) {
@@ -355,13 +381,7 @@ function buildLogChannelDisplay(entry) {
   }
 
   const channelHtml = buildChannelTrigger(entry.channel_id, entry.channel_name || '', entry.base_url || '');
-  const multiplier = Number(entry.cost_multiplier);
-  if (!Number.isFinite(multiplier) || multiplier < 0 || Math.abs(multiplier - 1) < 1e-9) {
-    return channelHtml;
-  }
-
-  const multiplierText = `${Number(multiplier.toFixed(2)).toString()}x`;
-  return `<span class="log-channel-cell">${channelHtml}<sup class="log-channel-multiplier-badge">${multiplierText}</sup></span>`;
+  return buildLogChannelCell(channelHtml, entry.cost_multiplier, entry.upstream_websocket);
 }
 // 生成流式标志HTML（公共函数，避免重复）
 function getStreamFlagHtml(isStreaming) {
@@ -520,7 +540,8 @@ function renderLogSourceBadge(logSource) {
 }
 
 function canInspectDebugLog(entry) {
-  return Number(entry?.channel_id) > 0;
+  const isTokenSession = typeof window.isAPITokenRole === 'function' && window.isAPITokenRole();
+  return !isTokenSession && Number(entry?.channel_id) > 0;
 }
 
 function buildLogMessageContent(entry) {
@@ -541,39 +562,76 @@ function buildLogMessageContent(entry) {
   return `${sourceBadge}${inner}`;
 }
 
-function buildLogCostDisplay(entry) {
+function getLogCostInfo(entry) {
   const standardCost = Number(entry?.cost) || 0;
-  if (standardCost <= 0) return '';
+  if (standardCost <= 0) return null;
 
   const rawMultiplier = Number(entry?.cost_multiplier);
   const multiplier = (Number.isFinite(rawMultiplier) && rawMultiplier >= 0) ? rawMultiplier : 1;
-  const effectiveCost = standardCost * multiplier;
-  const hasMultiplier = Math.abs(effectiveCost - standardCost) >= 1e-9;
+  const responseEffectiveCost = Number(entry?.effective_cost);
+  const effectiveCost = Number.isFinite(responseEffectiveCost)
+    ? responseEffectiveCost
+    : standardCost * multiplier;
+
+  return getCostDisplayInfo(standardCost, effectiveCost);
+}
+
+function formatLogCostFormulaValue(value) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric) || numeric === 0) return '$0';
+  return `$${numeric.toFixed(9).replace(/\.?0+$/, '')}`;
+}
+
+function buildLogCostTooltip(entry, costInfo) {
+  const breakdown = entry?.cost_breakdown;
+  if (!costInfo || !breakdown) return '';
+
+  const components = [
+    ['logs.costTooltipInput', breakdown.input],
+    ['logs.costTooltipOutput', breakdown.output],
+    ['logs.costTooltipCacheRead', breakdown.cache_read],
+    ['logs.costTooltipCacheWrite', breakdown.cache_write]
+  ];
+  return components.map(([labelKey, component]) => t('logs.costTooltipLine', {
+    label: t(labelKey),
+    price: formatLogCostFormulaValue(component?.price_per_million),
+    quantity: (Number(component?.quantity) || 0).toLocaleString(),
+    cost: formatLogCostFormulaValue(component?.cost)
+  })).join('\n');
+}
+
+function buildLogCostDisplay(entry, costInfo = getLogCostInfo(entry)) {
+  if (!costInfo) return '';
+
   const badgeParts = [];
 
-  switch (entry?.service_tier) {
-    case 'priority':
-      badgeParts.push('<sup class="log-cost-badge log-cost-badge--priority">2x</sup>');
-      break;
-    case 'flex':
-      badgeParts.push('<sup class="log-cost-badge log-cost-badge--flex">0.5x</sup>');
-      break;
-    case 'fast':
-      badgeParts.push('<sup class="log-cost-badge log-cost-badge--fast">\u26A16x</sup>');
-      break;
+  const tierMultiplier = Number(entry?.cost_breakdown?.service_tier_multiplier);
+  if (Number.isFinite(tierMultiplier) && tierMultiplier > 0 && Math.abs(tierMultiplier - 1) >= 1e-9) {
+    const multiplierText = formatMultiplierText(tierMultiplier);
+    switch (entry?.service_tier) {
+      case 'priority':
+        badgeParts.push(`<sup class="log-cost-badge log-cost-badge--priority">${multiplierText}</sup>`);
+        break;
+      case 'flex':
+        badgeParts.push(`<sup class="log-cost-badge log-cost-badge--flex">${multiplierText}</sup>`);
+        break;
+      case 'fast':
+        badgeParts.push(`<sup class="log-cost-badge log-cost-badge--fast">\u26A1${multiplierText}</sup>`);
+        break;
+    }
   }
 
   const badgesHtml = badgeParts.length
     ? `<span class="log-cost-badges">${badgeParts.join('')}</span>`
     : '';
-  const costClasses = `log-cost${hasMultiplier ? ' log-cost--with-multiplier' : ''}${badgeParts.length ? ' log-cost--with-badges' : ''}`;
+  const costClasses = `log-cost${costInfo.hasMultiplier ? ' log-cost--with-multiplier' : ''}${badgeParts.length ? ' log-cost--with-badges' : ''}`;
   const openingTag = `<span class="${costClasses}">`;
 
-  if (!hasMultiplier) {
-    return `${openingTag}${badgesHtml}<span class="log-cost-effective">${formatCost(standardCost)}</span></span>`;
+  if (!costInfo.hasMultiplier) {
+    return `${openingTag}${badgesHtml}<span class="log-cost-effective">${formatCost(costInfo.standardCost)}</span></span>`;
   }
 
-  return `${openingTag}${badgesHtml}<span class="log-cost-standard">${formatCost(standardCost)}</span><span class="log-cost-effective">${formatCost(effectiveCost)}</span></span>`;
+  return `${openingTag}${badgesHtml}<span class="log-cost-standard">${formatCost(costInfo.standardCost)}</span><span class="log-cost-effective">${formatCost(costInfo.effectiveCost)}</span></span>`;
 }
 
 function formatDebugSettingValue(setting) {
@@ -643,7 +701,7 @@ async function load(skipLoading = false) {
     }
 
     const params = buildLogsRequestParams();
-    const response = await fetchAPIWithAuth('/admin/logs?' + params.toString());
+    const response = await fetchAPIWithAuth('/dashboard/logs?' + params.toString());
     if (!response.success) throw new Error(response.error || '无法加载请求日志');
 
     const data = response.data || [];
@@ -710,7 +768,7 @@ function filterActiveRequests(requests) {
   const model = normalizeLogsFilterValue(filters.model);
   const channelNameExact = filters.channelNameExact;
   const modelExact = filters.modelExact;
-  const channelType = (document.getElementById('f_channel_type')?.value || '').trim();
+  const clientProtocol = normalizeLogsFilterValue(filters.clientProtocol);
   const tokenId = (document.getElementById('f_auth_token')?.value || '').trim();
 
   return requests.filter(req => {
@@ -722,11 +780,7 @@ function filterActiveRequests(requests) {
       const reqModel = normalizeLogsFilterValue(req.model || '');
       if (modelExact ? reqModel !== model : !reqModel.includes(model)) return false;
     }
-    // 渠道类型精确匹配（'all' 表示全部，不过滤）
-    if (channelType && channelType !== 'all') {
-      const reqType = (typeof req.channel_type === 'string' ? req.channel_type : '').toLowerCase();
-      if (reqType !== channelType.toLowerCase()) return false;
-    }
+    if (clientProtocol && normalizeLogsFilterValue(req.client_protocol) !== clientProtocol) return false;
     // 令牌ID精确匹配
     if (tokenId) {
       if (req.token_id === undefined || req.token_id === null || req.token_id === 0) return false;
@@ -757,7 +811,9 @@ function handleActiveRequestsData(rawActiveRequests) {
 
   // 筛选条件不匹配时跳过
   const hours = (document.getElementById('f_hours')?.value || '').trim();
-  const status = (document.getElementById('f_status')?.value || '').trim();
+  const status = logsStatusCombobox
+    ? String(logsStatusCombobox.getValue() || '').trim()
+    : (document.getElementById('f_status')?.value || '').trim();
   const logSource = (document.getElementById('f_log_source')?.value || 'proxy').trim();
   if (shouldSkipActiveRequestsFetch(hours, status, logSource)) {
     clearActiveRequestsRows();
@@ -822,6 +878,7 @@ function renderActiveRequests(activeRequests) {
     const durationDisplay = startMs ? buildActiveRequestTimingHtml(req, elapsedRaw, elapsed) : '-';
 
     const channelDisplay = buildActiveRequestChannelDisplay(req);
+    const statusDisplay = buildActiveRequestStatusHtml(req);
     const modelDisplay = buildLogModelDisplay(req.model, '', req.thinking_effort, req.reasoning_tokens);
     const tokenDescDisplay = buildActiveRequestTokenDescDisplay(req);
     const tokenDescCellClass = `logs-col-token-desc${tokenDescDisplay ? '' : ' mobile-empty-cell'}`;
@@ -842,6 +899,10 @@ function renderActiveRequests(activeRequests) {
       if (timingCell) timingCell.innerHTML = `${durationDisplay} ${streamFlag}`;
       const channelCell = existingRow.querySelector('.logs-col-channel');
       if (channelCell) channelCell.innerHTML = channelDisplay;
+      const statusCell = existingRow.querySelector('.logs-col-status');
+      if (statusCell) statusCell.innerHTML = statusDisplay;
+      const compactStatus = existingRow.querySelector('.active-upstream-status');
+      if (compactStatus && !statusCell) compactStatus.textContent = activeRequestStatusLabel(req);
       const msgCell = existingRow.querySelector('.logs-col-message');
       if (msgCell) msgCell.innerHTML = infoContent;
     } else {
@@ -852,7 +913,7 @@ function renderActiveRequests(activeRequests) {
       if (totalCols < 8) {
         row.innerHTML = `
             <td colspan="${totalCols}">
-              <span class="status-pending">进行中</span>
+              ${statusDisplay}
               <span style="margin-left: 8px;">${formatTime(req.start_time)}</span>
               <span class="logs-mono-text" style="margin-left: 8px;" title="${escapeHtml(req.client_ip || '')}">${escapeHtml(maskIP(req.client_ip) || '-')}</span>
               <span style="margin-left: 8px;">${modelDisplay}</span>
@@ -868,7 +929,7 @@ function renderActiveRequests(activeRequests) {
             <td class="logs-col-api-key" data-mobile-label="${logMobileLabels.apiKey}" style="text-align: center; white-space: nowrap;">${keyDisplay}</td>
             <td class="logs-col-channel" data-mobile-label="${logMobileLabels.channel}" style="text-align: left;">${channelDisplay}</td>
             <td class="logs-col-model" data-mobile-label="${logMobileLabels.model}">${modelDisplay}</td>
-            <td class="logs-col-status" data-mobile-label="${logMobileLabels.status}"><span class="status-pending">进行中</span></td>
+            <td class="logs-col-status" data-mobile-label="${logMobileLabels.status}">${statusDisplay}</td>
             <td class="logs-col-timing" data-mobile-label="${logMobileLabels.timing}" style="text-align: right; white-space: nowrap;">${durationDisplay} ${streamFlag}</td>
             <td class="logs-col-speed mobile-empty-cell" data-mobile-label="${logMobileLabels.speed}" style="text-align: right; white-space: nowrap;"></td>
             <td class="logs-col-input mobile-empty-cell" data-mobile-label="${logMobileLabels.input}" style="text-align: right; white-space: nowrap;"></td>
@@ -961,17 +1022,6 @@ function renderLogs(data) {
       'status-success' : 'status-error';
     const statusCode = entry.status_code;
 
-    // 2.5. 重试尝试次数角标（attempt_index>1 表示该请求发生过重试）
-    const attemptBadge = (Number(entry.attempt_index) > 1)
-      ? ` <sup class="logs-attempt-badge" style="color: var(--warning-600); font-weight: 600;" title="第 ${entry.attempt_index} 次尝试（已重试）">↻${entry.attempt_index}</sup>`
-      : '';
-
-    // 2.6. 最终结果角标（is_final=该请求链的最后一条；按状态码区分成功/失败）
-    const finalStatusOk = entry.status_code >= 200 && entry.status_code < 300;
-    const finalBadge = entry.is_final
-      ? ` <sup class="logs-final-badge" style="color: ${finalStatusOk ? 'var(--success-600)' : 'var(--error-600)'}; font-weight: 700;" title="该请求的最终结果（${finalStatusOk ? '成功' : '失败'}）">终</sup>`
-      : '';
-
     // 3. 模型显示（支持重定向与思考等级角标）
     const modelDisplay = buildLogModelDisplay(entry.model, entry.actual_model, entry.thinking_effort, entry.reasoning_tokens);
 
@@ -1012,7 +1062,7 @@ function renderLogs(data) {
       const deleteBtnIcon = `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true" focusable="false"><path d="M3 6H21" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/><path d="M8 6V4H16V6" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/><path d="M19 6L18 20H6L5 6" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/><path d="M10 11V17" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/><path d="M14 11V17" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>`;
       let buttons = '';
       if (showTestBtn) {
-        buttons += `<button class="test-key-btn" data-action="test" data-channel-id="${entry.channel_id}" data-channel-name="${attr(entry.channel_name)}" data-api-key="${attr(entry.api_key_used)}" data-api-key-hash="${keyHashAttr}" data-model="${attr(entry.model)}" title="测试此 API Key">${testBtnIcon}</button>`;
+        buttons += `<button class="test-key-btn" data-action="test" data-channel-id="${entry.channel_id}" data-channel-name="${attr(entry.channel_name)}" data-api-key="${attr(entry.api_key_used)}" data-api-key-hash="${keyHashAttr}" data-model="${attr(entry.model)}" data-client-protocol="${attr(entry.client_protocol)}" title="测试此 API Key">${testBtnIcon}</button>`;
       }
       if (showDeleteBtn) {
         buttons += `<button class="test-key-btn" style="color: var(--error-600);" data-action="delete" data-channel-id="${entry.channel_id}" data-channel-name="${attr(entry.channel_name)}" data-api-key="${attr(entry.api_key_used)}" data-api-key-hash="${keyHashAttr}" title="删除此 API Key">${deleteBtnIcon}</button>`;
@@ -1058,7 +1108,10 @@ function renderLogs(data) {
     }
 
     // 7. 成本显示
-    const costDisplay = buildLogCostDisplay(entry);
+    const costInfo = getLogCostInfo(entry);
+    const costDisplay = buildLogCostDisplay(entry, costInfo);
+    const costTitle = buildLogCostTooltip(entry, costInfo);
+    const costTitleAttr = costTitle ? ` title="${escapeHtml(costTitle)}"` : '';
     const cacheUtilDisplay = formatCacheUtilRate(
       entry.input_tokens,
       entry.cache_read_input_tokens,
@@ -1074,7 +1127,7 @@ function renderLogs(data) {
           <td class="logs-col-api-key" data-mobile-label="${logMobileLabels.apiKey}" style="text-align: center; white-space: nowrap;">${apiKeyDisplay}</td>
           <td class="logs-col-channel" data-mobile-label="${logMobileLabels.channel}" style="text-align: left;">${configDisplay}</td>
           <td class="logs-col-model" data-mobile-label="${logMobileLabels.model}">${modelDisplay}</td>
-          <td class="logs-col-status" data-mobile-label="${logMobileLabels.status}"><span class="${statusClass}">${statusCode}${attemptBadge}${finalBadge}</span></td>
+          <td class="logs-col-status" data-mobile-label="${logMobileLabels.status}"><span class="${statusClass}">${statusCode}</span></td>
           <td class="logs-col-timing" data-mobile-label="${logMobileLabels.timing}" style="text-align: right; white-space: nowrap;">${responseTimingDisplay}</td>
           <td class="logs-col-speed${speedDisplay ? '' : ' mobile-empty-cell'}" data-mobile-label="${logMobileLabels.speed}" style="text-align: right; white-space: nowrap;">${speedDisplay}</td>
           <td class="logs-col-input${inputTokensDisplay ? '' : ' mobile-empty-cell'}" data-mobile-label="${logMobileLabels.input}" style="text-align: right; white-space: nowrap;">${inputTokensDisplay}</td>
@@ -1082,7 +1135,7 @@ function renderLogs(data) {
           <td class="logs-col-cache-read${cacheReadDisplay ? '' : ' mobile-empty-cell'}" data-mobile-label="${logMobileLabels.cacheRead}" style="text-align: right; white-space: nowrap;">${cacheReadDisplay}</td>
           <td class="logs-col-cache-write${cacheCreationDisplay ? '' : ' mobile-empty-cell'}" data-mobile-label="${logMobileLabels.cacheWrite}" style="text-align: right; white-space: nowrap;">${cacheCreationDisplay}</td>
           <td class="logs-col-cache-util${cacheUtilDisplay ? '' : ' mobile-empty-cell'}" data-mobile-label="${logMobileLabels.cacheUtil}" style="text-align: right; white-space: nowrap;">${cacheUtilDisplay}</td>
-          <td class="logs-col-cost${costDisplay ? '' : ' mobile-empty-cell'}" data-mobile-label="${logMobileLabels.cost}" style="text-align: right; white-space: nowrap;">${costDisplay}</td>
+          <td class="logs-col-cost${costDisplay ? '' : ' mobile-empty-cell'}" data-mobile-label="${logMobileLabels.cost}"${costTitleAttr} style="text-align: right; white-space: nowrap;">${costDisplay}</td>
           <td class="logs-col-message${messageContent ? '' : ' mobile-empty-cell'}" data-mobile-label="${logMobileLabels.message}" style="max-width: 300px; word-break: break-word;">${messageContent}</td>
         </tr>`;
   }
@@ -1211,7 +1264,6 @@ async function resetLogsFilters() {
   const defaults = getDefaultLogsFilters();
 
   currentLogsCustomTimeRange = null;
-  currentChannelType = defaults.channelType || 'all';
   currentLogsPage = 1;
   totalLogsPages = 1;
   rememberExactLogsFilters({
@@ -1221,7 +1273,7 @@ async function resetLogsFilters() {
   });
 
   applyLogsFilterValues(defaults);
-  await loadLogsModels(currentChannelType, defaults.range || 'today');
+  await loadLogsFilterOptions(defaults.range || 'today');
   await syncLogSourceVisibility();
 
   window.persistFilterState({
@@ -1239,8 +1291,8 @@ async function resetLogsFilters() {
 function applyLogsFilterValues(filters) {
   window.applyFilterControlValues(filters, {
     range: 'f_hours',
+    clientProtocol: 'f_client_protocol',
     logSource: 'f_log_source',
-    status: 'f_status',
     authToken: 'f_auth_token'
   });
 
@@ -1254,9 +1306,10 @@ function applyLogsFilterValues(filters) {
     logsModelCombobox.setValue(filters.model || '', filters.model || t('trend.allModels'));
   }
 
-  currentChannelType = filters.channelType || 'all';
-  const channelTypeEl = document.getElementById('f_channel_type');
-  if (channelTypeEl) channelTypeEl.value = currentChannelType;
+  if (logsStatusCombobox && filters.status !== undefined) {
+    logsStatusCombobox.setValue(filters.status || '', filters.status || t('logs.allStatusCodes'));
+  }
+
 }
 
 function getLogSourceFilterElements() {
@@ -1280,6 +1333,12 @@ async function syncLogSourceVisibility(preloadedIntervalHours) {
   const { group, select } = getLogSourceFilterElements();
   if (!group || !select) return false;
 
+  if (window.isAPITokenRole()) {
+    group.hidden = true;
+    select.value = 'proxy';
+    return false;
+  }
+
   let scheduledCheckEnabledByConfig = false;
   if (preloadedIntervalHours !== undefined) {
     // 预加载路径：跳过 fetch，直接使用 bootstrap 数据
@@ -1301,27 +1360,30 @@ async function syncLogSourceVisibility(preloadedIntervalHours) {
   return scheduledCheckEnabledByConfig;
 }
 
-async function loadLogsModels(channelType, range) {
+async function loadLogsFilterOptions(range) {
   try {
     const params = new URLSearchParams();
-    const ct = channelType || currentChannelType || 'all';
     const r = range || document.getElementById('f_hours')?.value || 'today';
     appendLogsTimeRangeParams(params, { range: r });
-    if (ct && ct !== 'all') params.set('channel_type', ct);
-    const resp = await fetchDataWithAuth('/admin/models?' + params.toString()) || {};
+    const resp = await fetchDataWithAuth('/dashboard/models?' + params.toString()) || {};
     const rawModels = Array.isArray(resp.models) ? resp.models : [];
     const rawChannels = Array.isArray(resp.channels) ? resp.channels : [];
+    const rawStatusCodes = Array.isArray(resp.status_codes) ? resp.status_codes : [];
 
     window.availableLogsModels = [...new Set(rawModels)];
     window.logsChannels = rawChannels;
+    window.availableLogsStatusCodes = [...new Set(rawStatusCodes
+      .map(Number)
+      .filter(code => Number.isInteger(code) && code >= 100 && code <= 999))];
     if (logsChannelNameCombobox) logsChannelNameCombobox.refresh();
     if (logsModelCombobox) logsModelCombobox.refresh();
+    if (logsStatusCombobox) logsStatusCombobox.refresh();
   } catch (error) {
-    console.error('加载模型列表失败:', error);
+    console.error('加载日志筛选选项失败:', error);
   }
 }
 
-// 从日志/活跃请求数据中提取渠道名与模型，去重合并进筛选下拉。
+// 从日志/活跃请求数据中提取渠道名与请求模型，去重合并进筛选下拉。
 // 根因：/admin/models 的 distinct 查询滞后于刚落库或进行中的请求，
 // 导致列表里能看到的渠道/模型在下拉里缺失，必须刷新页面才更新。
 // 此处做到“所见即可筛选”，无需刷新。
@@ -1332,6 +1394,8 @@ function mergeLogsFilterOptions(entries) {
   const knownNames = new Set(channels.map(ch => ch && ch.name).filter(Boolean));
   const models = Array.isArray(window.availableLogsModels) ? window.availableLogsModels : [];
   const knownModels = new Set(models);
+  const statusCodes = Array.isArray(window.availableLogsStatusCodes) ? window.availableLogsStatusCodes : [];
+  const knownStatusCodes = new Set(statusCodes);
   let changed = false;
 
   for (const entry of entries) {
@@ -1341,21 +1405,27 @@ function mergeLogsFilterOptions(entries) {
       channels.push({ id: Number(entry?.channel_id) || 0, name });
       changed = true;
     }
-    for (const raw of [entry?.model, entry?.actual_model]) {
-      const m = String(raw || '').trim();
-      if (m && !knownModels.has(m)) {
-        knownModels.add(m);
-        models.push(m);
-        changed = true;
-      }
+    const model = String(entry?.model || '').trim();
+    if (model && !knownModels.has(model)) {
+      knownModels.add(model);
+      models.push(model);
+      changed = true;
+    }
+    const statusCode = Number(entry?.status_code);
+    if (Number.isInteger(statusCode) && statusCode >= 100 && statusCode <= 999 && !knownStatusCodes.has(statusCode)) {
+      knownStatusCodes.add(statusCode);
+      statusCodes.push(statusCode);
+      changed = true;
     }
   }
 
   if (!changed) return;
   window.logsChannels = channels;
   window.availableLogsModels = models;
+  window.availableLogsStatusCodes = statusCodes.sort((a, b) => a - b);
   if (logsChannelNameCombobox) logsChannelNameCombobox.refresh();
   if (logsModelCombobox) logsModelCombobox.refresh();
+  if (logsStatusCombobox) logsStatusCombobox.refresh();
 }
 
 function initLogsChannelNameCombobox(initialValue) {
@@ -1400,6 +1470,26 @@ function initLogsModelCombobox(initialValue) {
   });
 }
 
+function initLogsStatusCombobox(initialValue) {
+  if (typeof window.createSearchableCombobox !== 'function') return;
+  if (!document.getElementById('f_status')) return;
+  logsStatusCombobox = window.createSearchableCombobox({
+    inputId: 'f_status',
+    dropdownId: 'f_status_dropdown',
+    attachMode: true,
+    initialValue: initialValue || '',
+    initialLabel: initialValue || t('logs.allStatusCodes'),
+    commitEmptyAsFirst: true,
+    getOptions: () => [
+      { value: '', label: t('logs.allStatusCodes') },
+      ...(window.availableLogsStatusCodes || []).map(code => ({ value: String(code), label: String(code) }))
+    ],
+    onSelect: () => {
+      applyFilter();
+    }
+  });
+}
+
 async function initFilters(restoredFilters, preloaded) {
   const range = restoredFilters.range || 'today';
   const authToken = restoredFilters.authToken || '';
@@ -1419,14 +1509,19 @@ async function initFilters(restoredFilters, preloaded) {
       }
       currentLogsPage = 1;
       totalLogsPages = 1;
-      await loadLogsModels(currentChannelType, nextRange);
+      await loadLogsFilterOptions(nextRange);
       applyFilter();
     }
   });
 
   initLogsChannelNameCombobox(restoredFilters.channelName || '');
   initLogsModelCombobox(restoredFilters.model || '');
+  initLogsStatusCombobox(restoredFilters.status || '');
   applyLogsFilterValues(restoredFilters);
+  const clientProtocolSelect = document.getElementById('f_client_protocol');
+  if (clientProtocolSelect) {
+    clientProtocolSelect.addEventListener('change', applyFilter);
+  }
   // 并行化：三个独立网络请求同时发起（高 RTT 环境下节省 ~2 个往返延迟）
   // 若有 preloaded 数据则跳过对应的网络请求
   const [, tokens] = await Promise.all([
@@ -1444,7 +1539,7 @@ async function initFilters(restoredFilters, preloaded) {
       },
       ...(preloaded ? { preloadedTokens: preloaded.authTokens } : {})
     }),
-    preloaded ? Promise.resolve() : loadLogsModels(currentChannelType, range)
+    preloaded ? Promise.resolve() : loadLogsFilterOptions(range)
   ]);
   authTokens = tokens;
 
@@ -1455,8 +1550,8 @@ async function initFilters(restoredFilters, preloaded) {
 
   window.bindFilterApplyInputs({
     apply: applyFilter,
-    debounceInputIds: ['f_status'],
-    enterInputIds: ['f_hours', 'f_status', 'f_auth_token', 'f_channel_type', 'f_log_source']
+    debounceInputIds: [],
+    enterInputIds: ['f_hours', 'f_client_protocol', 'f_auth_token', 'f_log_source']
   });
 }
 
@@ -1642,6 +1737,7 @@ const LOGS_FILTER_FIELDS = [
       return false;
     }
   },
+  { key: 'clientProtocol', queryKeys: ['client_protocol'], defaultValue: '' },
   {
     key: 'channelName',
     queryKeys: ['channel_name', 'channel_name_like'],
@@ -1658,18 +1754,7 @@ const LOGS_FILTER_FIELDS = [
   },
   { key: 'logSource', queryKeys: ['log_source'], requestKey: 'log_source', defaultValue: 'proxy' },
   { key: 'status', queryKeys: ['status_code'], defaultValue: '' },
-  { key: 'authToken', queryKeys: ['auth_token_id'], defaultValue: '' },
-  {
-    key: 'channelType',
-    queryKeys: ['channel_type'],
-    defaultValue: 'all',
-    includeInQuery(value) {
-      return Boolean(value) && value !== 'all';
-    },
-    includeInRequest(value) {
-      return Boolean(value) && value !== 'all';
-    }
-  }
+  { key: 'authToken', queryKeys: ['auth_token_id'], defaultValue: '' }
 ];
 
 function getLogsFilters() {
@@ -1679,9 +1764,10 @@ function getLogsFilters() {
     : (logSourceSelect.value || 'proxy').trim();
   const model = logsModelCombobox ? logsModelCombobox.getValue() : (document.getElementById('f_model')?.value || '').trim();
   const channelName = logsChannelNameCombobox ? logsChannelNameCombobox.getValue() : (document.getElementById('f_name')?.value || '').trim();
+  const status = logsStatusCombobox ? logsStatusCombobox.getValue() : (document.getElementById('f_status')?.value || '').trim();
   const baseValues = window.readFilterControlValues({
     range: { id: 'f_hours', defaultValue: 'today', trim: true },
-    status: { id: 'f_status', trim: true },
+    clientProtocol: { id: 'f_client_protocol', trim: true },
     authToken: { id: 'f_auth_token', trim: true }
   });
   const hasCustomRange = baseValues.range === 'custom' && currentLogsCustomTimeRange;
@@ -1691,11 +1777,11 @@ function getLogsFilters() {
     customStartTime: hasCustomRange ? String(currentLogsCustomTimeRange.startMs) : '',
     customEndTime: hasCustomRange ? String(currentLogsCustomTimeRange.endMs) : '',
     model,
+    status,
     modelExact: isExactLogsModelFilter(model),
     channelName,
     channelNameExact: isExactLogsChannelNameFilter(channelName),
-    logSource,
-    channelType: document.getElementById('f_channel_type')?.value || 'all',
+    logSource
   };
 }
 
@@ -1738,29 +1824,12 @@ window.initPageBootstrap({
     channelNameExact: !hasUrlParams && savedFilters?.channelNameExact === true,
     modelExact: !hasUrlParams && savedFilters?.modelExact === true
   }, hasUrlParams ? u : null);
-  currentChannelType = restoredFilters.channelType || 'all';
-
-  // 构造 bootstrap 请求参数（和 loadLogsModels 一致）
+  // 构造 bootstrap 请求参数（和 loadLogsFilterOptions 一致）
   const bootstrapParams = new URLSearchParams();
   appendLogsTimeRangeParams(bootstrapParams, { range: restoredFilters.range || 'today' });
-  if (currentChannelType && currentChannelType !== 'all') {
-    bootstrapParams.set('channel_type', currentChannelType);
-  }
 
-  // Wave 1：channel-types（浏览器缓存）+ bootstrap（合并 5 个请求）
-  const [, bootstrap] = await Promise.all([
-    window.initChannelTypeFilter('f_channel_type', currentChannelType, async (value) => {
-      currentChannelType = value;
-      window.persistFilterState({
-        key: LOGS_FILTER_KEY,
-        getValues: getLogsFilters
-      });
-      currentLogsPage = 1;
-      await loadLogsModels(value);
-      load();
-    }),
-    fetchDataWithAuth('/admin/logs/bootstrap?' + bootstrapParams.toString()).catch(() => null)
-  ]);
+  // Wave 1：bootstrap 合并页面初始化请求
+  const bootstrap = await fetchDataWithAuth('/dashboard/logs/bootstrap?' + bootstrapParams.toString()).catch(() => null);
 
   // 从 bootstrap 数据应用设置（bootstrap 失败时各字段回退到原有 fetch 路径）
   if (bootstrap) {
@@ -1769,8 +1838,12 @@ window.initPageBootstrap({
     logChannelClickAction = clickAction === 'navigate' ? 'navigate' : 'edit';
     window.availableLogsModels = [...new Set(bootstrap.models || [])];
     window.logsChannels = bootstrap.channels || [];
+    window.availableLogsStatusCodes = [...new Set((bootstrap.status_codes || [])
+      .map(Number)
+      .filter(code => Number.isInteger(code) && code >= 100 && code <= 999))];
     if (logsChannelNameCombobox) logsChannelNameCombobox.refresh();
     if (logsModelCombobox) logsModelCombobox.refresh();
+    if (logsStatusCombobox) logsStatusCombobox.refresh();
   }
 
   // Wave 2：initFilters（有预加载则跳过内部 fetch）
@@ -1853,9 +1926,10 @@ window.initPageBootstrap({
       const apiKey = btn.dataset.apiKey || '';
       const apiKeyHash = btn.dataset.apiKeyHash || '';
       const model = btn.dataset.model || '';
+      const clientProtocol = btn.dataset.clientProtocol || 'anthropic';
 
       if (action === 'test') {
-        testKey(channelId, channelName, apiKey, model, apiKeyHash);
+        testKey(channelId, channelName, apiKey, model, apiKeyHash, clientProtocol);
       } else if (action === 'delete') {
         deleteKeyFromLog(channelId, channelName, apiKey, apiKeyHash);
       }
@@ -1894,7 +1968,7 @@ window.addEventListener('pageshow', async function (event) {
       }
 
       document.getElementById('f_hours').value = restoredFilters.range || 'today';
-      await loadLogsModels(restoredFilters.channelType || 'all', restoredFilters.range || 'today');
+      await loadLogsFilterOptions(restoredFilters.range || 'today');
       applyLogsFilterValues(restoredFilters);
       await syncLogSourceVisibility();
 
@@ -1908,14 +1982,14 @@ window.addEventListener('pageshow', async function (event) {
 // ========== API Key 测试功能 ==========
 let testingKeyData = null;
 
-async function testKey(channelId, channelName, apiKey, model, apiKeyHash = '') {
+async function testKey(channelId, channelName, apiKey, model, apiKeyHash = '', clientProtocol = 'anthropic') {
   testingKeyData = {
     channelId,
     channelName,
     maskedApiKey: apiKey,
     apiKeyHash,
     originalModel: model,
-    channelType: null, // 将在异步加载渠道配置后填充
+    clientProtocol,
     keyIndex: null
   };
 
@@ -1939,8 +2013,6 @@ async function testKey(channelId, channelName, apiKey, model, apiKeyHash = '') {
     ]);
     const apiKeys = apiKeysRaw || [];
 
-    // ✅ 保存渠道类型,用于后续测试请求
-    testingKeyData.channelType = channel.channel_type || 'anthropic';
     const { keyIndex: matchedIndex, matchCount, method } = await resolveKeyIndexForLogEntry(apiKeys, apiKey, apiKeyHash);
     testingKeyData.keyIndex = matchedIndex;
     if (apiKeys.length > 0) {
@@ -2045,7 +2117,7 @@ async function runKeyTest() {
       model: selectedModel,
       stream: streamEnabled,
       content: testContent,
-      channel_type: testingKeyData.channelType || 'anthropic' // ✅ 添加渠道类型
+      client_protocol: testingKeyData.clientProtocol || 'anthropic'
     };
     if (testingKeyData && testingKeyData.keyIndex !== null && testingKeyData.keyIndex !== undefined) {
       testRequest.key_index = testingKeyData.keyIndex;
@@ -2221,14 +2293,12 @@ function formatHeaderLines(headers) {
   return lines.join('\n');
 }
 
-function composeDebugRawRequest(data) {
+function composeDebugRequest(method, url, headerData, bodyData) {
   const parts = [];
-  const method = data.req_method || 'POST';
-  const url = data.req_url || '';
-  parts.push(`${method} ${url}`);
-  const headers = formatHeaderLines(data.req_headers);
+  parts.push(`${method || 'POST'} ${url || ''}`);
+  const headers = formatHeaderLines(headerData);
   if (headers) parts.push(headers);
-  const body = formatJsonSafe(data.req_body);
+  const body = formatJsonSafe(bodyData);
   if (body) {
     parts.push('');
     parts.push(body);
@@ -2236,27 +2306,98 @@ function composeDebugRawRequest(data) {
   return parts.join('\n');
 }
 
-function composeDebugRawResponse(data) {
+function composeDebugResponse(status, headerData, bodyData, upstreamError) {
   const parts = [];
-  if (data.resp_status) parts.push('HTTP ' + data.resp_status);
-  const headers = formatHeaderLines(data.resp_headers);
+  if (status) parts.push('HTTP ' + status);
+  if (upstreamError) {
+    if (!status) parts.push('UPSTREAM TRANSPORT ERROR (no HTTP response)');
+    parts.push(String(upstreamError));
+  }
+  const headers = formatHeaderLines(headerData);
   if (headers) parts.push(headers);
-  const body = formatJsonSafe(data.resp_body);
+  const body = formatJsonSafe(bodyData);
   if (body) {
     parts.push('');
     parts.push(body);
   }
   return parts.join('\n');
+}
+
+function composeDebugRawRequest(data) {
+  if (data?.protocol_transformed) {
+    return composeDebugRequest(data.req_method, data.original_req_url, data.original_req_headers, data.original_req_body);
+  }
+  return composeDebugRequest(data?.req_method, data?.req_url, data?.req_headers, data?.req_body);
+}
+
+function composeDebugRawResponse(data) {
+  return composeDebugResponse(data?.resp_status, data?.resp_headers, data?.resp_body, data?.upstream_error);
+}
+
+function composeDebugTranslatedRequest(data) {
+  return composeDebugRequest(data?.req_method, data?.req_url, data?.req_headers, data?.req_body);
+}
+
+function composeDebugTranslatedResponse(data) {
+  return composeDebugResponse(data?.translated_resp_status, data?.translated_resp_headers, data?.translated_resp_body);
+}
+
+function setDebugTabLabel(buttonId, key, fallback) {
+  const button = document.getElementById(buttonId);
+  if (!button) return;
+  button.dataset.i18n = key;
+  button.textContent = (typeof t === 'function' ? t(key) : '') || fallback;
+}
+
+function activateDebugTab(target) {
+  const modal = document.getElementById('debugLogModal');
+  if (!modal) return;
+  modal.querySelectorAll('.upstream-tab').forEach(tab => {
+    tab.classList.toggle('active', tab.dataset.tab === target);
+  });
+  modal.querySelectorAll('.upstream-tab-panel').forEach(panel => {
+    panel.classList.toggle('active', panel.dataset.tab === target);
+  });
+  updateDebugResponseActionButtons();
+}
+
+function configureDebugProtocolTabs(data) {
+  const transformed = !!data?.protocol_transformed;
+  const translatedRequestTab = document.getElementById('debugTranslatedRequestTabBtn');
+  const translatedResponseTab = document.getElementById('debugTranslatedResponseTabBtn');
+  if (translatedRequestTab) translatedRequestTab.hidden = !transformed;
+  if (translatedResponseTab) translatedResponseTab.hidden = !transformed;
+
+  setDebugTabLabel('debugRequestTabBtn', transformed ? 'logs.debugOriginalRequest' : 'logs.debugRequest', transformed ? '原始请求' : '请求');
+  setDebugTabLabel('debugTranslatedRequestTabBtn', 'logs.debugTranslatedRequest', '转换后请求');
+  setDebugTabLabel('debugResponseTabBtn', transformed ? 'logs.debugOriginalResponse' : 'logs.debugResponse', transformed ? '原始响应' : '响应');
+  setDebugTabLabel('debugTranslatedResponseTabBtn', 'logs.debugTranslatedResponse', '转换后响应');
+
+  const activeTab = document.querySelector('#debugLogModal .upstream-tab.active');
+  if (!activeTab || activeTab.hidden) activateDebugTab('request');
 }
 
 const ACTIVE_DEBUG_LOG_REFRESH_INTERVAL_MS = 1500;
 let activeDebugLogRefreshTimer = null;
 let activeDebugLogRefreshInFlight = false;
-let debugResponseMergedVisible = false;
 let debugLogWrapEnabled = true;
 let currentDebugLogData = null;
-let debugMergedSourceBody = null;
-let debugMergedLoading = false;
+const debugResponseViews = {
+  response: {
+    rawId: 'debugRespRaw',
+    mergedId: 'debugRespMerged',
+    bodyKey: 'resp_body'
+  },
+  'translated-response': {
+    rawId: 'debugTranslatedRespRaw',
+    mergedId: 'debugTranslatedRespMerged',
+    bodyKey: 'translated_resp_body'
+  }
+};
+const debugMergedStates = {
+  response: { visible: false, sourceBody: null, loading: false },
+  'translated-response': { visible: false, sourceBody: null, loading: false }
+};
 
 async function showDebugLogModal(logId) {
   return showDebugLogModalFromUrl(`/admin/debug-logs/${logId}`, { activeRequestId: 0 });
@@ -2285,17 +2426,12 @@ async function showDebugLogModalFromUrl(url, opts = {}) {
   content.style.display = 'none';
   setDebugLogStatus(null);
   currentDebugLogData = null;
-  debugMergedSourceBody = null;
-  debugMergedLoading = false;
   modal.classList.add('show');
 
   // Reset tabs
-  modal.querySelectorAll('.upstream-tab').forEach(tab => {
-    tab.classList.toggle('active', tab.dataset.tab === 'request');
-  });
-  document.getElementById('debugTabRequest').classList.add('active');
-  document.getElementById('debugTabResponse').classList.remove('active');
-  setDebugResponseMergedVisible(false);
+  configureDebugProtocolTabs(null);
+  activateDebugTab('request');
+  resetDebugMergedResponses();
   applyDebugLogWrapMode();
   updateDebugResponseActionButtons();
 
@@ -2316,9 +2452,12 @@ async function showDebugLogModalFromUrl(url, opts = {}) {
     loading.style.display = 'none';
     content.style.display = 'flex';
 
+    configureDebugProtocolTabs(data);
     window.setHighlightedCodeContent('debugReqRaw', composeDebugRawRequest(data), 'request');
+    window.setHighlightedCodeContent('debugTranslatedReqRaw', composeDebugTranslatedRequest(data), 'request');
     window.setHighlightedCodeContent('debugRespRaw', composeDebugRawResponse(data), 'response');
-    resetDebugMergedResponse();
+    window.setHighlightedCodeContent('debugTranslatedRespRaw', composeDebugTranslatedResponse(data), 'response');
+    resetDebugMergedResponses();
 
     // 如果是实时活跃请求，启动轮询
     const activeRequestId = Number(opts.activeRequestId);
@@ -2400,12 +2539,15 @@ async function refreshActiveDebugLogOnce(activeRequestId) {
 }
 
 function updateDebugLogContentPreserveScroll(data) {
+  configureDebugProtocolTabs(data);
   updateDebugPanePreserveScroll('debugReqRaw', composeDebugRawRequest(data), 'request');
+  updateDebugPanePreserveScroll('debugTranslatedReqRaw', composeDebugTranslatedRequest(data), 'request');
   updateDebugPanePreserveScroll('debugRespRaw', composeDebugRawResponse(data), 'response');
-  if (debugResponseMergedVisible) {
-    void refreshDebugMergedResponse(data);
-  } else if (String(data?.resp_body || '') !== String(debugMergedSourceBody || '')) {
-    resetDebugMergedResponse();
+  updateDebugPanePreserveScroll('debugTranslatedRespRaw', composeDebugTranslatedResponse(data), 'response');
+  for (const tab of Object.keys(debugResponseViews)) {
+    if (debugMergedStates[tab].visible) {
+      void refreshDebugMergedResponse(data, tab);
+    }
   }
 }
 
@@ -2457,8 +2599,7 @@ function closeDebugLogModal() {
   stopActiveDebugLogPolling();
   setDebugLogStatus(null);
   currentDebugLogData = null;
-  debugMergedSourceBody = null;
-  debugMergedLoading = false;
+  resetDebugMergedResponses();
   document.getElementById('debugLogModal').classList.remove('show');
 }
 
@@ -2476,6 +2617,9 @@ function applyDebugLogWrapMode() {
   document.querySelectorAll('#debugLogModal .upstream-pre').forEach(pre => {
     pre.classList.toggle('upstream-pre--nowrap', !debugLogWrapEnabled);
   });
+  document.querySelectorAll('#debugLogModal .upstream-merged-markdown').forEach(merged => {
+    merged.classList.toggle('upstream-merged-markdown--nowrap', !debugLogWrapEnabled);
+  });
   updateDebugWrapButton();
 }
 
@@ -2485,70 +2629,91 @@ function setDebugLogWrapEnabled(enabled) {
 }
 
 function updateDebugResponseActionButtons() {
-  const responseActive = !!document.getElementById('debugTabResponse')?.classList.contains('active');
+  const activeTab = document.querySelector('#debugLogModal .upstream-tab.active')?.dataset.tab || 'request';
+  const responseView = debugResponseViews[activeTab];
+  const mergedVisible = responseView ? debugMergedStates[activeTab].visible : false;
+  const copyTargets = {
+    request: 'debugReqRaw',
+    'translated-request': 'debugTranslatedReqRaw',
+    response: debugMergedStates.response.visible ? 'debugRespMerged' : 'debugRespRaw',
+    'translated-response': debugMergedStates['translated-response'].visible
+      ? 'debugTranslatedRespMerged'
+      : 'debugTranslatedRespRaw'
+  };
   const copyBtn = document.querySelector('#debugLogModal .upstream-copy-btn--tabs');
   if (copyBtn) {
-    copyBtn.dataset.copyTarget = responseActive
-      ? (debugResponseMergedVisible ? 'debugRespMerged' : 'debugRespRaw')
-      : 'debugReqRaw';
+    copyBtn.dataset.copyTarget = copyTargets[activeTab] || 'debugReqRaw';
   }
 
   const mergeBtn = document.getElementById('debugMergeBtn');
   if (mergeBtn) {
-    mergeBtn.hidden = !responseActive;
+    mergeBtn.hidden = !responseView;
+    const key = mergedVisible ? 'logs.debugRaw' : 'logs.debugMerge';
+    mergeBtn.classList.toggle('active', mergedVisible);
+    mergeBtn.setAttribute('aria-pressed', mergedVisible ? 'true' : 'false');
+    mergeBtn.dataset.i18n = key;
+    mergeBtn.textContent = (typeof t === 'function' ? t(key) : '') || (mergedVisible ? '原始' : '合并');
   }
 }
 
-function setDebugResponseMergedVisible(visible) {
-  debugResponseMergedVisible = !!visible;
+function activeDebugResponseTab() {
+  const tab = document.querySelector('#debugLogModal .upstream-tab.active')?.dataset.tab;
+  return debugResponseViews[tab] ? tab : '';
+}
 
-  const raw = document.getElementById('debugRespRaw');
-  const merged = document.getElementById('debugRespMerged');
-  if (raw) raw.hidden = debugResponseMergedVisible;
-  if (merged) merged.hidden = !debugResponseMergedVisible;
-
-  const mergeBtn = document.getElementById('debugMergeBtn');
-  if (mergeBtn) {
-    const key = debugResponseMergedVisible ? 'logs.debugRaw' : 'logs.debugMerge';
-    mergeBtn.classList.toggle('active', debugResponseMergedVisible);
-    mergeBtn.setAttribute('aria-pressed', debugResponseMergedVisible ? 'true' : 'false');
-    mergeBtn.dataset.i18n = key;
-    mergeBtn.textContent = (typeof t === 'function' ? t(key) : '') || (debugResponseMergedVisible ? '原始' : '合并');
-  }
-
+function setDebugResponseMergedVisible(visible, tab = activeDebugResponseTab()) {
+  const view = debugResponseViews[tab];
+  const state = debugMergedStates[tab];
+  if (!view || !state) return;
+  state.visible = !!visible;
+  const raw = document.getElementById(view.rawId);
+  const merged = document.getElementById(view.mergedId);
+  if (raw) raw.hidden = state.visible;
+  if (merged) merged.hidden = !state.visible;
   updateDebugResponseActionButtons();
 
-  if (debugResponseMergedVisible) {
-    void refreshDebugMergedResponse(currentDebugLogData);
+  if (state.visible) {
+    void refreshDebugMergedResponse(currentDebugLogData, tab);
   }
 }
 
-function resetDebugMergedResponse() {
-  debugMergedSourceBody = null;
-  debugMergedLoading = false;
-  window.MarkdownRenderer.renderResponse('debugRespMerged', { reasoning: '', content: '' });
+function resetDebugMergedResponses() {
+  for (const [tab, view] of Object.entries(debugResponseViews)) {
+    const state = debugMergedStates[tab];
+    state.visible = false;
+    state.sourceBody = null;
+    state.loading = false;
+    const raw = document.getElementById(view.rawId);
+    const merged = document.getElementById(view.mergedId);
+    if (raw) raw.hidden = false;
+    if (merged) merged.hidden = true;
+    window.MarkdownRenderer.renderResponse(view.mergedId, { reasoning: '', content: '' });
+  }
+  updateDebugResponseActionButtons();
 }
 
-async function refreshDebugMergedResponse(data) {
-  if (!data || debugMergedLoading) return;
-  const sourceBody = String(data.resp_body || '');
-  if (debugMergedSourceBody === sourceBody) return;
-  debugMergedLoading = true;
-  window.MarkdownRenderer.renderResponse('debugRespMerged', {
+async function refreshDebugMergedResponse(data, tab) {
+  const view = debugResponseViews[tab];
+  const state = debugMergedStates[tab];
+  if (!data || !view || !state || state.loading) return;
+  const sourceBody = String(data[view.bodyKey] || '');
+  if (state.sourceBody === sourceBody) return;
+  state.loading = true;
+  window.MarkdownRenderer.renderResponse(view.mergedId, {
     reasoning: '',
     content: (typeof t === 'function' ? t('common.loading') : '加载中...') || '加载中...',
   });
   try {
     const merged = await window.MergedResponseClient.mergeUpstreamResponse(sourceBody);
-    debugMergedSourceBody = sourceBody;
-    updateDebugPanePreserveScroll('debugRespMerged', merged, 'markdown');
+    state.sourceBody = sourceBody;
+    updateDebugPanePreserveScroll(view.mergedId, merged, 'markdown');
   } catch (e) {
-    window.MarkdownRenderer.renderResponse('debugRespMerged', {
+    window.MarkdownRenderer.renderResponse(view.mergedId, {
       reasoning: '',
       content: e?.message || '合并响应失败',
     });
   } finally {
-    debugMergedLoading = false;
+    state.loading = false;
   }
 }
 
@@ -2558,17 +2723,14 @@ if (typeof document !== 'undefined' && typeof document.addEventListener === 'fun
   document.addEventListener('click', (e) => {
     const tab = e.target.closest('#debugLogModal .upstream-tab');
     if (tab) {
-      const target = tab.dataset.tab;
-      document.querySelectorAll('#debugLogModal .upstream-tab').forEach(t => t.classList.toggle('active', t === tab));
-      document.getElementById('debugTabRequest').classList.toggle('active', target === 'request');
-      document.getElementById('debugTabResponse').classList.toggle('active', target === 'response');
-      updateDebugResponseActionButtons();
+      activateDebugTab(tab.dataset.tab);
       return;
     }
 
     const mergeBtn = e.target.closest('#debugLogModal [data-action="merge-debug-response"]');
     if (mergeBtn) {
-      setDebugResponseMergedVisible(!debugResponseMergedVisible);
+      const tab = activeDebugResponseTab();
+      if (tab) setDebugResponseMergedVisible(!debugMergedStates[tab].visible, tab);
       return;
     }
 
@@ -2584,12 +2746,12 @@ if (typeof document !== 'undefined' && typeof document.addEventListener === 'fun
       const pre = document.getElementById(targetId);
       if (!pre) return;
       const text = pre._rawText || pre.textContent || '';
-      navigator.clipboard.writeText(text).then(() => {
+      window.copyToClipboard(text).then(() => {
         const orig = copyBtn.textContent;
         copyBtn.textContent = '\u2713';
         copyBtn.classList.add('copied');
         setTimeout(() => { copyBtn.textContent = orig; copyBtn.classList.remove('copied'); }, 1500);
-      });
+      }).catch(() => {});
     }
   });
 }

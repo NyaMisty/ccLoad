@@ -18,7 +18,7 @@ import (
 //
 // 测试场景：
 //   - SQLite（本地）vs MySQL（远程）的读写延迟对比
-//   - 混合模式（读 SQLite + 写 MySQL）的性能表现
+//   - 混合模式请求热缓存、远程主库与本地 SQLite 的延迟对比
 //
 // 运行方式：
 //   go test -tags sonic -bench=BenchmarkHybrid -benchtime=3s ./internal/storage/...
@@ -78,11 +78,10 @@ func BenchmarkHybrid_ListConfigs_SQLite(b *testing.B) {
 	// 准备测试数据
 	for i := range 10 {
 		_, err := store.CreateConfig(ctx, &model.Config{
-			Name:        fmt.Sprintf("bench-channel-%d", i),
-			ChannelType: "openai",
-			URL:         "https://api.openai.com",
-			Priority:    100,
-			Enabled:     true,
+			Name:     fmt.Sprintf("bench-channel-%d", i),
+			URLs:     model.ChannelURLs{{URL: "https://api.openai.com"}},
+			Priority: 100,
+			Enabled:  true,
 		})
 		if err != nil {
 			b.Fatalf("创建渠道失败: %v", err)
@@ -115,6 +114,33 @@ func BenchmarkHybrid_ListConfigs_MySQL(b *testing.B) {
 		_, err := store.ListConfigs(ctx)
 		if err != nil {
 			b.Fatalf("ListConfigs 失败: %v", err)
+		}
+	}
+}
+
+func BenchmarkHybrid_ChannelCacheWarmRead(b *testing.B) {
+	store := createBenchSQLite(b)
+	ctx := context.Background()
+	for i := range 10 {
+		_, err := store.CreateConfig(ctx, &model.Config{
+			Name: fmt.Sprintf("cache-channel-%d", i), URLs: model.ChannelURLs{{URL: "https://api.openai.com"}},
+			Priority: 100, Enabled: true,
+			ModelEntries: []model.ModelEntry{{Model: "gpt-cache"}},
+		})
+		if err != nil {
+			b.Fatalf("创建渠道失败: %v", err)
+		}
+	}
+	cache := storage.NewChannelCache(store, time.Hour)
+	if _, err := cache.GetEnabledChannelsSnapshotByModel(ctx, "gpt-cache"); err != nil {
+		b.Fatalf("预热缓存失败: %v", err)
+	}
+
+	b.ResetTimer()
+	b.ReportAllocs()
+	for b.Loop() {
+		if _, err := cache.GetEnabledChannelsSnapshotByModel(ctx, "gpt-cache"); err != nil {
+			b.Fatalf("读取缓存失败: %v", err)
 		}
 	}
 }
@@ -283,11 +309,10 @@ func BenchmarkHybrid_ListConfigs_SQLite_Parallel(b *testing.B) {
 	// 准备测试数据
 	for i := range 10 {
 		_, _ = store.CreateConfig(ctx, &model.Config{
-			Name:        fmt.Sprintf("bench-parallel-%d", i),
-			ChannelType: "openai",
-			URL:         "https://api.openai.com",
-			Priority:    100,
-			Enabled:     true,
+			Name:     fmt.Sprintf("bench-parallel-%d", i),
+			URLs:     model.ChannelURLs{{URL: "https://api.openai.com"}},
+			Priority: 100,
+			Enabled:  true,
 		})
 	}
 
@@ -371,4 +396,82 @@ func BenchmarkHybrid_AddLog_MySQL_Parallel(b *testing.B) {
 			}
 		}
 	})
+}
+
+// ============================================================================
+// 首页统计查询基线（SQLite 大表）：按客户端协议聚合 vs 既有轻量统计
+// ============================================================================
+
+// seedProtocolStatsLogs 灌入 rows 行分布在最近 24h 的代理日志。
+func seedProtocolStatsLogs(b *testing.B, store storage.Store, rows int) (time.Time, time.Time) {
+	b.Helper()
+	ctx := context.Background()
+	end := time.Now()
+	start := end.Add(-24 * time.Hour)
+	protocols := []string{"anthropic", "openai", "codex", "gemini"}
+	models := []string{"claude-sonnet-5", "gpt-5.4", "gemini-3-pro", "qwen-plus"}
+
+	batch := make([]*model.LogEntry, 0, 1000)
+	flush := func() {
+		if len(batch) == 0 {
+			return
+		}
+		if err := store.BatchAddLogs(ctx, batch); err != nil {
+			b.Fatalf("BatchAddLogs 失败: %v", err)
+		}
+		batch = batch[:0]
+	}
+	step := 24 * time.Hour / time.Duration(rows)
+	for i := 0; i < rows; i++ {
+		status := 200
+		if i%17 == 0 {
+			status = 500
+		}
+		batch = append(batch, &model.LogEntry{
+			Time:           model.JSONTime{Time: start.Add(time.Duration(i) * step)},
+			Model:          models[i%len(models)],
+			LogSource:      "proxy",
+			ChannelID:      int64(1 + i%8),
+			StatusCode:     status,
+			Duration:       1.2,
+			ClientProtocol: protocols[i%len(protocols)],
+			InputTokens:    1200,
+			OutputTokens:   350,
+			Cost:           0.0042,
+			CostMultiplier: 1,
+		})
+		if len(batch) == cap(batch) {
+			flush()
+		}
+	}
+	flush()
+	return start, end
+}
+
+func BenchmarkClientProtocolStats_SQLite_200k(b *testing.B) {
+	store := createBenchSQLite(b)
+	start, end := seedProtocolStatsLogs(b, store, 200_000)
+	ctx := context.Background()
+
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		if _, err := store.GetClientProtocolStats(ctx, start, end, nil); err != nil {
+			b.Fatalf("GetClientProtocolStats 失败: %v", err)
+		}
+	}
+}
+
+func BenchmarkStatsLite_SQLite_200k(b *testing.B) {
+	store := createBenchSQLite(b)
+	start, end := seedProtocolStatsLogs(b, store, 200_000)
+	ctx := context.Background()
+
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		if _, err := store.GetStatsLite(ctx, start, end, nil); err != nil {
+			b.Fatalf("GetStatsLite 失败: %v", err)
+		}
+	}
 }

@@ -12,14 +12,18 @@
     let selectedAllowedModelIndices = new Set(); // 已选中的模型索引（批量删除用）
     let allChannels = [];                    // 渠道数据缓存
     let availableModelsCache = [];           // 可用模型缓存
-    let channelTypeDisplayNameMap = new Map(); // 渠道类型显示名缓存
-    let channelTypeDisplayNamesPromise = null; // 渠道类型显示名加载中的 Promise
+    let protocolDisplayNameMap = new Map(); // 协议显示名缓存
+    let protocolDisplayNamesPromise = null; // 协议显示名加载中的 Promise
     let selectedModelsForAdd = new Set();    // 模型选择对话框中已选的模型
     let currentVisibleModels = [];            // 当前可见的模型列表（用于全选功能）
     let editAllowedChannelIDs = [];           // 编辑模态框中当前的渠道限制列表
+    let editChannelRestrictionMode = 'allow'; // allow|deny
     let selectedAllowedChannelIDs = new Set(); // 已选中的渠道ID（批量删除用）
+    let currentAllowedChannelFilter = '';
+    let currentAllowedModelFilter = '';
     let selectedChannelsForAdd = new Set();   // 渠道选择对话框中已选的渠道ID
     let currentVisibleChannels = [];          // 当前可见的渠道列表（用于全选功能）
+    let initialEditExpiryState = { type: 'never', value: '' };
 
     // 对话框栈，用于 ESC 键层级关闭
     const modalStack = [];
@@ -79,7 +83,7 @@
 
       // 预加载渠道数据（用于模型选择）
       loadChannelsData();
-      ensureChannelTypeDisplayNameMap();
+      ensureProtocolDisplayNameMap();
 
       initPageActionDelegation();
 
@@ -89,6 +93,7 @@
       // 监听语言切换事件，重新渲染令牌相关动态内容
       window.i18n.onLocaleChange(() => {
         renderAllowedChannelsTable();
+        renderAllowedModelsTable();
         renderTokens();
       });
 
@@ -146,8 +151,11 @@
               actionTarget.value === 'custom' ? 'block' : 'none';
           },
           'toggle-select-all-allowed-channels': (actionTarget) => toggleSelectAllAllowedChannels(actionTarget.checked),
+          'change-channel-restriction-mode': (actionTarget) => {
+            editChannelRestrictionMode = normalizeChannelRestrictionMode(actionTarget.value);
+            updateChannelRestrictionModeUI();
+          },
           'toggle-select-all-channels': (actionTarget) => toggleSelectAllChannels(actionTarget.checked),
-          'filter-available-channel-type': () => filterAvailableChannels(document.getElementById('channelSearchInput')?.value || ''),
           'toggle-select-all-allowed-models': (actionTarget) => toggleSelectAllAllowedModels(actionTarget.checked),
           'toggle-select-all-models': (actionTarget) => toggleSelectAllModels(actionTarget.checked),
           'toggle-allowed-channel': (actionTarget) => {
@@ -166,6 +174,8 @@
         input: {
           'filter-available-channels': (actionTarget) => filterAvailableChannels(actionTarget.value),
           'filter-available-models': (actionTarget) => filterAvailableModels(actionTarget.value),
+          'filter-allowed-channels': (actionTarget) => filterAllowedChannels(actionTarget.value),
+          'filter-allowed-models': (actionTarget) => filterAllowedModels(actionTarget.value),
           'update-model-import-preview': () => updateModelImportPreview()
         }
       });
@@ -537,6 +547,19 @@
       return { value: parsed };
     }
 
+    function fillCostLimitField(inputId, usedDisplayId, limitUSD, usedUSD) {
+      const input = document.getElementById(inputId);
+      const usedDisplay = document.getElementById(usedDisplayId);
+      if (input) {
+        input.value = limitUSD || 0;
+      }
+      if (usedDisplay) {
+        const costUsed = Number(usedUSD);
+        const used = Number.isFinite(costUsed) ? costUsed : 0;
+        usedDisplay.textContent = `${t('tokens.costUsedPrefix')}: $${used.toFixed(4)}`;
+      }
+    }
+
     /**
      * 构建响应时间HTML
      */
@@ -623,6 +646,8 @@
     function showCreateModal() {
       document.getElementById('tokenDescription').value = '';
       document.getElementById('tokenExpiry').value = 'never';
+      document.getElementById('tokenDailyCostLimitUSD').value = 0;
+      document.getElementById('tokenMonthlyCostLimitUSD').value = 0;
       document.getElementById('tokenCostLimitUSD').value = 0;
       document.getElementById('tokenMaxConcurrency').value = 0;
       document.getElementById('tokenActive').checked = true;
@@ -657,9 +682,11 @@
         }
       }
       const isActive = document.getElementById('tokenActive').checked;
+      const dailyCostLimitUSD = parseFloat(document.getElementById('tokenDailyCostLimitUSD').value) || 0;
+      const monthlyCostLimitUSD = parseFloat(document.getElementById('tokenMonthlyCostLimitUSD').value) || 0;
       const costLimitUSD = parseFloat(document.getElementById('tokenCostLimitUSD').value) || 0;
       const maxConcurrencyResult = parseMaxConcurrencyInput(document.getElementById('tokenMaxConcurrency').value);
-      if (costLimitUSD < 0) {
+      if (dailyCostLimitUSD < 0 || monthlyCostLimitUSD < 0 || costLimitUSD < 0) {
         window.showNotification(t('tokens.msg.costLimitNegative'), 'error');
         return;
       }
@@ -674,7 +701,15 @@
           headers: {
             'Content-Type': 'application/json'
           },
-          body: JSON.stringify({ description, expires_at: expiresAt, is_active: isActive, cost_limit_usd: costLimitUSD, max_concurrency: maxConcurrency })
+          body: JSON.stringify({
+            description,
+            expires_at: expiresAt,
+            is_active: isActive,
+            cost_daily_limit_usd: dailyCostLimitUSD,
+            cost_monthly_limit_usd: monthlyCostLimitUSD,
+            cost_limit_usd: costLimitUSD,
+            max_concurrency: maxConcurrency
+          })
         });
 
         closeCreateModal();
@@ -713,25 +748,22 @@
       document.getElementById('editTokenValue').value = token.token || '';
       document.getElementById('editTokenDescription').value = token.description;
       document.getElementById('editTokenActive').checked = token.is_active;
+      const expiryTypeInput = document.getElementById('editTokenExpiry');
+      const customExpiryInput = document.getElementById('editCustomExpiry');
       if (!token.expires_at) {
-        document.getElementById('editTokenExpiry').value = 'never';
+        expiryTypeInput.value = 'never';
+        customExpiryInput.value = '';
         document.getElementById('editCustomExpiryContainer').style.display = 'none';
       } else {
-        document.getElementById('editTokenExpiry').value = 'custom';
+        expiryTypeInput.value = 'custom';
         document.getElementById('editCustomExpiryContainer').style.display = 'block';
-        const date = new Date(token.expires_at);
-        document.getElementById('editCustomExpiry').value = date.toISOString().slice(0, 16);
+        customExpiryInput.value = TokenExpiry.formatDateTimeLocal(token.expires_at);
       }
+      initialEditExpiryState = { type: expiryTypeInput.value, value: customExpiryInput.value };
 
-      // 初始化费用限额状态（2026-01新增）
-      const costLimitInput = document.getElementById('editCostLimitUSD');
-      const costUsedDisplay = document.getElementById('editCostUsedDisplay');
-      costLimitInput.value = token.cost_limit_usd || 0;
-
-      // 显示已消耗费用
-      const costUsed = token.cost_used_usd || 0;
-      
-      costUsedDisplay.textContent = costUsed > 0 ? `${t('tokens.costUsedPrefix')}: $${costUsed.toFixed(4)}` : '';
+      fillCostLimitField('editDailyCostLimitUSD', 'editDailyCostUsedDisplay', token.cost_daily_limit_usd, token.cost_daily_used_usd);
+      fillCostLimitField('editMonthlyCostLimitUSD', 'editMonthlyCostUsedDisplay', token.cost_monthly_limit_usd, token.cost_monthly_used_usd);
+      fillCostLimitField('editCostLimitUSD', 'editCostUsedDisplay', token.cost_limit_usd, token.cost_used_usd);
 
       const maxConcurrencyInput = document.getElementById('editMaxConcurrency');
       maxConcurrencyInput.value = token.max_concurrency || 0;
@@ -739,11 +771,21 @@
       // 初始化模型限制状态（2026-01新增）
       editAllowedModels = (token.allowed_models || []).slice();
       selectedAllowedModelIndices.clear();
+      currentAllowedModelFilter = '';
+      const allowedModelFilterInput = document.getElementById('allowedModelFilterInput');
+      if (allowedModelFilterInput) allowedModelFilterInput.value = '';
       renderAllowedModelsTable();
 
       // 初始化渠道限制状态（2026-04新增）
       editAllowedChannelIDs = (token.allowed_channel_ids || []).slice();
+      editChannelRestrictionMode = normalizeChannelRestrictionMode(token.channel_restriction_mode);
       selectedAllowedChannelIDs.clear();
+      currentAllowedChannelFilter = '';
+      const allowedChannelFilterInput = document.getElementById('allowedChannelFilterInput');
+      if (allowedChannelFilterInput) allowedChannelFilterInput.value = '';
+      const modeSelect = document.getElementById('editChannelRestrictionMode');
+      if (modeSelect) modeSelect.value = editChannelRestrictionMode;
+      updateChannelRestrictionModeUI();
       renderAllowedChannelsTable();
       if (allChannels.length === 0) {
         loadChannelsData().then(() => renderAllowedChannelsTable());
@@ -756,12 +798,20 @@
     function closeEditModal() {
       document.getElementById('editModal').style.display = 'none';
       document.getElementById('editTokenValue').value = '';
+      document.getElementById('editCustomExpiry').value = '';
       document.getElementById('editCustomExpiryContainer').style.display = 'none';
+      initialEditExpiryState = { type: 'never', value: '' };
       // 清理模型限制状态
       editAllowedModels = [];
       selectedAllowedModelIndices.clear();
+      currentAllowedModelFilter = '';
       editAllowedChannelIDs = [];
+      editChannelRestrictionMode = 'allow';
       selectedAllowedChannelIDs.clear();
+      currentAllowedChannelFilter = '';
+      const modeSelect = document.getElementById('editChannelRestrictionMode');
+      if (modeSelect) modeSelect.value = 'allow';
+      updateChannelRestrictionModeUI();
       popModal();
     }
 
@@ -771,9 +821,11 @@
       const description = document.getElementById('editTokenDescription').value.trim();
       const isActive = document.getElementById('editTokenActive').checked;
       const expiryType = document.getElementById('editTokenExpiry').value;
+      const dailyCostLimitUSD = parseFloat(document.getElementById('editDailyCostLimitUSD').value) || 0;
+      const monthlyCostLimitUSD = parseFloat(document.getElementById('editMonthlyCostLimitUSD').value) || 0;
       const costLimitUSD = parseFloat(document.getElementById('editCostLimitUSD').value) || 0;
       const maxConcurrencyResult = parseMaxConcurrencyInput(document.getElementById('editMaxConcurrency').value);
-      if (costLimitUSD < 0) {
+      if (dailyCostLimitUSD < 0 || monthlyCostLimitUSD < 0 || costLimitUSD < 0) {
         window.showNotification(t('tokens.msg.costLimitNegative'), 'error');
         return;
       }
@@ -782,10 +834,11 @@
         return;
       }
       const maxConcurrency = maxConcurrencyResult.value;
+      let customDate = '';
       let expiresAt = null;
       if (expiryType !== 'never') {
         if (expiryType === 'custom') {
-          const customDate = document.getElementById('editCustomExpiry').value;
+          customDate = document.getElementById('editCustomExpiry').value;
           if (!customDate) {
             window.showNotification(t('tokens.msg.selectExpiry'), 'error');
             return;
@@ -796,6 +849,11 @@
           expiresAt = Date.now() + days * 24 * 60 * 60 * 1000;
         }
       }
+      const expiryUpdate = TokenExpiry.buildUpdatePayload(
+        initialEditExpiryState,
+        { type: expiryType, value: customDate },
+        expiresAt
+      );
       try {
         await fetchDataWithAuth(`${API_BASE}/auth-tokens/${id}`, {
           method: 'PUT',
@@ -805,10 +863,13 @@
           body: JSON.stringify({
             description,
             is_active: isActive,
-            expires_at: expiresAt,
+            ...expiryUpdate,
             allowed_channel_ids: editAllowedChannelIDs,
+            channel_restriction_mode: normalizeChannelRestrictionMode(editChannelRestrictionMode),
             allowed_models: editAllowedModels,  // 2026-01新增：模型限制
-            cost_limit_usd: costLimitUSD,        // 2026-01新增：费用上限
+            cost_daily_limit_usd: dailyCostLimitUSD,
+            cost_monthly_limit_usd: monthlyCostLimitUSD,
+            cost_limit_usd: costLimitUSD,        // 总限额
             max_concurrency: maxConcurrency      // 2026-04新增：并发上限
           })
         });
@@ -868,15 +929,36 @@
       return Array.from(modelSet).sort();
     }
 
+    function normalizeChannelRestrictionMode(mode) {
+      return String(mode || '').toLowerCase() === 'deny' ? 'deny' : 'allow';
+    }
+
+    function updateChannelRestrictionModeUI() {
+      const suffix = document.getElementById('editChannelCountSuffix');
+      if (!suffix) return;
+      const key = editChannelRestrictionMode === 'deny'
+        ? 'tokens.channelCountSuffixDeny'
+        : 'tokens.channelCountSuffixAllow';
+      suffix.setAttribute('data-i18n', key);
+      suffix.textContent = t(key);
+    }
+
     function getAvailableModelsForCurrentChannelRestriction() {
       if (editAllowedChannelIDs.length === 0) {
         return availableModelsCache;
       }
 
-      const allowedChannelIDs = new Set(editAllowedChannelIDs);
+      const restrictedChannelIDs = new Set(editAllowedChannelIDs);
+      const deny = editChannelRestrictionMode === 'deny';
       const modelSet = new Set();
       allChannels.forEach(ch => {
-        if (!allowedChannelIDs.has(normalizeChannelID(ch.id))) return;
+        const id = normalizeChannelID(ch.id);
+        const inList = restrictedChannelIDs.has(id);
+        if (deny) {
+          if (inList) return;
+        } else if (!inList) {
+          return;
+        }
         (ch.models || []).forEach(m => {
           if (m.model) modelSet.add(m.model);
         });
@@ -895,13 +977,36 @@
 
     function getChannelDisplayName(channelID) {
       const channel = getChannelByID(channelID);
-      if (!channel) return `${t('common.unknown')} #${channelID}`;
-      return `${channel.name || t('common.unknown')} #${channel.id}`;
+      return channel?.name || t('common.unknown');
     }
 
-    function getChannelTypeText(channelID) {
-      const channel = getChannelByID(channelID);
-      return channel ? (channel.channel_type || '-') : '-';
+    function normalizeRestrictionFilter(value) {
+      return String(value || '').trim().toLowerCase();
+    }
+
+    function getVisibleAllowedChannelIDs() {
+      const filter = normalizeRestrictionFilter(currentAllowedChannelFilter);
+      if (!filter) return editAllowedChannelIDs;
+      return editAllowedChannelIDs.filter((channelID) =>
+        getChannelDisplayName(channelID).toLowerCase().includes(filter)
+      );
+    }
+
+    function getVisibleAllowedModelEntries() {
+      const entries = editAllowedModels.map((model, index) => ({ model, index }));
+      const filter = normalizeRestrictionFilter(currentAllowedModelFilter);
+      if (!filter) return entries;
+      return entries.filter(({ model }) => String(model).toLowerCase().includes(filter));
+    }
+
+    function filterAllowedChannels(searchText) {
+      currentAllowedChannelFilter = searchText;
+      renderAllowedChannelsTable();
+    }
+
+    function filterAllowedModels(searchText) {
+      currentAllowedModelFilter = searchText;
+      renderAllowedModelsTable();
     }
 
     function sortAllowedChannelIDs() {
@@ -919,8 +1024,8 @@
       const countSpan = document.getElementById('editAllowedChannelsCount');
       const selectAllCheckbox = document.getElementById('selectAllAllowedChannels');
       const mobileLabelChannelName = t('tokens.channelName');
-      const mobileLabelChannelType = t('tokens.channelType');
       const mobileLabelActions = t('tokens.table.actions');
+      const visibleChannelIDs = getVisibleAllowedChannelIDs();
 
       if (!tbody) return;
 
@@ -928,22 +1033,33 @@
       updateBatchDeleteChannelsBtn();
 
       if (selectAllCheckbox) {
-        selectAllCheckbox.checked = editAllowedChannelIDs.length > 0 &&
-          selectedAllowedChannelIDs.size === editAllowedChannelIDs.length;
+        const selectedVisibleCount = visibleChannelIDs.filter((channelID) => selectedAllowedChannelIDs.has(channelID)).length;
+        selectAllCheckbox.checked = visibleChannelIDs.length > 0 && selectedVisibleCount === visibleChannelIDs.length;
+        selectAllCheckbox.indeterminate = selectedVisibleCount > 0 && selectedVisibleCount < visibleChannelIDs.length;
       }
 
       if (editAllowedChannelIDs.length === 0) {
         tbody.innerHTML = `
           <tr class="allowed-channels-empty-row">
-            <td colspan="4" class="allowed-channels-empty-cell">
+            <td colspan="3" class="allowed-channels-empty-cell">
               ${t('tokens.noChannelRestriction')}
             </td>
           </tr>
         `;
         return;
       }
+      if (visibleChannelIDs.length === 0) {
+        tbody.innerHTML = `
+          <tr class="allowed-channels-empty-row">
+            <td colspan="3" class="allowed-channels-empty-cell">
+              ${t('tokens.noMatchingChannel')}
+            </td>
+          </tr>
+        `;
+        return;
+      }
 
-      tbody.innerHTML = editAllowedChannelIDs.map((channelID) => `
+      tbody.innerHTML = visibleChannelIDs.map((channelID) => `
         <tr class="mobile-inline-row allowed-channel-row">
           <td class="allowed-channel-col-select mobile-inline-no-label">
             <input type="checkbox" class="allowed-channel-checkbox" data-channel-id="${channelID}"
@@ -952,7 +1068,6 @@
             >
           </td>
           <td class="allowed-channel-col-name" data-mobile-label="${mobileLabelChannelName}">${escapeHtml(getChannelDisplayName(channelID))}</td>
-          <td class="allowed-channel-col-type" data-mobile-label="${mobileLabelChannelType}">${escapeHtml(getChannelTypeText(channelID))}</td>
           <td class="allowed-channel-col-actions" data-mobile-label="${mobileLabelActions}">
             <button type="button" class="allowed-channel-remove-btn btn btn-secondary btn-sm" data-action="remove-allowed-channel" data-channel-id="${channelID}">${t('common.delete')}</button>
           </td>
@@ -972,9 +1087,9 @@
 
     function toggleSelectAllAllowedChannels(checked) {
       if (checked) {
-        editAllowedChannelIDs.forEach(channelID => selectedAllowedChannelIDs.add(channelID));
+        getVisibleAllowedChannelIDs().forEach(channelID => selectedAllowedChannelIDs.add(channelID));
       } else {
-        selectedAllowedChannelIDs.clear();
+        getVisibleAllowedChannelIDs().forEach(channelID => selectedAllowedChannelIDs.delete(channelID));
       }
       renderAllowedChannelsTable();
     }
@@ -989,8 +1104,10 @@
     function updateSelectAllAllowedChannelsCheckbox() {
       const checkbox = document.getElementById('selectAllAllowedChannels');
       if (checkbox) {
-        checkbox.checked = editAllowedChannelIDs.length > 0 &&
-          selectedAllowedChannelIDs.size === editAllowedChannelIDs.length;
+        const visibleChannelIDs = getVisibleAllowedChannelIDs();
+        const selectedVisibleCount = visibleChannelIDs.filter((channelID) => selectedAllowedChannelIDs.has(channelID)).length;
+        checkbox.checked = visibleChannelIDs.length > 0 && selectedVisibleCount === visibleChannelIDs.length;
+        checkbox.indeterminate = selectedVisibleCount > 0 && selectedVisibleCount < visibleChannelIDs.length;
       }
     }
 
@@ -1012,11 +1129,9 @@
       if (allChannels.length === 0) {
         await loadChannelsData();
       }
-      await ensureChannelTypeDisplayNameMap();
+      await ensureProtocolDisplayNameMap();
       selectedChannelsForAdd.clear();
       document.getElementById('channelSearchInput').value = '';
-      const channelTypeFilter = document.getElementById('channelTypeFilterSelect');
-      if (channelTypeFilter) channelTypeFilter.value = '';
       renderAvailableChannels('');
       document.getElementById('channelSelectModal').style.display = 'block';
       pushModal(closeChannelSelectModal);
@@ -1032,116 +1147,73 @@
       renderAvailableChannels(searchText);
     }
 
-    function normalizeChannelTypeValue(value) {
-      const type = String(value || '').trim().toLowerCase();
-      return type || 'anthropic';
+    function normalizeProtocolValue(value) {
+      return String(value || '').trim().toLowerCase();
     }
 
-    function buildChannelTypeDisplayNameMap(types) {
+    function buildProtocolDisplayNameMap(protocols) {
       const map = new Map();
-      (Array.isArray(types) ? types : []).forEach((type) => {
-        const typeKey = normalizeChannelTypeValue(type && type.value);
-        const displayName = String(type && type.display_name || '').trim();
+      (Array.isArray(protocols) ? protocols : []).forEach((protocol) => {
+        const protocolKey = normalizeProtocolValue(protocol && protocol.value);
+        const displayName = String(protocol && protocol.display_name || '').trim();
         if (!displayName) return;
-        map.set(typeKey, displayName);
+        map.set(protocolKey, displayName);
       });
       return map;
     }
 
-    async function ensureChannelTypeDisplayNameMap() {
-      if (channelTypeDisplayNameMap.size > 0) {
-        return channelTypeDisplayNameMap;
+    async function ensureProtocolDisplayNameMap() {
+      if (protocolDisplayNameMap.size > 0) {
+        return protocolDisplayNameMap;
       }
-      if (channelTypeDisplayNamesPromise) {
-        return channelTypeDisplayNamesPromise;
+      if (protocolDisplayNamesPromise) {
+        return protocolDisplayNamesPromise;
       }
 
-      channelTypeDisplayNamesPromise = (async () => {
+      protocolDisplayNamesPromise = (async () => {
         try {
-          if (window.ChannelTypeManager && typeof window.ChannelTypeManager.getChannelTypes === 'function') {
-            const types = await window.ChannelTypeManager.getChannelTypes();
-            channelTypeDisplayNameMap = buildChannelTypeDisplayNameMap(types);
+          if (window.ProtocolManager && typeof window.ProtocolManager.getProtocols === 'function') {
+            const protocols = await window.ProtocolManager.getProtocols();
+            protocolDisplayNameMap = buildProtocolDisplayNameMap(protocols);
           }
         } catch (error) {
-          console.error('Failed to load channel type display names:', error);
+          console.error('Failed to load protocol display names:', error);
         } finally {
-          channelTypeDisplayNamesPromise = null;
+          protocolDisplayNamesPromise = null;
         }
-        return channelTypeDisplayNameMap;
+        return protocolDisplayNameMap;
       })();
 
-      return channelTypeDisplayNamesPromise;
+      return protocolDisplayNamesPromise;
     }
 
-    function getChannelTypeGroupKey(channel) {
-      return normalizeChannelTypeValue(channel?.channel_type);
+    function getChannelProtocols(channel) {
+      return Array.from(new Set(
+        (Array.isArray(channel?.urls) ? channel.urls : [])
+          .flatMap(entry => Array.isArray(entry?.protocols) ? entry.protocols : [])
+          .map(normalizeProtocolValue)
+          .filter(Boolean)
+      ));
     }
 
-    function getChannelTypeGroupLabel(typeKey) {
-      const normalizedTypeKey = normalizeChannelTypeValue(typeKey);
-      return channelTypeDisplayNameMap.get(normalizedTypeKey) || normalizedTypeKey || t('tokens.channelTypeOther');
+    function getProtocolLabel(protocol) {
+      const normalizedProtocol = normalizeProtocolValue(protocol);
+      return protocolDisplayNameMap.get(normalizedProtocol) || normalizedProtocol;
     }
 
     function matchesChannelSearchText(channel, searchText) {
       const search = String(searchText || '').trim().toLowerCase();
       if (!search) return true;
 
-      const normalizedTypeKey = getChannelTypeGroupKey(channel);
-      const displayTypeName = getChannelTypeGroupLabel(normalizedTypeKey).toLowerCase();
+      const protocols = getChannelProtocols(channel);
+      const protocolText = protocols.map(getProtocolLabel).join(' ').toLowerCase();
       const name = String(channel?.name || '').toLowerCase();
-      const rawType = String(channel?.channel_type || '').trim().toLowerCase();
       const id = String(channel?.id || '');
 
       return name.includes(search) ||
-        rawType.includes(search) ||
-        normalizedTypeKey.includes(search) ||
-        displayTypeName.includes(search) ||
+        protocols.some(protocol => protocol.includes(search)) ||
+        protocolText.includes(search) ||
         id.includes(search);
-    }
-
-    function sortChannelTypeGroups(groups) {
-      const order = ['anthropic', 'codex', 'openai', 'gemini'];
-      return groups.sort((a, b) => {
-        const indexA = order.includes(a.typeKey) ? order.indexOf(a.typeKey) : order.length;
-        const indexB = order.includes(b.typeKey) ? order.indexOf(b.typeKey) : order.length;
-        if (indexA !== indexB) return indexA - indexB;
-        return a.label.localeCompare(b.label);
-      });
-    }
-
-    function groupChannelsByType(channels) {
-      const groupMap = new Map();
-      channels.forEach((channel) => {
-        const typeKey = getChannelTypeGroupKey(channel);
-        if (!groupMap.has(typeKey)) {
-          groupMap.set(typeKey, {
-            typeKey,
-            label: getChannelTypeGroupLabel(typeKey),
-            channels: []
-          });
-        }
-        groupMap.get(typeKey).channels.push(channel);
-      });
-      return sortChannelTypeGroups(Array.from(groupMap.values()));
-    }
-
-    function updateChannelTypeFilterOptions(channels) {
-      const select = document.getElementById('channelTypeFilterSelect');
-      if (!select) return '';
-
-      const currentValue = select.value;
-      const channelGroups = groupChannelsByType(channels);
-      select.innerHTML = [
-        `<option value="">${escapeHtml(t('tokens.channelTypeAll'))}</option>`,
-        ...channelGroups.map(group => `<option value="${escapeHtml(group.typeKey)}">${escapeHtml(group.label)}</option>`)
-      ].join('');
-
-      if (channelGroups.some(group => group.typeKey === currentValue)) {
-        select.value = currentValue;
-      } else {
-        select.value = '';
-      }
-      return select.value;
     }
 
     function renderAvailableChannels(searchText) {
@@ -1154,21 +1226,17 @@
 
       const existingChannelIDs = new Set(editAllowedChannelIDs);
       const availableChannels = allChannels.filter(ch => !existingChannelIDs.has(normalizeChannelID(ch.id)));
-      const selectedTypeKey = updateChannelTypeFilterOptions(availableChannels);
       let channels = availableChannels;
 
       if (searchText) {
         channels = channels.filter(ch => matchesChannelSearchText(ch, searchText));
-      }
-      if (selectedTypeKey) {
-        channels = channels.filter(ch => getChannelTypeGroupKey(ch) === selectedTypeKey);
       }
 
       currentVisibleChannels = channels;
       if (countSpan) countSpan.textContent = selectedChannelsForAdd.size;
 
       if (channels.length === 0) {
-        const hasFilter = Boolean(searchText || selectedTypeKey);
+        const hasFilter = Boolean(searchText);
         const message = hasFilter
           ? t('tokens.noMatchingChannel')
           : allChannels.length === 0
@@ -1196,30 +1264,21 @@
         visibleChannelsCount.textContent = t('tokens.visibleChannelsCount', { count: channels.length });
       }
 
-      const channelGroups = groupChannelsByType(channels);
-      container.innerHTML = channelGroups.map(group => `
-        <section class="channel-type-group" data-channel-type-key="${escapeHtml(group.typeKey)}">
-          <div class="channel-type-group-header">
-            <div class="channel-type-group-title">
-              <span class="channel-type-group-name">${escapeHtml(group.label)}</span>
-              <span class="channel-type-group-count">${t('tokens.visibleChannelsCount', { count: group.channels.length })}</span>
-            </div>
-          </div>
-          <div class="channel-type-group-list">
-            ${group.channels.map(ch => {
-              const channelID = normalizeChannelID(ch.id);
-              return `
-                <label class="channel-option-item" data-channel-id="${channelID}">
-                  <input type="checkbox" class="channel-option-checkbox" data-channel-id="${channelID}"
-                    ${selectedChannelsForAdd.has(channelID) ? 'checked' : ''}>
-                  <span class="channel-option-label">${escapeHtml(ch.name || t('common.unknown'))}</span>
-                  <span class="channel-option-meta">#${channelID} · ${escapeHtml(ch.channel_type || '-')}</span>
-                </label>
-              `;
-            }).join('')}
-          </div>
-        </section>
-      `).join('');
+      container.innerHTML = `<div class="channel-option-list">${channels.map(ch => {
+        const channelID = normalizeChannelID(ch.id);
+        const protocols = getChannelProtocols(ch);
+        const protocolText = protocols.length > 0
+          ? protocols.map(getProtocolLabel).join(', ')
+          : t('channels.urlProtocolAuto');
+        return `
+          <label class="channel-option-item" data-channel-id="${channelID}">
+            <input type="checkbox" class="channel-option-checkbox" data-channel-id="${channelID}"
+              ${selectedChannelsForAdd.has(channelID) ? 'checked' : ''}>
+            <span class="channel-option-label">${escapeHtml(ch.name || t('common.unknown'))}</span>
+            <span class="channel-option-meta">#${channelID} · ${escapeHtml(protocolText)}</span>
+          </label>
+        `;
+      }).join('')}</div>`;
 
       if (!container.dataset.delegated) {
         container.addEventListener('change', (e) => {
@@ -1271,6 +1330,7 @@
         return;
       }
 
+      const addedCount = selectedChannelsForAdd.size;
       const existingChannelIDs = new Set(editAllowedChannelIDs);
       selectedChannelsForAdd.forEach(channelID => {
         if (!existingChannelIDs.has(channelID)) {
@@ -1281,7 +1341,7 @@
       sortAllowedChannelIDs();
       closeChannelSelectModal();
       renderAllowedChannelsTable();
-      window.showNotification(t('tokens.msg.channelsAdded', { count: selectedChannelsForAdd.size }), 'success');
+      window.showNotification(t('tokens.msg.channelsAdded', { count: addedCount }), 'success');
     }
 
     /**
@@ -1293,6 +1353,7 @@
       const selectAllCheckbox = document.getElementById('selectAllAllowedModels');
       const mobileLabelModelName = t('tokens.modelName');
       const mobileLabelActions = t('tokens.table.actions');
+      const visibleModelEntries = getVisibleAllowedModelEntries();
 
       if (!tbody) return;
 
@@ -1304,8 +1365,9 @@
 
       // 更新全选复选框状态
       if (selectAllCheckbox) {
-        selectAllCheckbox.checked = editAllowedModels.length > 0 &&
-          selectedAllowedModelIndices.size === editAllowedModels.length;
+        const selectedVisibleCount = visibleModelEntries.filter(({ index }) => selectedAllowedModelIndices.has(index)).length;
+        selectAllCheckbox.checked = visibleModelEntries.length > 0 && selectedVisibleCount === visibleModelEntries.length;
+        selectAllCheckbox.indeterminate = selectedVisibleCount > 0 && selectedVisibleCount < visibleModelEntries.length;
       }
 
       if (editAllowedModels.length === 0) {
@@ -1318,8 +1380,18 @@
         `;
         return;
       }
+      if (visibleModelEntries.length === 0) {
+        tbody.innerHTML = `
+          <tr class="allowed-models-empty-row">
+            <td colspan="3" class="allowed-models-empty-cell">
+              ${t('tokens.noMatchingModel')}
+            </td>
+          </tr>
+        `;
+        return;
+      }
 
-      tbody.innerHTML = editAllowedModels.map((model, index) => {
+      tbody.innerHTML = visibleModelEntries.map(({ model, index }) => {
         return `
         <tr class="mobile-inline-row allowed-model-row">
           <td class="allowed-model-col-select mobile-inline-no-label">
@@ -1354,9 +1426,9 @@
      */
     function toggleSelectAllAllowedModels(checked) {
       if (checked) {
-        editAllowedModels.forEach((_, index) => selectedAllowedModelIndices.add(index));
+        getVisibleAllowedModelEntries().forEach(({ index }) => selectedAllowedModelIndices.add(index));
       } else {
-        selectedAllowedModelIndices.clear();
+        getVisibleAllowedModelEntries().forEach(({ index }) => selectedAllowedModelIndices.delete(index));
       }
       renderAllowedModelsTable();
     }
@@ -1377,8 +1449,10 @@
     function updateSelectAllCheckbox() {
       const checkbox = document.getElementById('selectAllAllowedModels');
       if (checkbox) {
-        checkbox.checked = editAllowedModels.length > 0 &&
-          selectedAllowedModelIndices.size === editAllowedModels.length;
+        const visibleModelEntries = getVisibleAllowedModelEntries();
+        const selectedVisibleCount = visibleModelEntries.filter(({ index }) => selectedAllowedModelIndices.has(index)).length;
+        checkbox.checked = visibleModelEntries.length > 0 && selectedVisibleCount === visibleModelEntries.length;
+        checkbox.indeterminate = selectedVisibleCount > 0 && selectedVisibleCount < visibleModelEntries.length;
       }
     }
 
@@ -1574,12 +1648,12 @@
      * 确认添加选中的模型
      */
     function confirmModelSelection() {
-      
       if (selectedModelsForAdd.size === 0) {
         window.showNotification(t('tokens.msg.selectAtLeastOne'), 'warning');
         return;
       }
 
+      const addedCount = selectedModelsForAdd.size;
       // 添加到模型限制列表
       selectedModelsForAdd.forEach(model => {
         if (!editAllowedModels.includes(model)) {
@@ -1592,7 +1666,7 @@
 
       closeModelSelectModal();
       renderAllowedModelsTable();
-      window.showNotification(t('tokens.msg.modelsAdded', { count: selectedModelsForAdd.size }), 'success');
+      window.showNotification(t('tokens.msg.modelsAdded', { count: addedCount }), 'success');
     }
 
     // ==================== 模型手动输入 ====================
