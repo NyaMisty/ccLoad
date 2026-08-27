@@ -197,6 +197,35 @@ func (r *sseErrorResponse) ErrorType() string {
 	return r.Error.Code
 }
 
+var glmSSEErrorLevels = map[string]ErrorLevel{
+	"1302": ErrorLevelKey,
+	"1305": ErrorLevelChannel,
+	"1308": ErrorLevelKey,
+	"1310": ErrorLevelKey,
+	"1312": ErrorLevelChannel,
+	"1313": ErrorLevelKey,
+}
+
+// GLMErrorLevel gives a recognized numeric GLM code precedence over generic
+// wrappers such as api_error and rate_limit_error.
+func (r *sseErrorResponse) GLMErrorLevel() (string, ErrorLevel, bool) {
+	candidates := [...]string{
+		r.Error.Code,
+		r.Response.Error.Code,
+		r.Code,
+		r.Error.Type,
+		r.Response.Error.Type,
+		r.Type,
+	}
+	for _, candidate := range candidates {
+		code := strings.TrimSpace(candidate)
+		if level, ok := glmSSEErrorLevels[code]; ok {
+			return code, level, true
+		}
+	}
+	return "", ErrorLevelNone, false
+}
+
 // IsContextLengthExceededError reports whether an upstream error says that the
 // current request exceeds the model context window. Codex can emit the error as
 // error, response.error, or a top-level streaming error object.
@@ -644,6 +673,9 @@ func classifySSEError(responseBody []byte) ErrorLevel {
 
 	if err := json.Unmarshal(responseBody, &errResp); err != nil {
 		return ErrorLevelKey // 解析失败，保守处理
+	}
+	if _, level, ok := errResp.GLMErrorLevel(); ok {
+		return level
 	}
 
 	// 根据error.type/code判断错误级别
@@ -1137,6 +1169,9 @@ func ParseResetTimeFrom1308Error(responseBody []byte) (time.Time, bool) {
 
 	// 2. 检查是否为1308或1310错误（优先使用type，如果为空则使用code）
 	errorType := errResp.ErrorType()
+	if code, _, ok := errResp.GLMErrorLevel(); ok {
+		errorType = code
+	}
 	if errorType != "1308" && errorType != "1310" {
 		return time.Time{}, false
 	}

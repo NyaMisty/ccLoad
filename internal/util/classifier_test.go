@@ -893,6 +893,24 @@ func TestClassifySSEError(t *testing.T) {
 			reason:       "1310错误是Key配额问题，应触发Key级冷却",
 		},
 		{
+			name:         "1302_rate_limit_code_overrides_api_error",
+			responseBody: []byte(`{"error":{"type":"api_error","code":"1302","message":"account rate limited"}}`),
+			expected:     ErrorLevelKey,
+			reason:       "1302错误是Key级速率限制，数字code应优先于api_error",
+		},
+		{
+			name:         "1312_overloaded_code",
+			responseBody: []byte(`{"error":{"code":"1312","message":"service overloaded"}}`),
+			expected:     ErrorLevelChannel,
+			reason:       "1312错误表示上游服务过载，应触发渠道级冷却",
+		},
+		{
+			name:         "1313_fair_use_code_overrides_api_error",
+			responseBody: []byte(`{"error":{"type":"api_error","code":"1313","message":"fair use policy limited"}}`),
+			expected:     ErrorLevelKey,
+			reason:       "1313错误是Key级公平使用限制，数字code应优先于api_error",
+		},
+		{
 			name:         "unknown_error_type",
 			responseBody: []byte(`{"type":"error","error":{"type":"unknown_type","message":"未知错误"}}`),
 			expected:     ErrorLevelKey,

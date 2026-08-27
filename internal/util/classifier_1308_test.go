@@ -45,6 +45,12 @@ func TestParseResetTimeFrom1308Error(t *testing.T) {
 			expectTime:    "2025-12-21 15:00:05",
 		},
 		{
+			name:          "1308数字code优先于api_error类型",
+			responseBody:  `{"error":{"type":"api_error","code":"1308","message":"Your limit will reset at 2025-12-22 16:01:06"}}`,
+			expectSuccess: true,
+			expectTime:    "2025-12-22 16:01:06",
+		},
+		{
 			name:          "1310周/月度限额耗尽",
 			responseBody:  `{"error":{"code":"1310","message":"Weekly/Monthly Limit Exhausted. Your limit will reset at 2026-04-20 15:24:20"},"request_id":"..."}`,
 			expectSuccess: true,
