@@ -223,6 +223,8 @@ func buildProxyLogEntry(
 		DebugData:        reqCtx.debugData,
 		CostMultiplier:   cfg.CostMultiplier,
 		ThinkingEffort:   reqCtx.thinkingEffort,
+		AttemptIndex:     int32(reqCtx.attemptIndex),
+		RequestID:        reqCtx.activeReqID,
 	})
 }
 

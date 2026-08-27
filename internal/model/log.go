@@ -100,6 +100,12 @@ type LogEntry struct {
 
 	// 瞬态字段：不持久化到 logs 表，仅用于传递 debug 数据到写入管道
 	DebugData *DebugLogEntry `json:"-"`
+
+	// 以下字段仅在内存中关联重试链，不写入 logs 表。
+	AttemptIndex       int32 `json:"attempt_index,omitempty"`
+	IsFinal            bool  `json:"is_final,omitempty"`
+	RequestID          int64 `json:"-"`
+	IsTerminalOverride bool  `json:"-"`
 }
 
 // LogFilter 日志查询过滤条件

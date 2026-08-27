@@ -3148,6 +3148,8 @@ func (s *Server) attemptKeyAcrossURLs(
 	if len(sortedURLs) == 0 {
 		return nil, nil, fmt.Errorf("no enabled URLs configured for channel %d", cfg.ID)
 	}
+	reqCtx.attemptIndex++
+	attemptIndex := int32(reqCtx.attemptIndex)
 	clientProtocol := reqCtx.clientProtocol
 	transformMode := cfg.GetProtocolTransformMode()
 	if transformMode == model.ProtocolTransformModeAuto {
@@ -3190,6 +3192,7 @@ func (s *Server) attemptKeyAcrossURLs(
 			BaseURL:          urlEntry.url,
 			CostMultiplier:   cfg.CostMultiplier,
 			ThinkingEffort:   reqCtx.thinkingEffort,
+			AttemptIndex:     attemptIndex,
 		})
 
 		shouldDeferChannelCooldown := urlIdx < len(sortedURLs)-1

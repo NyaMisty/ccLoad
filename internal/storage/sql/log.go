@@ -3,6 +3,7 @@ package sql
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"log"
 	"strings"
 	"sync"
@@ -199,8 +200,10 @@ func (s *SQLStore) addLog(ctx context.Context, e *model.LogEntry, updateOAuthQuo
 		if err := insertLogsWithDebug(ctx, s, tx, []*model.LogEntry{e}); err != nil {
 			return nil, err
 		}
-	} else if _, err := s.execTx(ctx, tx, logsInsertColumns+logRowPlaceholders, logRowArgs(e)...); err != nil {
-		return nil, err
+	} else {
+		if err := insertPlainLog(ctx, s, tx, e); err != nil {
+			return nil, err
+		}
 	}
 	var updatedChannelIDs []int64
 	if updateOAuthQuotaCost {
@@ -221,6 +224,21 @@ const logsInsertColumns = `INSERT INTO logs(time, minute_bucket, model, actual_m
 const logRowPlaceholders = `(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
 
 const logRowParams = 30
+
+func insertPlainLog(ctx context.Context, s *SQLStore, tx *sql.Tx, entry *model.LogEntry) error {
+	query := logsInsertColumns + logRowPlaceholders
+	if s.IsPostgres() {
+		return s.queryRowTx(ctx, tx, query+" RETURNING id", logRowArgs(entry)...).Scan(&entry.ID)
+	}
+	result, err := s.execTx(ctx, tx, query, logRowArgs(entry)...)
+	if err != nil {
+		return err
+	}
+	if id, idErr := result.LastInsertId(); idErr == nil {
+		entry.ID = id
+	}
+	return nil
+}
 
 // BatchAddLogs 批量写入日志（单事务，多值 INSERT 提升刷盘吞吐）
 // 设计：
@@ -330,11 +348,72 @@ func batchInsertPlainLogs(ctx context.Context, s *SQLStore, tx *sql.Tx, logs []*
 			b.WriteString(logRowPlaceholders)
 			args = append(args, logRowArgs(e)...)
 		}
-		if _, err := s.execTx(ctx, tx, b.String(), args...); err != nil {
+		if s.IsPostgres() {
+			if err := assignPostgresInsertedIDs(ctx, s, tx, b.String(), args, chunk); err != nil {
+				return err
+			}
+			continue
+		}
+		result, err := s.execTx(ctx, tx, b.String(), args...)
+		if err != nil {
 			return err
 		}
+		assignInsertedIDs(chunk, result, s.IsSQLite())
 	}
 	return nil
+}
+
+func assignPostgresInsertedIDs(
+	ctx context.Context,
+	s *SQLStore,
+	tx *sql.Tx,
+	query string,
+	args []any,
+	entries []*model.LogEntry,
+) error {
+	rows, err := s.queryTx(ctx, tx, query+" RETURNING id", args...)
+	if err != nil {
+		return err
+	}
+
+	index := 0
+	for rows.Next() {
+		if index >= len(entries) {
+			_ = rows.Close()
+			return fmt.Errorf("log insert returned more IDs than entries")
+		}
+		if err := rows.Scan(&entries[index].ID); err != nil {
+			_ = rows.Close()
+			return err
+		}
+		index++
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return err
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	if index != len(entries) {
+		return fmt.Errorf("log insert returned %d IDs for %d entries", index, len(entries))
+	}
+	return nil
+}
+
+// assignInsertedIDs handles the different LastInsertId endpoints returned by
+// SQLite (last row) and MySQL (first row) for a multi-value INSERT.
+func assignInsertedIDs(entries []*model.LogEntry, result sql.Result, sqlite bool) {
+	id, err := result.LastInsertId()
+	if err != nil || id <= 0 {
+		return
+	}
+	if sqlite {
+		id -= int64(len(entries) - 1)
+	}
+	for index, entry := range entries {
+		entry.ID = id + int64(index)
+	}
 }
 
 // insertLogsWithDebug 逐条插入需要关联 debug_logs 的日志。
@@ -348,6 +427,7 @@ func insertLogsWithDebug(ctx context.Context, s *SQLStore, tx *sql.Tx, logs []*m
 			if err := s.queryRowTx(ctx, tx, insertSQL, logRowArgs(e)...).Scan(&logID); err != nil {
 				return err
 			}
+			e.ID = logID
 			if _, err := s.execTx(ctx, tx, `
 				INSERT INTO debug_logs (log_id, created_at, req_method, req_url, req_headers, req_body, resp_status, resp_headers, resp_body, upstream_error,
 					protocol_transformed, original_req_url, original_req_headers, original_req_body,
@@ -377,6 +457,7 @@ func insertLogsWithDebug(ctx context.Context, s *SQLStore, tx *sql.Tx, logs []*m
 			return err
 		}
 		logID, _ := result.LastInsertId()
+		e.ID = logID
 		if _, err := s.execTx(ctx, tx, `
 			INSERT INTO debug_logs (log_id, created_at, req_method, req_url, req_headers, req_body, resp_status, resp_headers, resp_body, upstream_error,
 				protocol_transformed, original_req_url, original_req_headers, original_req_body,

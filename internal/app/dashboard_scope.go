@@ -48,6 +48,8 @@ type tokenLogEntry struct {
 	Cost                     float64                     `json:"cost"`
 	EffectiveCost            float64                     `json:"effective_cost"`
 	CostBreakdown            *util.StandardCostBreakdown `json:"cost_breakdown,omitempty"`
+	AttemptIndex             int32                       `json:"attempt_index,omitempty"`
+	IsFinal                  bool                        `json:"is_final,omitempty"`
 }
 
 type dashboardLogEntry struct {
@@ -139,6 +141,8 @@ func projectTokenLogs(logs []*model.LogEntry, channels map[int64]tokenLogChannel
 			Cost:                     entry.Cost,
 			EffectiveCost:            entry.Cost * multiplier,
 			CostBreakdown:            buildLogCostBreakdown(entry),
+			AttemptIndex:             entry.AttemptIndex,
+			IsFinal:                  entry.IsFinal,
 		})
 	}
 	return projected

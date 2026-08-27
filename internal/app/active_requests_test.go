@@ -11,6 +11,7 @@ func beginTestActiveRequest(m *activeRequestManager, start time.Time, model, cli
 	return m.BeginAttempt(0, activeRequestAttempt{
 		StartTime: start, Model: model, ClientIP: clientIP, Streaming: streaming,
 		ChannelID: 1, ChannelName: "test-channel", APIKey: "sk-test", BaseURL: "https://upstream.example.com", CostMultiplier: 1,
+		AttemptIndex: 1,
 	})
 }
 
@@ -45,6 +46,7 @@ func TestActiveRequestManager_BeginAttemptMasksKey(t *testing.T) {
 	m.BeginAttempt(id, activeRequestAttempt{
 		StartTime: time.UnixMilli(200), Model: "m", ClientIP: "1.1.1.1",
 		ChannelID: 1, ChannelName: "ch", APIKey: rawKey, BaseURL: "https://upstream.example.com", CostMultiplier: 1,
+		AttemptIndex: 2,
 	})
 
 	got := m.List()
@@ -59,6 +61,9 @@ func TestActiveRequestManager_BeginAttemptMasksKey(t *testing.T) {
 	}
 	if got[0].UpstreamWebsocket {
 		t.Fatal("channel/key update must reset upstream websocket state")
+	}
+	if got[0].AttemptIndex != 2 {
+		t.Fatalf("attempt_index=%d, want 2", got[0].AttemptIndex)
 	}
 }
 
@@ -83,6 +88,7 @@ func TestActiveRequestManager_UpstreamStatusTransitions(t *testing.T) {
 	m.BeginAttempt(id, activeRequestAttempt{
 		StartTime: time.UnixMilli(200), Model: "m", ClientIP: "1.1.1.1", Streaming: true,
 		ChannelID: 1, ChannelName: "ch", APIKey: "sk-test", BaseURL: "https://upstream.example.com", CostMultiplier: 1,
+		AttemptIndex: 2,
 	})
 	if got := m.List()[0].UpstreamStatus; got != activeRequestStatusRetrying {
 		t.Fatalf("status during retry=%q, want %q", got, activeRequestStatusRetrying)

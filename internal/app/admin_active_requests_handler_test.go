@@ -14,6 +14,7 @@ func TestHandleActiveRequests(t *testing.T) {
 		StartTime: time.Now(), Model: "m1", ClientIP: "1.2.3.4", Streaming: true,
 		ChannelID: 10, ChannelName: "ch", APIKey: "sk-test",
 		ClientProtocol: "openai", TokenID: 7, BaseURL: "https://upstream.example.com", CostMultiplier: 1.5,
+		AttemptIndex: 2,
 	})
 	m.SetUpstreamWebsocket(id, true)
 	m.AddBytes(id, 123)
@@ -59,6 +60,9 @@ func TestHandleActiveRequests(t *testing.T) {
 	}
 	if resp.Data[0].UpstreamStatus != activeRequestStatusReceiving {
 		t.Fatalf("upstream_status=%q, want %q", resp.Data[0].UpstreamStatus, activeRequestStatusReceiving)
+	}
+	if resp.Data[0].AttemptIndex != 2 {
+		t.Fatalf("attempt_index=%d, want 2", resp.Data[0].AttemptIndex)
 	}
 }
 

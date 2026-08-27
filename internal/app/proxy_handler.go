@@ -409,16 +409,17 @@ func (s *Server) HandleProxyRequest(c *gin.Context) {
 			return
 		}
 		s.AddLogAsync(&model.LogEntry{
-			Time:           model.JSONTime{Time: time.Now()},
-			Model:          originalModel,
-			LogSource:      model.LogSourceProxy,
-			AuthTokenID:    tokenIDInt64,
-			ClientProtocol: string(clientProtocol),
-			StatusCode:     503,
-			Message:        "no available upstream (all cooled or none)",
-			IsStreaming:    isStreaming,
-			ClientIP:       c.ClientIP(),
-			ThinkingEffort: thinkingEffort,
+			Time:               model.JSONTime{Time: time.Now()},
+			Model:              originalModel,
+			LogSource:          model.LogSourceProxy,
+			AuthTokenID:        tokenIDInt64,
+			ClientProtocol:     string(clientProtocol),
+			StatusCode:         503,
+			Message:            "no available upstream (all cooled or none)",
+			IsStreaming:        isStreaming,
+			ClientIP:           c.ClientIP(),
+			ThinkingEffort:     thinkingEffort,
+			IsTerminalOverride: true,
 		})
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "no available upstream (all cooled or none)"})
 		return
@@ -718,15 +719,17 @@ func (s *Server) writeFinalProxyResponse(
 	skipLog = skipLog || candidateCount <= 1
 	if !skipLog {
 		s.AddLogAsync(&model.LogEntry{
-			Time:           model.JSONTime{Time: reqCtx.startTime},
-			Model:          originalModel,
-			LogSource:      model.LogSourceProxy,
-			ClientProtocol: string(reqCtx.clientProtocol),
-			StatusCode:     upstreamFinalStatus,
-			Message:        msg,
-			Duration:       time.Since(reqCtx.startTime).Seconds(),
-			IsStreaming:    isStreaming,
-			ClientIP:       reqCtx.clientIP,
+			Time:               model.JSONTime{Time: reqCtx.startTime},
+			Model:              originalModel,
+			LogSource:          model.LogSourceProxy,
+			ClientProtocol:     string(reqCtx.clientProtocol),
+			StatusCode:         upstreamFinalStatus,
+			Message:            msg,
+			Duration:           time.Since(reqCtx.startTime).Seconds(),
+			IsStreaming:        isStreaming,
+			ClientIP:           reqCtx.clientIP,
+			RequestID:          reqCtx.activeReqID,
+			IsTerminalOverride: true,
 		})
 	}
 

@@ -39,6 +39,9 @@ type LogService struct {
 	// 日志保留天数（启动时确定，修改后重启生效）
 	retentionDays int
 
+	// 最近写入日志的重试元数据，纯内存保存，不改变 logs 表结构。
+	attemptIndexCache *attemptIndexCache
+
 	// 优雅关闭
 	shutdownCh     chan struct{}
 	isShuttingDown *atomic.Bool
@@ -75,13 +78,14 @@ func NewLogService(
 	wg *sync.WaitGroup,
 ) *LogService {
 	return &LogService{
-		store:          store,
-		logChan:        make(chan *model.LogEntry, logBufferSize),
-		logWorkers:     logWorkers,
-		retentionDays:  retentionDays,
-		shutdownCh:     shutdownCh,
-		isShuttingDown: isShuttingDown,
-		wg:             wg,
+		store:             store,
+		logChan:           make(chan *model.LogEntry, logBufferSize),
+		logWorkers:        logWorkers,
+		retentionDays:     retentionDays,
+		attemptIndexCache: newAttemptIndexCache(3000),
+		shutdownCh:        shutdownCh,
+		isShuttingDown:    isShuttingDown,
+		wg:                wg,
 	}
 }
 
@@ -175,6 +179,7 @@ retryLoop:
 		err := s.store.BatchAddLogs(ctx, logs)
 		cancel()
 		if err == nil {
+			s.recordAttemptIndexes(logs)
 			if attempt > 1 {
 				log.Printf("[WARN] 日志批量写入重试成功 (attempt=%d/%d, batch_size=%d)", attempt, maxRetries, len(logs))
 			}
@@ -243,6 +248,32 @@ func (s *LogService) AddLogAsync(entry *model.LogEntry) {
 			log.Printf("[ERROR] 日志队列已满，日志被丢弃 (累计丢弃: %d) - 考虑增大 LOG_BUFFER_SIZE 或 LOG_WORKERS", count)
 		}
 	}
+}
+
+func (s *LogService) recordAttemptIndexes(logs []*model.LogEntry) {
+	if s == nil || s.attemptIndexCache == nil {
+		return
+	}
+	for _, entry := range logs {
+		if entry == nil || entry.ID <= 0 {
+			continue
+		}
+		if entry.IsTerminalOverride {
+			s.attemptIndexCache.recordFinal(entry.ID, entry.RequestID)
+			continue
+		}
+		if entry.AttemptIndex > 0 {
+			s.attemptIndexCache.record(entry.ID, entry.RequestID, entry.AttemptIndex)
+		}
+	}
+}
+
+// LookupAttemptIndex returns transient retry metadata for a recent persisted log.
+func (s *LogService) LookupAttemptIndex(logID int64) (index int32, isFinal bool, ok bool) {
+	if s == nil || s.attemptIndexCache == nil || logID <= 0 {
+		return 0, false, false
+	}
+	return s.attemptIndexCache.lookup(logID)
 }
 
 // ============================================================================

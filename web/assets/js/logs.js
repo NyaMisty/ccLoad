@@ -274,7 +274,12 @@ function buildActiveRequestInfoContent(req) {
     ? t('logs.receivedBytes', { bytes: bytesInfo })
     : (req?.debug_log_available ? t('logs.upstreamDetails') : '-');
   const infoColor = hasBytes ? 'var(--success-600)' : 'var(--neutral-500)';
-  const infoHtml = `<span style="color: ${infoColor};">${escapeHtml(infoDisplay)}</span>`;
+  let infoHtml = `<span style="color: ${infoColor};">${escapeHtml(infoDisplay)}</span>`;
+  const attemptIndex = Number(req?.attempt_index);
+  if (Number.isFinite(attemptIndex) && attemptIndex > 1) {
+    const title = escapeHtml(t('logs.attemptTitle', { attempt: attemptIndex }));
+    infoHtml += ` <span class="logs-attempt-badge" style="color: var(--warning-600); font-weight: 600;" title="${title}">↻${attemptIndex}</span>`;
+  }
   const activeRequestId = Number(req?.id);
 
   if (!req?.debug_log_available || !Number.isFinite(activeRequestId) || activeRequestId <= 0) {
@@ -1021,6 +1026,14 @@ function renderLogs(data) {
     const statusClass = (entry.status_code >= 200 && entry.status_code < 300) ?
       'status-success' : 'status-error';
     const statusCode = entry.status_code;
+    const attemptIndex = Number(entry.attempt_index);
+    const attemptBadge = Number.isFinite(attemptIndex) && attemptIndex > 1
+      ? ` <sup class="logs-attempt-badge" style="color: var(--warning-600); font-weight: 600;" title="${escapeHtml(t('logs.attemptTitle', { attempt: attemptIndex }))}">↻${attemptIndex}</sup>`
+      : '';
+    const finalStatusOK = entry.status_code >= 200 && entry.status_code < 300;
+    const finalBadge = entry.is_final
+      ? ` <sup class="logs-final-badge" style="color: ${finalStatusOK ? 'var(--success-600)' : 'var(--error-600)'}; font-weight: 700;" title="${escapeHtml(t(finalStatusOK ? 'logs.finalResultSuccess' : 'logs.finalResultFailure'))}">${escapeHtml(t('logs.finalBadge'))}</sup>`
+      : '';
 
     // 3. 模型显示（支持重定向与思考等级角标）
     const modelDisplay = buildLogModelDisplay(entry.model, entry.actual_model, entry.thinking_effort, entry.reasoning_tokens);
@@ -1127,7 +1140,7 @@ function renderLogs(data) {
           <td class="logs-col-api-key" data-mobile-label="${logMobileLabels.apiKey}" style="text-align: center; white-space: nowrap;">${apiKeyDisplay}</td>
           <td class="logs-col-channel" data-mobile-label="${logMobileLabels.channel}" style="text-align: left;">${configDisplay}</td>
           <td class="logs-col-model" data-mobile-label="${logMobileLabels.model}">${modelDisplay}</td>
-          <td class="logs-col-status" data-mobile-label="${logMobileLabels.status}"><span class="${statusClass}">${statusCode}</span></td>
+          <td class="logs-col-status" data-mobile-label="${logMobileLabels.status}"><span class="${statusClass}">${statusCode}${attemptBadge}${finalBadge}</span></td>
           <td class="logs-col-timing" data-mobile-label="${logMobileLabels.timing}" style="text-align: right; white-space: nowrap;">${responseTimingDisplay}</td>
           <td class="logs-col-speed${speedDisplay ? '' : ' mobile-empty-cell'}" data-mobile-label="${logMobileLabels.speed}" style="text-align: right; white-space: nowrap;">${speedDisplay}</td>
           <td class="logs-col-input${inputTokensDisplay ? '' : ' mobile-empty-cell'}" data-mobile-label="${logMobileLabels.input}" style="text-align: right; white-space: nowrap;">${inputTokensDisplay}</td>

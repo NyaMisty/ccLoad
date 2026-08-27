@@ -591,7 +591,14 @@ func TestLog_BatchAdd(t *testing.T) {
 	if err := store.BatchAddLogs(ctx, logs); err != nil {
 		t.Fatalf("batch add logs: %v", err)
 	}
-	// BatchAddLogs 方法不返回 ID，不需要检查
+	for i, entry := range logs {
+		if entry.ID <= 0 {
+			t.Fatalf("logs[%d].ID=%d, want a persisted ID", i, entry.ID)
+		}
+		if i > 0 && entry.ID != logs[i-1].ID+1 {
+			t.Fatalf("logs[%d].ID=%d, want %d", i, entry.ID, logs[i-1].ID+1)
+		}
+	}
 
 	since := now.Add(-1 * time.Hour)
 	count, err := store.CountLogs(ctx, since, nil)

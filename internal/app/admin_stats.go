@@ -31,6 +31,15 @@ func (s *Server) HandleErrors(c *gin.Context) {
 		RespondError(c, http.StatusInternalServerError, err)
 		return
 	}
+	for _, entry := range logs {
+		if entry == nil {
+			continue
+		}
+		if index, isFinal, ok := s.logService.LookupAttemptIndex(entry.ID); ok {
+			entry.AttemptIndex = index
+			entry.IsFinal = isFinal
+		}
+	}
 
 	if isAPITokenWebRequest(c) {
 		channels, err := s.tokenLogChannels(c.Request.Context(), logs)

@@ -34,6 +34,7 @@ type ActiveRequest struct {
 	BytesReceived       int64   `json:"bytes_received,omitempty"`         // 上游已返回的字节数（快照）
 	ClientFirstByteTime float64 `json:"client_first_byte_time,omitempty"` // 客户端侧首字节响应时间（秒），流式请求有效
 	CostMultiplier      float64 `json:"cost_multiplier"`                  // 渠道成本倍率
+	AttemptIndex        int32   `json:"attempt_index,omitempty"`          // 当前 Key/凭证尝试次数（1-based）
 	UpstreamWebsocket   bool    `json:"upstream_websocket,omitempty"`     // 实际上游请求是否使用WebSocket
 	DebugLogAvailable   bool    `json:"debug_log_available,omitempty"`    // 运行中请求是否已有可读取的调试快照
 	ThinkingEffort      string  `json:"thinking_effort,omitempty"`
@@ -62,6 +63,7 @@ type activeRequest struct {
 
 	bytesCounter            atomic.Int64 // 上游已返回的字节数（原子累加）
 	clientFirstByteTimeUsec atomic.Int64 // 客户端侧首字节响应时间（微秒），CAS保证只写一次，0表示未设置
+	attemptIndex            atomic.Int32 // 当前 Key/凭证尝试次数（1-based）
 }
 
 type activeRequestAttempt struct {
@@ -78,6 +80,7 @@ type activeRequestAttempt struct {
 	BaseURL          string
 	CostMultiplier   float64
 	ThinkingEffort   string
+	AttemptIndex     int32
 }
 
 // activeRequestManager 管理进行中的请求（内存状态，不持久化）
@@ -122,6 +125,7 @@ func (m *activeRequestManager) BeginAttempt(id int64, attempt activeRequestAttem
 	req.CostMultiplier = attempt.CostMultiplier
 	req.UpstreamWebsocket = false
 	req.ThinkingEffort = normalizeThinkingEffort(attempt.ThinkingEffort)
+	req.attemptIndex.Store(attempt.AttemptIndex)
 	req.debugCapture = nil
 	req.clientFirstByteTimeUsec.Store(0)
 	req.bytesCounter.Store(0)
@@ -253,6 +257,7 @@ func (m *activeRequestManager) List() []*ActiveRequest {
 			BaseURL:           req.BaseURL,
 			BytesReceived:     req.bytesCounter.Load(),
 			CostMultiplier:    req.CostMultiplier,
+			AttemptIndex:      req.attemptIndex.Load(),
 			UpstreamWebsocket: req.UpstreamWebsocket,
 			DebugLogAvailable: req.debugCapture != nil,
 			ThinkingEffort:    req.ThinkingEffort,

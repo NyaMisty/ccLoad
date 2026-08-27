@@ -170,6 +170,7 @@ type proxyRequestContext struct {
 	startTime                  time.Time            // 请求开始时间（用于统计）
 	channelStartTime           time.Time            // 当前渠道尝试开始时间（每次切换渠道时重置）
 	attemptStartTime           time.Time            // 渠道内单次 Key/URL 尝试开始时间
+	attemptIndex               int                  // 当前请求链的 Key/凭证尝试次数（1-based）
 	baseURL                    string               // 当前尝试使用的上游URL（多URL场景）
 	debugData                  *model.DebugLogEntry // Debug日志数据（debug开启时填充）
 	thinkingEffort             string
@@ -915,6 +916,8 @@ type logEntryParams struct {
 	DebugData        *model.DebugLogEntry // Debug日志数据
 	CostMultiplier   float64              // 渠道成本倍率快照（0=免费，<0 视为 1）
 	ThinkingEffort   string
+	AttemptIndex     int32 // 瞬态重试次数，不持久化
+	RequestID        int64 // 瞬态请求链 ID，不持久化
 }
 
 // resolveProxyBillingModel 选择代理请求的计费模型。
@@ -1047,6 +1050,8 @@ func buildLogEntry(p logEntryParams) *model.LogEntry {
 		}
 	}
 	entry.DebugData = p.DebugData
+	entry.AttemptIndex = p.AttemptIndex
+	entry.RequestID = p.RequestID
 	return entry
 }
 
