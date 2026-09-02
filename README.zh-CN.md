@@ -1245,9 +1245,9 @@ storage/
 - `web_sessions` - 可绑定 API Token 的角色化 Web 会话
 - `system_settings` - 系统配置（数据库存储，保存后自动重启生效）
 
-请求快照不受 `debug_log_enabled` 开关影响，正文会完整保存；认证 Header
-及 URL 中携带凭据的查询参数会在落库前脱敏。按保留策略删除父日志时，
-对应请求快照也会通过外键级联删除。
+请求快照不受 `debug_log_enabled` 开关影响。捕获到的 URL（含查询参数）、
+全部 Header 名称与值（包括凭据）及正文均不作任何脱敏直接保存。按保留
+策略删除父日志时，对应请求快照也会通过外键级联删除。
 
 **架构特性**:
 - ✅ **统一SQL层**（重构）：SQLite、MySQL 和 PostgreSQL 共享 `storage/sql/` 实现

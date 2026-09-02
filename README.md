@@ -1210,10 +1210,11 @@ storage/
 - `web_sessions` - Role-aware Web sessions bound to an optional API token
 - `system_settings` - System config (database-backed, applied after automatic restart)
 
-Request snapshots are persisted independently of `debug_log_enabled`. Bodies are
-stored in full, while authentication headers and credential-bearing URL query
-parameters are redacted before storage. Deleting a parent log through the
-configured retention policy also deletes its request snapshots.
+Request snapshots are persisted independently of `debug_log_enabled`. Captured
+URLs (including query parameters), every captured header name and value
+(including credentials), and bodies are stored without redaction. Deleting a
+parent log through the configured retention policy also deletes its request
+snapshots.
 
 **Architecture Features**:
 - ✅ **Unified SQL Layer** (refactor): SQLite, MySQL, and PostgreSQL share `storage/sql/` implementation

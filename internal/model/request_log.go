@@ -6,8 +6,9 @@ const (
 	RequestTransportWebsocket = "websocket"
 )
 
-// RequestLogEntry is a credential-redacted snapshot of an HTTP or WebSocket
-// request. Body bytes are preserved exactly; Headers contains JSON.
+// RequestLogEntry is an unredacted snapshot of an HTTP or WebSocket request.
+// URL and body are preserved as captured; Headers contains every captured
+// header name and value encoded as JSON.
 type RequestLogEntry struct {
 	LogID      int64    `json:"log_id"`
 	Sequence   int      `json:"sequence,omitempty"`

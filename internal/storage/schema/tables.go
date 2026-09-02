@@ -225,7 +225,7 @@ func DefineLogsTable() *TableBuilder {
 }
 
 // DefineLogInboundRequestsTable stores the original accepted client request
-// for a log entry. Authentication headers are redacted before persistence.
+// for a log entry without redacting captured fields.
 func DefineLogInboundRequestsTable() *TableBuilder {
 	return NewTable("log_inbound_requests").
 		Column("log_id INT PRIMARY KEY").
@@ -239,7 +239,7 @@ func DefineLogInboundRequestsTable() *TableBuilder {
 }
 
 // DefineLogUpstreamRequestsTable stores selected upstream wire requests
-// associated with one log entry, including gateway-internal payload retries.
+// without redaction, including gateway-internal payload retries.
 func DefineLogUpstreamRequestsTable() *TableBuilder {
 	return NewTable("log_upstream_requests").
 		Column("log_id INT NOT NULL").
