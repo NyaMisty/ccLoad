@@ -320,6 +320,7 @@ func (s *Server) HandleProxyRequest(c *gin.Context) {
 	httpMetrics.observeRequest(isStreaming, len(all))
 
 	clientProtocol, effectiveRequestPath := clientRequestMetadata(c)
+	inboundRequest := captureInboundRequestLog(c.Request, all, model.RequestTransportHTTP)
 	if err := validateClientBodyMatchesProtocol(clientProtocol, all); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
@@ -432,6 +433,7 @@ func (s *Server) HandleProxyRequest(c *gin.Context) {
 			ClientIP:           c.ClientIP(),
 			ThinkingEffort:     thinkingEffort,
 			IsTerminalOverride: true,
+			InboundRequest:     inboundRequest.Clone(),
 		})
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "no available upstream (all cooled or none)"})
 		return
@@ -470,6 +472,7 @@ func (s *Server) HandleProxyRequest(c *gin.Context) {
 		tokenID:        tokenIDInt64,
 		clientIP:       c.ClientIP(),
 		startTime:      startTime,
+		inboundRequest: inboundRequest,
 		thinkingEffort: thinkingEffort,
 	}
 	if routingSession != nil {
@@ -498,6 +501,11 @@ func (s *Server) HandleProxyRequest(c *gin.Context) {
 		},
 		OnDebugCapture: func(dc *debugCapture) {
 			s.activeRequests.SetDebugCapture(reqCtx.activeReqID, dc)
+		},
+		OnUpstreamRequest: func(request *model.RequestLogEntry) {
+			if request != nil {
+				reqCtx.upstreamRequests = append(reqCtx.upstreamRequests, request.Clone())
+			}
 		},
 	}
 	defer func() {
@@ -759,6 +767,7 @@ func (s *Server) writeFinalProxyResponse(
 			ClientIP:           reqCtx.clientIP,
 			RequestID:          reqCtx.activeReqID,
 			IsTerminalOverride: true,
+			InboundRequest:     reqCtx.inboundRequest.Clone(),
 		})
 	}
 

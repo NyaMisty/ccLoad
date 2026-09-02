@@ -147,6 +147,7 @@ type ForwardObserver struct {
 	OnFirstByteRead     func()      // 首字节读取回调（可选）
 	OnUpstreamWebsocket func(bool)  // 实际上游传输变化回调（可选）
 	OnDebugCapture      func(*debugCapture)
+	OnUpstreamRequest   func(*model.RequestLogEntry)
 }
 
 // proxyRequestContext 代理请求上下文（封装请求信息，遵循DIP原则）
@@ -174,6 +175,8 @@ type proxyRequestContext struct {
 	apiKeyID                   int64                // 当前 API Key 数据库行 ID（亲和定位）
 	baseURL                    string               // 当前尝试使用的上游URL（多URL场景）
 	debugData                  *model.DebugLogEntry // Debug日志数据（debug开启时填充）
+	inboundRequest             *model.RequestLogEntry
+	upstreamRequests           []*model.RequestLogEntry
 	thinkingEffort             string
 	routingSession             *responsesExecutionSession // 当前 Responses execution session 的首选渠道
 	claudeAffinity             *claudeSessionAffinity     // 当前 Claude session 的直通软亲和
@@ -919,7 +922,9 @@ type logEntryParams struct {
 	ErrMsg           string
 	StartTime        time.Time            // 渠道尝试开始时间（用于日志记录）
 	DebugData        *model.DebugLogEntry // Debug日志数据
-	CostMultiplier   float64              // 渠道成本倍率快照（0=免费，<0 视为 1）
+	InboundRequest   *model.RequestLogEntry
+	UpstreamRequests []*model.RequestLogEntry
+	CostMultiplier   float64 // 渠道成本倍率快照（0=免费，<0 视为 1）
 	ThinkingEffort   string
 	AttemptIndex     int32 // 瞬态重试次数，不持久化
 	RequestID        int64 // 瞬态请求链 ID，不持久化
@@ -1055,6 +1060,8 @@ func buildLogEntry(p logEntryParams) *model.LogEntry {
 		}
 	}
 	entry.DebugData = p.DebugData
+	entry.InboundRequest = p.InboundRequest.Clone()
+	entry.UpstreamRequests = model.CloneRequestLogEntries(p.UpstreamRequests)
 	entry.AttemptIndex = p.AttemptIndex
 	entry.RequestID = p.RequestID
 	return entry

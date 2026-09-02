@@ -224,6 +224,36 @@ func DefineLogsTable() *TableBuilder {
 		Index("idx_logs_source_minute", "log_source, minute_bucket")
 }
 
+// DefineLogInboundRequestsTable stores the original accepted client request
+// for a log entry. Authentication headers are redacted before persistence.
+func DefineLogInboundRequestsTable() *TableBuilder {
+	return NewTable("log_inbound_requests").
+		Column("log_id INT PRIMARY KEY").
+		Column("captured_at BIGINT NOT NULL").
+		Column("transport VARCHAR(16) NOT NULL DEFAULT 'http'").
+		Column("method VARCHAR(16) NOT NULL DEFAULT ''").
+		Column("url TEXT NOT NULL").
+		Column("headers LONGTEXT NOT NULL").
+		Column("body LONGBLOB NOT NULL").
+		Column("FOREIGN KEY (log_id) REFERENCES logs(id) ON DELETE CASCADE")
+}
+
+// DefineLogUpstreamRequestsTable stores selected upstream wire requests
+// associated with one log entry, including gateway-internal payload retries.
+func DefineLogUpstreamRequestsTable() *TableBuilder {
+	return NewTable("log_upstream_requests").
+		Column("log_id INT NOT NULL").
+		Column("sequence INT NOT NULL").
+		Column("captured_at BIGINT NOT NULL").
+		Column("transport VARCHAR(16) NOT NULL DEFAULT 'http'").
+		Column("method VARCHAR(16) NOT NULL DEFAULT ''").
+		Column("url TEXT NOT NULL").
+		Column("headers LONGTEXT NOT NULL").
+		Column("body LONGBLOB NOT NULL").
+		Column("PRIMARY KEY (log_id, sequence)").
+		Column("FOREIGN KEY (log_id) REFERENCES logs(id) ON DELETE CASCADE")
+}
+
 // DefineDebugLogsTable 定义debug_logs表结构
 // log_id 与 logs.id 1:1 对应，直接作为主键，无需独立自增ID
 func DefineDebugLogsTable() *TableBuilder {

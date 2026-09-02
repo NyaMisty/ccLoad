@@ -199,7 +199,13 @@ func cleanupMySQLTables(t *testing.T, db *sql.DB) {
 	_, _ = db.Exec("SET FOREIGN_KEY_CHECKS = 0")
 	defer func() { _, _ = db.Exec("SET FOREIGN_KEY_CHECKS = 1") }()
 
-	tables := []string{"debug_logs", "logs", "web_sessions", "admin_sessions", "system_settings", "auth_tokens", "channel_model_cooldowns", "channel_url_states", "channel_models", "channel_protocol_transforms", "api_keys", "channels", "schema_migrations"}
+	tables := []string{
+		"log_inbound_requests", "log_upstream_requests", "debug_logs", "logs",
+		"web_sessions", "admin_sessions", "system_settings", "auth_tokens",
+		"channel_model_cooldowns", "channel_url_states", "channel_models",
+		"channel_protocol_transforms", "claude_session_affinities", "api_keys",
+		"channels", "schema_migrations",
+	}
 	for _, table := range tables {
 		_, _ = db.Exec("DROP TABLE IF EXISTS " + table)
 	}
@@ -224,7 +230,11 @@ func TestMySQL(t *testing.T) {
 		defer func() { _ = store.Close() }()
 
 		// 验证关键表存在
-		tables := []string{"channels", "api_keys", "channel_models", "auth_tokens", "logs", "system_settings", "web_sessions"}
+		tables := []string{
+			"channels", "api_keys", "claude_session_affinities", "channel_models",
+			"auth_tokens", "logs", "log_inbound_requests", "log_upstream_requests",
+			"system_settings", "web_sessions",
+		}
 		for _, table := range tables {
 			var count int
 			err := env.db.QueryRow(fmt.Sprintf("SELECT COUNT(*) FROM %s", table)).Scan(&count)

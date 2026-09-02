@@ -71,6 +71,8 @@ func migrate(ctx context.Context, db *sql.DB, dialect Dialect) error {
 		schema.DefineSystemSettingsTable,
 		schema.DefineWebSessionsTable,
 		schema.DefineLogsTable,
+		schema.DefineLogInboundRequestsTable,
+		schema.DefineLogUpstreamRequestsTable,
 		schema.DefineDebugLogsTable,
 	}
 

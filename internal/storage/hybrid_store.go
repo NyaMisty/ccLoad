@@ -140,6 +140,8 @@ func cloneLogEntryForSync(e *model.LogEntry) *model.LogEntry {
 	// 同步到主库时丢弃 DebugData：调试原始请求/响应体仅保留在 SQLite，
 	// 避免膨胀主库；但 logs 表主数据仍需正常同步
 	clone.DebugData = nil
+	clone.InboundRequest = e.InboundRequest.Clone()
+	clone.UpstreamRequests = model.CloneRequestLogEntries(e.UpstreamRequests)
 	return &clone
 }
 
@@ -696,6 +698,24 @@ func (h *HybridStore) CountLogsRange(ctx context.Context, since, until time.Time
 func (h *HybridStore) GetTodayChannelURLStats(ctx context.Context, dayStart time.Time) ([]model.ChannelURLLogStat, error) {
 	return readAnalytics(h, "GetTodayChannelURLStats", func(store *sqlstore.SQLStore) ([]model.ChannelURLLogStat, error) {
 		return store.GetTodayChannelURLStats(ctx, dayStart)
+	})
+}
+
+func (h *HybridStore) GetLogInboundRequest(
+	ctx context.Context,
+	logID int64,
+) (*model.RequestLogEntry, error) {
+	return readAnalytics(h, "GetLogInboundRequest", func(store *sqlstore.SQLStore) (*model.RequestLogEntry, error) {
+		return store.GetLogInboundRequest(ctx, logID)
+	})
+}
+
+func (h *HybridStore) GetLogUpstreamRequests(
+	ctx context.Context,
+	logID int64,
+) ([]*model.RequestLogEntry, error) {
+	return readAnalytics(h, "GetLogUpstreamRequests", func(store *sqlstore.SQLStore) ([]*model.RequestLogEntry, error) {
+		return store.GetLogUpstreamRequests(ctx, logID)
 	})
 }
 

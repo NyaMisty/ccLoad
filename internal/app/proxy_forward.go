@@ -1918,6 +1918,15 @@ func (s *Server) forwardOnceAsyncWithNativeCodexWebsocket(
 			debugBody = wireBody
 		}
 	}
+	if err == nil || (!errors.Is(err, ErrChannelRPMExceeded) && !errors.Is(err, ErrKeyConcurrencyExceeded)) {
+		transport := model.RequestTransportHTTP
+		if usedNativeWebsocket {
+			transport = model.RequestTransportWebsocket
+		}
+		if observer != nil && observer.OnUpstreamRequest != nil {
+			observer.OnUpstreamRequest(captureUpstreamRequestLog(debugReq, debugBody, transport))
+		}
+	}
 	dc := s.captureDebugRequest(debugReq, debugBody)
 	dc.captureUpstreamError(err)
 	if reqCtx.transformPlan.NeedsTransform || reqCtx.antigravityOAuth {
@@ -2181,6 +2190,7 @@ func (s *Server) forwardAttempt(
 ) (*proxyResult, cooldown.Action, error) {
 	// 记录渠道尝试开始时间（用于日志记录，每次渠道/Key切换时更新）
 	reqCtx.attemptStartTime = time.Now()
+	reqCtx.upstreamRequests = nil
 	reqCtx.baseURL = baseURL
 	reqCtx.upstreamProtocol = upstreamProtocol
 	actualModel, bodyToSend := s.prepareRequestBody(cfg, reqCtx, upstreamProtocol)

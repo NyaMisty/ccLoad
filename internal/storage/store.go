@@ -84,6 +84,8 @@ type Store interface {
 	CountLogsRange(ctx context.Context, since, until time.Time, filter *model.LogFilter) (int, error)
 	GetTodayChannelURLStats(ctx context.Context, dayStart time.Time) ([]model.ChannelURLLogStat, error)
 	CleanupLogsBefore(ctx context.Context, cutoff time.Time) error
+	GetLogInboundRequest(ctx context.Context, logID int64) (*model.RequestLogEntry, error)
+	GetLogUpstreamRequests(ctx context.Context, logID int64) ([]*model.RequestLogEntry, error)
 
 	// === Debug Log Management ===
 	AddDebugLog(ctx context.Context, e *model.DebugLogEntry) error

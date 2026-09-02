@@ -459,6 +459,10 @@ func (s *Server) executeResponsesWebsocketTurn(
 
 	header := responsesWebsocketUpstreamHeaders(c.Request.Header)
 	header.Set("Content-Type", "application/json")
+	inboundRequest := captureInboundRequestLog(c.Request, requestBody, model.RequestTransportWebsocket)
+	if inboundRequest != nil {
+		inboundRequest.Method = "WEBSOCKET"
+	}
 	reqCtx := &proxyRequestContext{
 		originalModel:              modelName,
 		clientProtocol:             protocol.Codex,
@@ -474,6 +478,7 @@ func (s *Server) executeResponsesWebsocketTurn(
 		tokenID:                    tokenIDInt64,
 		clientIP:                   c.ClientIP(),
 		startTime:                  startTime,
+		inboundRequest:             inboundRequest,
 		thinkingEffort:             thinkingEffort,
 		routingSession:             executionSession,
 		nativeCodexWS:              nativeCodexWS,
@@ -493,6 +498,11 @@ func (s *Server) executeResponsesWebsocketTurn(
 		},
 		OnDebugCapture: func(dc *debugCapture) {
 			s.activeRequests.SetDebugCapture(reqCtx.activeReqID, dc)
+		},
+		OnUpstreamRequest: func(request *model.RequestLogEntry) {
+			if request != nil {
+				reqCtx.upstreamRequests = append(reqCtx.upstreamRequests, request.Clone())
+			}
 		},
 	}
 	defer func() {

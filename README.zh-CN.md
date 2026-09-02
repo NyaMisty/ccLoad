@@ -1235,12 +1235,19 @@ storage/
 - `channels` - 渠道配置（渠道级冷却内联，UNIQUE 约束 name，含上游协议、定时检测配置、RPM/并发限制配置）
 - `api_keys` - API 密钥（Key 级冷却内联，支持多 Key 策略）
 - `channel_model_cooldowns` - 模型级运行时冷却，主键为渠道和实际上游模型
+- `claude_session_affinities` - 按上游 API Key 持久化的 Claude 直通软亲和
 - `logs` - 请求日志（含base_url上游URL追踪）
+- `log_inbound_requests` - 与 `logs` 关联的原始入站请求快照
+- `log_upstream_requests` - 实际发往上游的请求快照，包含网关内部重试
 - `debug_logs` - 调试日志（上游请求/响应原始数据，独立清理策略）
 - `key_rr` - 轮询指针（channel_id → idx）
 - `auth_tokens` - 认证令牌（支持费用限额、模型/渠道限制、并发限制、首字节时间记录）
 - `web_sessions` - 可绑定 API Token 的角色化 Web 会话
 - `system_settings` - 系统配置（数据库存储，保存后自动重启生效）
+
+请求快照不受 `debug_log_enabled` 开关影响，正文会完整保存；认证 Header
+及 URL 中携带凭据的查询参数会在落库前脱敏。按保留策略删除父日志时，
+对应请求快照也会通过外键级联删除。
 
 **架构特性**:
 - ✅ **统一SQL层**（重构）：SQLite、MySQL 和 PostgreSQL 共享 `storage/sql/` 实现

@@ -128,9 +128,11 @@ func cleanupPostgresTables(t *testing.T, db *sql.DB) {
 	t.Helper()
 
 	tables := []string{
-		"debug_logs", "logs", "web_sessions", "admin_sessions", "system_settings",
-		"auth_tokens", "channel_models", "channel_model_cooldowns", "channel_protocol_transforms", "api_keys", "channel_url_states",
-		"channels", "schema_migrations", "key_rr",
+		"log_inbound_requests", "log_upstream_requests", "debug_logs", "logs",
+		"web_sessions", "admin_sessions", "system_settings", "auth_tokens",
+		"channel_models", "channel_model_cooldowns", "channel_protocol_transforms",
+		"claude_session_affinities", "api_keys", "channel_url_states", "channels",
+		"schema_migrations", "key_rr",
 	}
 	for _, table := range tables {
 		if _, err := db.Exec("DROP TABLE IF EXISTS " + table + " CASCADE"); err != nil {
@@ -163,7 +165,11 @@ func TestPostgres(t *testing.T) {
 		}
 		defer func() { _ = store.Close() }()
 
-		tables := []string{"channels", "api_keys", "channel_models", "auth_tokens", "logs", "system_settings", "web_sessions", "schema_migrations"}
+		tables := []string{
+			"channels", "api_keys", "claude_session_affinities", "channel_models",
+			"auth_tokens", "logs", "log_inbound_requests", "log_upstream_requests",
+			"system_settings", "web_sessions", "schema_migrations",
+		}
 		for _, table := range tables {
 			var count int
 			if err := env.db.QueryRow(fmt.Sprintf("SELECT COUNT(*) FROM %s", table)).Scan(&count); err != nil {

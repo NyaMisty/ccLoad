@@ -1200,12 +1200,20 @@ storage/
 - `channels` - Channel config (channel-level cooldown inline, UNIQUE constraint on name, with multi-protocol handling config, scheduled check config, RPM/concurrency limit config)
 - `api_keys` - API keys (key-level cooldown inline, multi-key strategies)
 - `channel_model_cooldowns` - Model-level runtime cooldown keyed by channel and actual upstream model
+- `claude_session_affinities` - Persistent native Claude soft affinity keyed to an upstream API key
 - `logs` - Request logs (with base_url upstream URL tracking)
+- `log_inbound_requests` - Original accepted client request snapshots linked to `logs`
+- `log_upstream_requests` - Actual upstream wire request snapshots, including gateway-internal retries
 - `debug_logs` - Debug logs (upstream request/response raw data, independent cleanup policy)
 - `key_rr` - Round-robin pointers (channel_id → idx)
 - `auth_tokens` - Auth tokens (with cost limits, model/channel restrictions, concurrency limits, first byte time tracking)
 - `web_sessions` - Role-aware Web sessions bound to an optional API token
 - `system_settings` - System config (database-backed, applied after automatic restart)
+
+Request snapshots are persisted independently of `debug_log_enabled`. Bodies are
+stored in full, while authentication headers and credential-bearing URL query
+parameters are redacted before storage. Deleting a parent log through the
+configured retention policy also deletes its request snapshots.
 
 **Architecture Features**:
 - ✅ **Unified SQL Layer** (refactor): SQLite, MySQL, and PostgreSQL share `storage/sql/` implementation

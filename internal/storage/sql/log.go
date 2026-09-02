@@ -205,6 +205,9 @@ func (s *SQLStore) addLog(ctx context.Context, e *model.LogEntry, updateOAuthQuo
 			return nil, err
 		}
 	}
+	if err := insertLogRequestDetails(ctx, s, tx, []*model.LogEntry{e}); err != nil {
+		return nil, err
+	}
 	var updatedChannelIDs []int64
 	if updateOAuthQuotaCost {
 		updatedChannelIDs, err = s.updateOAuthQuotaCostsTx(ctx, tx, []*model.LogEntry{e})
@@ -304,6 +307,9 @@ func (s *SQLStore) batchAddLogs(
 		if err := insertLogsWithDebug(ctx, s, tx, withDebug); err != nil {
 			return nil, err
 		}
+	}
+	if err := insertLogRequestDetails(ctx, s, tx, logs); err != nil {
+		return nil, err
 	}
 	var updatedChannelIDs []int64
 	if updateOAuthQuotaCost {

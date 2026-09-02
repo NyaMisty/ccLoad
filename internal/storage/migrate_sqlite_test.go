@@ -167,8 +167,11 @@ func TestMigrate_SQLite_FullFlow(t *testing.T) {
 	}
 
 	// 验证核心表存在
-	tables := []string{"channels", "api_keys", "channel_models", "auth_tokens",
-		"system_settings", "web_sessions", "logs", "schema_migrations"}
+	tables := []string{
+		"channels", "api_keys", "claude_session_affinities", "channel_models",
+		"auth_tokens", "system_settings", "web_sessions", "logs",
+		"log_inbound_requests", "log_upstream_requests", "schema_migrations",
+	}
 	for _, tbl := range tables {
 		var name string
 		err := db.QueryRowContext(ctx,

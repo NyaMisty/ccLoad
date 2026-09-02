@@ -100,6 +100,9 @@ type LogEntry struct {
 
 	// 瞬态字段：不持久化到 logs 表，仅用于传递 debug 数据到写入管道
 	DebugData *DebugLogEntry `json:"-"`
+	// 请求快照与日志在同一事务写入各自的明细表。
+	InboundRequest   *RequestLogEntry   `json:"-"`
+	UpstreamRequests []*RequestLogEntry `json:"-"`
 
 	// 以下字段仅在内存中关联重试链，不写入 logs 表。
 	AttemptIndex       int32 `json:"attempt_index,omitempty"`
