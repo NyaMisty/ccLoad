@@ -1616,6 +1616,14 @@ func (s *Server) stateCleanupLoop() {
 			if s.channelRPMLimiter != nil {
 				s.channelRPMLimiter.CleanupExpired()
 			}
+			cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), cooldownWriteTimeout)
+			if err := s.store.CleanupClaudeSessionAffinities(cleanupCtx, time.Now()); err != nil {
+				count := claudeAffinityCleanupFailureCount.Add(1)
+				if count%100 == 1 {
+					log.Printf("[WARN] 清理过期 Claude session Key 亲和失败 (累计: %d): %v", count, err)
+				}
+			}
+			cleanupCancel()
 		}
 	}
 }

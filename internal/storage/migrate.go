@@ -63,6 +63,7 @@ func migrate(ctx context.Context, db *sql.DB, dialect Dialect) error {
 		schema.DefineSchemaMigrationsTable, // 迁移版本表必须最先创建
 		schema.DefineChannelsTable,
 		schema.DefineAPIKeysTable,
+		schema.DefineClaudeSessionAffinitiesTable,
 		schema.DefineChannelModelsTable,
 		schema.DefineChannelModelCooldownsTable,
 		schema.DefineChannelURLStatesTable,

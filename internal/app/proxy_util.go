@@ -171,10 +171,15 @@ type proxyRequestContext struct {
 	channelStartTime           time.Time            // 当前渠道尝试开始时间（每次切换渠道时重置）
 	attemptStartTime           time.Time            // 渠道内单次 Key/URL 尝试开始时间
 	attemptIndex               int                  // 当前请求链的 Key/凭证尝试次数（1-based）
+	apiKeyID                   int64                // 当前 API Key 数据库行 ID（亲和定位）
 	baseURL                    string               // 当前尝试使用的上游URL（多URL场景）
 	debugData                  *model.DebugLogEntry // Debug日志数据（debug开启时填充）
 	thinkingEffort             string
 	routingSession             *responsesExecutionSession // 当前 Responses execution session 的首选渠道
+	claudeAffinity             *claudeSessionAffinity     // 当前 Claude session 的直通软亲和
+	claudeAffinityProbe        bool                       // 当前只尝试亲和 Key，不允许扩展为同渠道其他 Key
+	claudeAffinityTriedChannel int64                      // 亲和探测已尝试的渠道定位
+	claudeAffinityTriedKey     int                        // 普通回退时避免在同一请求内重复探测 Key
 	nativeCodexWS              *codexUpstreamWebsocketSession
 	nativeCodexBody            []byte
 	quotaOverdraftTranscript   []byte

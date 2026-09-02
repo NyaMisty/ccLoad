@@ -56,6 +56,12 @@ www/                 独立介绍站(`make www-setup` 复制共享资源后可�
 | 加 Admin API | `admin_types.go` 定类型 → `admin_<feature>.go` 实现 → `server.go:SetupRoutes` 注册 |
 | 数据库 | Schema 启动自动 `migrate.go`;事务 `(*SQLStore).WithTransaction`;改后失效 `InvalidateChannelListCache`/`InvalidateAPIKeysCache` |
 
+## Claude Anthropic 直通软亲和
+
+- **范围与身份**:仅作用于客户端和实际上游均为 Anthropic Messages 的 `POST /v1/messages`/`POST /messages`;身份键是入站 Token 哈希 + 合法 UUID Claude session。session 优先取 `X-Claude-Code-Session-Id`,缺失或非法时回退 `metadata.user_id.session_id`;`device_id` 不是 session,仍按本次实际选中的上游 Key 独立派生
+- **目标与软语义**:亲和目标只能是上游 API Key,不绑定渠道或 URL;`api_key_id` 标识 Key 行,`channel_id + key_index` 只负责路由定位,实际命中前还必须校验 Key 哈希。成本、可用时段、Token 渠道权限、禁用和冷却先过滤,目标 Key 不健康时回到未改动的普通渠道顺序。fallback 成功不覆盖仍有效的原 Key,原 Key 恢复后重新优先;OAuth 没有 API Key,不建立此亲和
+- **生命周期**:目标自最后一次成功命中起保留 1h,到期后由下一次成功 Key 重新绑定。只把 session/Token 组合摘要、Key 摘要和定位字段写入 `claude_session_affinities`,不保存明文 Token、session 或 Key;纯数据库模式写当前数据库,混合模式写权威 SQLite,进程重启后仍可恢复
+
 ## Responses WebSocket 会话与资源
 
 - **执行身份**:同 Token 下以 `Session-Id` 标识顶层会话;存在 `Thread-Id` 时组合两者,隔离 Codex 主/子代理的 transcript、Response ID、turn lock;无 `Thread-Id` 回退原 `Session-Id` 契约。禁止改用请求体 `session_id`、`prompt_cache_key` 或每回合变化的 request/turn/window ID

@@ -552,6 +552,8 @@ curl -X POST http://localhost:8080/v1/messages \
   }'
 ```
 
+For native Claude Code traffic that reaches an Anthropic Messages upstream, ccLoad provides persistent soft affinity for valid UUID sessions. It prefers `X-Claude-Code-Session-Id` and falls back to `metadata.user_id.session_id`, then keeps the first successful upstream API key preferred within the same inbound API-token scope. The stored API key row ID identifies the target; channel and key indexes only locate it for routing, the key hash is verified before use, and no URL is bound. Affinity only probes a key that remains allowed, enabled, and outside cooldown; an unavailable or failed key returns routing to its unchanged normal channel order. Fallback success does not replace a live original key, and a recovered original key becomes preferred again. The binding is retained for one hour after its latest successful hit and is stored in `claude_session_affinities` without plaintext tokens, sessions, or keys. OAuth channels do not participate because they have no API key. `device_id` is not a session identifier and remains derived from the API key selected for each actual attempt.
+
 **OpenAI Compatible API Proxy (Chat Completions)**:
 
 ```bash

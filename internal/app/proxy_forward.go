@@ -3421,8 +3421,19 @@ func (s *Server) tryChannelWithKeys(ctx context.Context, cfg *model.Config, reqC
 	if cfg.RetryOtherKeysOnFailure {
 		maxUpstreamKeyAttempts = actualKeyCount
 	}
+	if reqCtx.claudeAffinityProbe {
+		maxUpstreamKeyAttempts = 1
+	}
 
 	triedKeys := make(map[int]bool) // 本次请求内已尝试过的Key
+	if !reqCtx.claudeAffinityProbe && reqCtx.claudeAffinityTriedChannel == cfg.ID {
+		for _, apiKey := range apiKeys {
+			if apiKey != nil && apiKey.KeyIndex == reqCtx.claudeAffinityTriedKey {
+				triedKeys[apiKey.KeyIndex] = true
+				break
+			}
+		}
+	}
 
 	var lastFailure *proxyResult
 	var lastConcurrencyErr error
@@ -3457,7 +3468,12 @@ func (s *Server) tryChannelWithKeys(ctx context.Context, cfg *model.Config, reqC
 
 		// 选择可用的API Key（直接传入apiKeys，避免重复查询）
 		keyIndex, selectedKey, pinned := 0, "", false
-		if !cfg.RetryOtherKeysOnFailure {
+		if reqCtx.claudeAffinityProbe {
+			keyIndex, selectedKey, pinned = selectClaudeAffinityKey(cfg, apiKeys, triedKeys, reqCtx.claudeAffinity)
+			if !pinned {
+				return nil, ErrAllKeysUnavailable
+			}
+		} else if !cfg.RetryOtherKeysOnFailure {
 			keyIndex, selectedKey, pinned = selectPinnedCodexWebsocketKey(cfg, apiKeys, triedKeys, reqCtx.nativeCodexWS)
 		}
 		var selectErr error
@@ -3471,6 +3487,14 @@ func (s *Server) tryChannelWithKeys(ctx context.Context, cfg *model.Config, reqC
 			return nil, selectErr
 		}
 
+		reqCtx.apiKeyID = 0
+		for _, apiKey := range apiKeys {
+			if apiKey != nil && apiKey.KeyIndex == keyIndex {
+				reqCtx.apiKeyID = apiKey.ID
+				break
+			}
+		}
+
 		// 标记Key为已尝试
 		triedKeys[keyIndex] = true
 
@@ -3480,6 +3504,9 @@ func (s *Server) tryChannelWithKeys(ctx context.Context, cfg *model.Config, reqC
 			keyIndex, selectedKey, reqCtx, w)
 		if attemptErr != nil {
 			if errors.Is(attemptErr, ErrKeyConcurrencyExceeded) {
+				if reqCtx.claudeAffinityProbe {
+					return nil, attemptErr
+				}
 				lastConcurrencyErr = attemptErr
 				concurrencyLimitedKeys++
 				if _, limit, ok := keyConcurrencyLimit(attemptErr); ok {

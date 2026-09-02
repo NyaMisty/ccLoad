@@ -530,6 +530,20 @@ func (s *Server) handleProxySuccess(
 	// 冷却状态已恢复，刷新相关缓存避免下次命中过期数据
 	s.invalidateChannelRelatedCache(cfg.ID)
 
+	if reqCtx.claudeAffinity != nil &&
+		reqCtx.clientProtocol == protocol.Anthropic &&
+		reqCtx.upstreamProtocol == protocol.Anthropic {
+		if target, ok := newClaudeAffinityTarget(cfg, reqCtx.apiKeyID, keyIndex, selectedKey); ok {
+			affinityCtx, affinityCancel := cooldownWriteContext(ctx)
+			if err := reqCtx.claudeAffinity.remember(affinityCtx, target); err != nil {
+				count := claudeAffinityWriteFailureCount.Add(1)
+				if count%100 == 1 {
+					log.Printf("[WARN] 持久化 Claude session Key 亲和失败 (累计: %d): %v", count, err)
+				}
+			}
+			affinityCancel()
+		}
+	}
 	if cfg.RetryOtherKeysOnFailure && reqCtx.routingSession != nil {
 		reqCtx.routingSession.rememberPreferredChannel(cfg.ID)
 	}

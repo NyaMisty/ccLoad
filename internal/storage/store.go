@@ -50,6 +50,11 @@ type Store interface {
 	CompactKeyIndices(ctx context.Context, channelID int64, removedIndex int) error
 	DeleteAllAPIKeys(ctx context.Context, channelID int64) error
 
+	// === Claude Session Affinity ===
+	GetClaudeSessionAffinity(ctx context.Context, subjectSessionHash string, now time.Time) (*model.ClaudeSessionAffinity, error)
+	RememberClaudeSessionAffinity(ctx context.Context, affinity *model.ClaudeSessionAffinity, now time.Time) error
+	CleanupClaudeSessionAffinities(ctx context.Context, now time.Time) error
+
 	// === Cooldown Management ===
 	ConfigureCooldown(settings util.CooldownSettings)
 	// Channel-level cooldown

@@ -341,6 +341,18 @@ func (s *Server) HandleProxyRequest(c *gin.Context) {
 		return
 	}
 
+	var claudeAffinity *claudeSessionAffinity
+	if clientProtocol == protocol.Anthropic && requestMethod == http.MethodPost &&
+		isAnthropicMessagesRequest(protocol.Anthropic, effectiveRequestPath) {
+		claudeAffinity = newClaudeSessionAffinity(s.store, tokenHashStr, c.Request.Header, all)
+		if err := claudeAffinity.load(c.Request.Context()); err != nil {
+			count := claudeAffinityLoadFailureCount.Add(1)
+			if count%100 == 1 {
+				log.Printf("[WARN] 加载 Claude session Key 亲和失败 (累计: %d): %v", count, err)
+			}
+		}
+	}
+
 	timeout := parseTimeout(c.Request.URL.Query(), c.Request.Header)
 	ctx := c.Request.Context()
 	var cancel context.CancelFunc
@@ -462,6 +474,9 @@ func (s *Server) HandleProxyRequest(c *gin.Context) {
 	}
 	if routingSession != nil {
 		reqCtx.routingSession = routingSession
+	}
+	if claudeAffinity != nil {
+		reqCtx.claudeAffinity = claudeAffinity
 	}
 	if executionSession != nil {
 		reqCtx.codexMultiAgentV2Optimized = executionSession.codexMultiAgentV2StateSnapshot()
@@ -600,7 +615,21 @@ func (s *Server) runProxyAttemptLoop(
 	reqCtx *proxyRequestContext,
 	w http.ResponseWriter,
 ) (lastResult *proxyResult, succeeded bool) {
-	return s.runProxyAttemptLoopWithFailureBoundary(ctx, cands, reqCtx, w, nil)
+	affinityResult, affinityAttempted := s.tryClaudeAffinityKey(ctx, cands, reqCtx, w)
+	if affinityAttempted && affinityResult != nil {
+		if affinityResult.succeeded {
+			return affinityResult, true
+		}
+		if shouldStopTryingChannels(affinityResult) {
+			return affinityResult, false
+		}
+	}
+
+	lastResult, succeeded = s.runProxyAttemptLoopWithFailureBoundary(ctx, cands, reqCtx, w, nil)
+	if lastResult == nil && affinityResult != nil {
+		lastResult = affinityResult
+	}
+	return lastResult, succeeded
 }
 
 func (s *Server) runProxyAttemptLoopWithFailureBoundary(

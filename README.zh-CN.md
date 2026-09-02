@@ -567,6 +567,8 @@ curl -X POST http://localhost:8080/v1/messages \
   }'
 ```
 
+Claude Code 直通 Anthropic Messages 时，ccLoad 会对合法 UUID 会话建立持久化软亲和：优先读取 `X-Claude-Code-Session-Id`，缺失或非法时回退 `metadata.user_id.session_id`，并在同一入站 API 令牌范围内优先使用首次成功的上游 API Key。表中的 API Key 行 ID 标识亲和目标，渠道 ID 和 Key 下标只负责路由定位，命中前仍会校验 Key 哈希，不绑定 URL。亲和只探测仍有权限且未禁用、未冷却的 Key；Key 不可用或失败时会回到完全未改动的普通渠道顺序。fallback 成功不会覆盖仍有效的原 Key，原 Key 恢复后会再次优先。绑定从最后一次成功命中起保留 1 小时，写入 `claude_session_affinities`，且不保存明文令牌、session 或 Key。OAuth 渠道没有 API Key，因此不参与此亲和。`device_id` 不参与会话识别，仍由每次实际选中的上游 Key 稳定派生。
+
 **OpenAI 兼容 API 代理（Chat Completions）**：
 
 OpenAI SDK 只需替换 `base_url` 即可接入，业务代码无需改动：

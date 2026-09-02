@@ -21,7 +21,7 @@ import (
 // - 权威读写：使用 SQLite，主库延迟不进入请求热路径
 // - 后台复制：按实体合并最终状态，失败 10 秒后重试
 // - 本地分析：日志与统计默认使用 SQLite；读取失败后可回退主库
-// - 本地临时数据：Web session 和 DebugData 仅存 SQLite
+// - 本地数据：Web session、Claude session affinity 和 DebugData 仅存 SQLite
 //
 // 设计原则：
 // - SQLite = source of truth
@@ -453,6 +453,31 @@ func (h *HybridStore) DeleteAllAPIKeys(ctx context.Context, channelID int64) err
 
 	h.markChannelDirty(channelID, false)
 	return nil
+}
+
+// === Claude Session Affinity ===
+// Session affinity belongs to the authoritative local SQLite database in
+// hybrid mode. It survives restarts without putting primary latency on the
+// request routing path.
+
+func (h *HybridStore) GetClaudeSessionAffinity(
+	ctx context.Context,
+	subjectSessionHash string,
+	now time.Time,
+) (*model.ClaudeSessionAffinity, error) {
+	return h.sqlite.GetClaudeSessionAffinity(ctx, subjectSessionHash, now)
+}
+
+func (h *HybridStore) RememberClaudeSessionAffinity(
+	ctx context.Context,
+	affinity *model.ClaudeSessionAffinity,
+	now time.Time,
+) error {
+	return h.sqlite.RememberClaudeSessionAffinity(ctx, affinity, now)
+}
+
+func (h *HybridStore) CleanupClaudeSessionAffinities(ctx context.Context, now time.Time) error {
+	return h.sqlite.CleanupClaudeSessionAffinities(ctx, now)
 }
 
 // === Cooldown Management ===
