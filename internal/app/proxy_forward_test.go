@@ -1372,6 +1372,23 @@ func TestAnthropicOAuthPreservesMarkerlessHaikuHelper(t *testing.T) {
 	if strings.Contains(string(finalized), "cache_control") || gjson.GetBytes(finalized, "system").Exists() {
 		t.Fatalf("helper gained synthetic native fields: %s", finalized)
 	}
+	apiKeyBody, err := finalizeAnthropicClaudeCodeMessagesBody(
+		body, &model.Config{Name: "anthropic-api-key"}, "sk-ant-helper", headers,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	apiKeyUserID := gjson.GetBytes(apiKeyBody, "metadata.user_id").String()
+	if got, want := gjson.Get(apiKeyUserID, "device_id").String(),
+		synthesizeAnthropicAPIKeyCredential("sk-ant-helper").DeviceID; got != want {
+		t.Fatalf("API Key helper device_id=%q, want %q", got, want)
+	}
+	if gjson.Get(apiKeyUserID, "account_uuid").String() != "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb" ||
+		gjson.Get(apiKeyUserID, "session_id").String() != sessionID ||
+		gjson.GetBytes(apiKeyBody, "system").Exists() ||
+		!anthropicJSONObjectHasOrderedKeys(apiKeyBody, []string{"model", "max_tokens", "messages", "metadata"}) {
+		t.Fatalf("API Key helper native shape changed: %s", apiKeyBody)
+	}
 	otherCredentialJSON, err := (&anthropicauth.Credential{
 		Type: anthropicauth.ChannelType, AccessToken: "other-access", RefreshToken: "other-refresh",
 		Expired: "2030-01-01T00:00:00Z", AccountUUID: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
@@ -1828,6 +1845,9 @@ func TestSynthesizedAnthropicAPIKeyIdentityIsStable(t *testing.T) {
 	if first.DeviceID != again.DeviceID || first.AccountUUID != again.AccountUUID {
 		t.Fatalf("identity drifted across calls: %+v vs %+v", first, again)
 	}
+	if want := "f004d144f934184870b24255ff4593ecda912490f1ee8ea6e0b5972118ca9b27"; first.DeviceID != want {
+		t.Fatalf("stable device vector changed: got %q, want %q", first.DeviceID, want)
+	}
 	if first.DeviceID == other.DeviceID || first.AccountUUID == other.AccountUUID {
 		t.Fatalf("distinct API keys share an identity: %+v vs %+v", first, other)
 	}
@@ -1836,6 +1856,117 @@ func TestSynthesizedAnthropicAPIKeyIdentityIsStable(t *testing.T) {
 	}
 	if synthesizeAnthropicAPIKeyCredential("   ") != nil {
 		t.Fatal("blank API key must not synthesize an identity")
+	}
+}
+
+func TestAnthropicAPIKeyNativeDeviceFollowsSelectedKey(t *testing.T) {
+	const (
+		callerDevice = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+		accountUUID  = "9b079a70-8780-5404-bbaf-d74217f5adfd"
+		sessionID    = "e03895ad-8b34-4a84-bbf6-002e8909b17b"
+	)
+	identity := fmt.Sprintf(
+		`{"device_id":%q,"account_uuid":%q,"session_id":%q,"parent_session_id":"parent"}`,
+		callerDevice, accountUUID, sessionID,
+	)
+	body := []byte(fmt.Sprintf(`{
+		"model":"claude-sonnet-4-6",
+		"system":[
+			{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.220.abc; cc_entrypoint=cli; cch=00000;"},
+			{"type":"text","text":"keep native policy","cache_control":{"type":"ephemeral","ttl":"1h"}}
+		],
+		"metadata":{"user_id":%q,"keep":"metadata"},
+		"messages":[{"role":"user","content":"hello"}],
+		"max_tokens":1024
+	}`, identity))
+	headers := http.Header{
+		"User-Agent":               {"claude-cli/2.1.220 (external, cli)"},
+		"X-App":                    {"cli"},
+		"Anthropic-Beta":           {"claude-code-20250219"},
+		"X-Claude-Code-Session-Id": {sessionID},
+	}
+	cfg := &model.Config{Name: "anthropic-api-key"}
+
+	finalize := func(t *testing.T, apiKey string) []byte {
+		t.Helper()
+		finalized, err := finalizeAnthropicClaudeCodeMessagesBody(body, cfg, apiKey, headers)
+		if err != nil {
+			t.Fatalf("finalize with %q: %v", apiKey, err)
+		}
+		if bytes.Contains(finalized, []byte(`"temperature"`)) ||
+			gjson.GetBytes(finalized, "system.1.cache_control.ttl").String() != "1h" ||
+			gjson.GetBytes(finalized, "metadata.keep").String() != "metadata" {
+			t.Fatalf("native body policy changed for %q: %s", apiKey, finalized)
+		}
+		userID := gjson.GetBytes(finalized, "metadata.user_id").String()
+		if got := gjson.Get(userID, "account_uuid").String(); got != accountUUID {
+			t.Fatalf("account_uuid=%q, want %q", got, accountUUID)
+		}
+		if got := gjson.Get(userID, "session_id").String(); got != sessionID {
+			t.Fatalf("session_id=%q, want %q", got, sessionID)
+		}
+		if got := gjson.Get(userID, "parent_session_id").String(); got != "parent" {
+			t.Fatalf("parent_session_id=%q, want parent", got)
+		}
+		resigned, err := finalizeAnthropicCCH(finalized)
+		if err != nil || !bytes.Equal(resigned, finalized) {
+			t.Fatalf("CCH is stale after binding %q: err=%v body=%s", apiKey, err, finalized)
+		}
+		return finalized
+	}
+
+	first := finalize(t, "sk-ant-device-a")
+	again := finalize(t, "  sk-ant-device-a  ")
+	other := finalize(t, "sk-ant-device-b")
+	firstDevice := gjson.Get(gjson.GetBytes(first, "metadata.user_id").String(), "device_id").String()
+	againDevice := gjson.Get(gjson.GetBytes(again, "metadata.user_id").String(), "device_id").String()
+	otherDevice := gjson.Get(gjson.GetBytes(other, "metadata.user_id").String(), "device_id").String()
+	if want := synthesizeAnthropicAPIKeyCredential("sk-ant-device-a").DeviceID; firstDevice != want {
+		t.Fatalf("device_id=%q, want selected-key device %q", firstDevice, want)
+	}
+	if firstDevice == callerDevice || firstDevice != againDevice || firstDevice == otherDevice {
+		t.Fatalf("device mapping caller/a/again/b=%q/%q/%q/%q",
+			callerDevice, firstDevice, againDevice, otherDevice)
+	}
+}
+
+func TestPrepareTranslatedAnthropicBodyRebindsFinalizedDeviceToCurrentKey(t *testing.T) {
+	srv := newInMemoryServer(t)
+	cfg := &model.Config{Name: "anthropic-api-key"}
+	headers := http.Header{"Content-Type": {"application/json"}, "User-Agent": {"third-party-client"}}
+	source := []byte(`{
+		"model":"claude-sonnet-4-6",
+		"metadata":{"user_id":"{\"device_id\":\"caller-device\",\"account_uuid\":\"caller-account\",\"session_id\":\"e03895ad-8b34-4a84-bbf6-002e8909b17b\"}"},
+		"messages":[{"role":"user","content":"hello"}]
+	}`)
+
+	first, err := srv.prepareTranslatedUpstreamBody(
+		cfg, protocol.Anthropic, "/v1/messages", source, source, "sk-ant-first", headers, false,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rebound, err := srv.prepareTranslatedUpstreamBody(
+		cfg, protocol.Anthropic, "/v1/messages", first, source, "sk-ant-second", headers, true,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	device := func(body []byte) string {
+		return gjson.Get(gjson.GetBytes(body, "metadata.user_id").String(), "device_id").String()
+	}
+	if got, want := device(first), synthesizeAnthropicAPIKeyCredential("sk-ant-first").DeviceID; got != want {
+		t.Fatalf("first device_id=%q, want %q", got, want)
+	}
+	if got, want := device(rebound), synthesizeAnthropicAPIKeyCredential("sk-ant-second").DeviceID; got != want {
+		t.Fatalf("rebound device_id=%q, want %q", got, want)
+	}
+	if device(first) == device(rebound) {
+		t.Fatalf("device_id did not change with selected key: %q", device(first))
+	}
+	resigned, err := finalizeAnthropicCCH(rebound)
+	if err != nil || !bytes.Equal(resigned, rebound) {
+		t.Fatalf("rebound CCH is stale: err=%v body=%s", err, rebound)
 	}
 }
 

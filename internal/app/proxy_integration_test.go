@@ -770,6 +770,104 @@ func TestProxy_NativeAnthropicAPIKeyPreservesExplicitCachePolicy(t *testing.T) {
 	}
 }
 
+func TestProxy_NativeAnthropicDeviceFollowsRetriedAPIKey(t *testing.T) {
+	const (
+		firstKey      = "sk-anthropic-device-first"
+		secondKey     = "sk-anthropic-device-second"
+		callerDevice  = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+		nativeSession = "e03895ad-8b34-4a84-bbf6-002e8909b17b"
+		nativeAccount = "9b079a70-8780-5404-bbaf-d74217f5adfd"
+		responseBody  = `{"id":"msg_1","type":"message","role":"assistant","content":[{"type":"text","text":"ok"}],"model":"claude-sonnet-4-6","stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}`
+	)
+	type attempt struct {
+		key  string
+		body []byte
+	}
+	var attempts []attempt
+	upstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		key := headerValueFold(r.Header, "x-api-key")
+		attempts = append(attempts, attempt{key: key, body: body})
+		w.Header().Set("Content-Type", "application/json")
+		if key == firstKey {
+			w.WriteHeader(http.StatusBadGateway)
+			_, _ = io.WriteString(w, `{"error":{"message":"retry another key"}}`)
+			return
+		}
+		if key != secondKey {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		_, _ = io.WriteString(w, responseBody)
+	}))
+	defer upstream.Close()
+
+	env := setupProxyTestEnv(t, []testChannel{{
+		name: "anthropic-device-retry", upstreamProtocol: "anthropic", models: "claude-sonnet-4-6",
+		apiKey: firstKey, retryOtherKeysOnFailure: true,
+	}}, map[int]string{0: upstream.URL})
+	configs, err := env.store.ListConfigs(context.Background())
+	if err != nil || len(configs) != 1 {
+		t.Fatalf("ListConfigs: configs=%d err=%v", len(configs), err)
+	}
+	if err := env.store.CreateAPIKeysBatch(context.Background(), []*model.APIKey{{
+		ChannelID: configs[0].ID, KeyIndex: 1, APIKey: secondKey, KeyStrategy: model.KeyStrategySequential,
+	}}); err != nil {
+		t.Fatalf("create second Anthropic key: %v", err)
+	}
+	env.server.InvalidateAPIKeysCache(configs[0].ID)
+	env.server.maxKeyRetries = 1
+
+	identity, err := json.Marshal(map[string]string{
+		"device_id": callerDevice, "account_uuid": nativeAccount, "session_id": nativeSession,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	response := doProxyRequest(t, env.engine, "/v1/messages", map[string]any{
+		"model": "claude-sonnet-4-6",
+		"system": []any{
+			map[string]any{"type": "text", "text": "x-anthropic-billing-header: cc_version=2.1.220.abc; cc_entrypoint=cli; cch=00000;"},
+			map[string]any{"type": "text", "text": "native policy"},
+		},
+		"metadata":   map[string]any{"user_id": string(identity)},
+		"messages":   []any{map[string]any{"role": "user", "content": "hello"}},
+		"max_tokens": 1024,
+	}, map[string]string{
+		"User-Agent":               "claude-cli/2.1.220 (external, cli)",
+		"X-App":                    "cli",
+		"Anthropic-Beta":           "claude-code-20250219",
+		"X-Claude-Code-Session-Id": nativeSession,
+	})
+	if response.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s attempts=%v", response.Code, response.Body.String(), attempts)
+	}
+	if len(attempts) != 2 || attempts[0].key != firstKey || attempts[1].key != secondKey {
+		t.Fatalf("attempt keys=%v, want [%q %q]", attempts, firstKey, secondKey)
+	}
+	for index, attempt := range attempts {
+		want := synthesizeAnthropicAPIKeyCredential(attempt.key).DeviceID
+		userID := gjson.GetBytes(attempt.body, "metadata.user_id").String()
+		if got := gjson.Get(userID, "device_id").String(); got != want || got == callerDevice {
+			t.Fatalf("attempt %d key=%q device_id=%q, want %q", index, attempt.key, got, want)
+		}
+		if got := gjson.Get(userID, "account_uuid").String(); got != nativeAccount {
+			t.Fatalf("attempt %d account_uuid=%q, want %q", index, got, nativeAccount)
+		}
+		if got := gjson.Get(userID, "session_id").String(); got != nativeSession {
+			t.Fatalf("attempt %d session_id=%q, want %q", index, got, nativeSession)
+		}
+		resigned, err := finalizeAnthropicCCH(attempt.body)
+		if err != nil || !bytes.Equal(resigned, attempt.body) {
+			t.Fatalf("attempt %d has stale CCH: err=%v body=%s", index, err, attempt.body)
+		}
+	}
+	if firstDevice := synthesizeAnthropicAPIKeyCredential(firstKey).DeviceID; firstDevice ==
+		synthesizeAnthropicAPIKeyCredential(secondKey).DeviceID {
+		t.Fatalf("distinct selected keys share device_id %q", firstDevice)
+	}
+}
+
 func TestProxy_NativeAnthropic400RepairsToolAndBudget(t *testing.T) {
 	t.Parallel()
 

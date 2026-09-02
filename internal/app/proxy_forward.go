@@ -289,24 +289,29 @@ func (s *Server) prepareTranslatedUpstreamBody(
 	body = prepareCodexResponsesBodyForUpstream(cfg, upstreamProtocol, requestPath, body)
 	body = prepareCodexOAuthResponsesBody(cfg, upstreamProtocol, requestPath, body, headers)
 	if isAnthropicMessagesRequest(upstreamProtocol, requestPath) {
+		claudeCodeWire := isAnthropicClaudeCodeMessagesRequest(cfg, upstreamProtocol, requestPath)
 		var err error
 		switch {
-		case !isAnthropicClaudeCodeMessagesRequest(cfg, upstreamProtocol, requestPath):
+		case !claudeCodeWire:
 			// Z.ai Coding Plan 自带 ZCode 指纹，只做 Anthropic 线协议归一。
 			body, err = normalizeAnthropicMessagesBody(body)
 		case anthropicAlreadyFinalized:
 			var request map[string]any
-			if json.Unmarshal(body, &request) == nil {
-				helperShape := nativeAnthropicHaikuHelperShape(body, request, headers)
-				if helperShape == anthropicHaikuHelperMinimal {
-					return body, nil
-				}
-				if helperShape == anthropicHaikuHelperStructured ||
-					isNativeAnthropicClaudeCodeRequest(request, headers, cfg, apiKey) {
-					return finalizeAnthropicCCH(body)
-				}
+			if json.Unmarshal(body, &request) != nil {
+				body, err = normalizeAnthropicMessagesBody(body)
+				break
 			}
-			body, err = normalizeAnthropicMessagesBody(body)
+			body, err = bindAnthropicAPIKeyDeviceID(body, request, cfg, apiKey)
+			if err != nil {
+				break
+			}
+			helperShape := nativeAnthropicHaikuHelperShape(body, request, headers)
+			if helperShape != anthropicHaikuHelperNone ||
+				isNativeAnthropicClaudeCodeRequest(request, headers, cfg, apiKey) {
+				body, err = finalizeAnthropicCCH(body)
+			} else {
+				body, err = normalizeAnthropicMessagesBody(body)
+			}
 		default:
 			body, err = finalizeAnthropicClaudeCodeMessagesBody(body, cfg, apiKey, headers)
 		}

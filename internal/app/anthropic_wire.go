@@ -18,6 +18,7 @@ import (
 	"ccLoad/internal/protocol"
 
 	"github.com/google/uuid"
+	"github.com/tidwall/sjson"
 )
 
 const (
@@ -122,6 +123,11 @@ func finalizeAnthropicClaudeCodeMessagesBody(
 	if err := json.Unmarshal(body, &request); err != nil {
 		return nil, errors.New("finalize Anthropic Claude Code request: invalid JSON body")
 	}
+	var err error
+	body, err = bindAnthropicAPIKeyDeviceID(body, request, cfg, apiKey)
+	if err != nil {
+		return nil, err
+	}
 	helperShape := nativeAnthropicHaikuHelperShape(body, request, headers)
 	if helperShape != anthropicHaikuHelperNone {
 		if helperShape == anthropicHaikuHelperStructured {
@@ -133,7 +139,7 @@ func finalizeAnthropicClaudeCodeMessagesBody(
 	messages, _ := request["messages"].([]any)
 	if isNativeAnthropicClaudeCodeRequest(request, headers, cfg, apiKey) {
 		// Native Claude Code owns sampling, prompt-cache placement and JSON member
-		// order. Only refresh the CCH digits in place.
+		// order. API-key attempts replace only device_id; then CCH is refreshed.
 		return finalizeAnthropicCCH(body)
 	}
 	// 缓存窗口归调用方：调用方自己声明了 1h，网关注入的 breakpoint 就跟到 1h，否则
@@ -581,8 +587,8 @@ func normalizeAnthropicOAuthModel(request map[string]any) {
 // 请求——是就整体直通、只补 CCH，绝不重写。
 //
 // 身份校验按凭证种类分。OAuth 渠道要求与本渠道账号严格一致，防止把别人的身份转发
-// 出去；API Key 渠道的身份本来就是网关自己合成的，下游真实 Claude Code 带的
-// device_id 才是可信的那个，拿合成值去比对只会把本该直通的请求降级重写。
+// 出去；API Key 渠道先按本次选中的 Key 覆盖 device_id，再按其余身份形态判定直通。
+// 这样原生请求仍保留自己的采样和缓存策略，但客户端设备标识不会送到上游。
 func isNativeAnthropicClaudeCodeRequest(
 	request map[string]any,
 	headers http.Header,
@@ -736,6 +742,50 @@ func synthesizeAnthropicAPIKeyCredential(apiKey string) *anthropicauth.Credentia
 		AccountUUID: uuid.NewSHA1(uuid.NameSpaceOID, []byte("ccload:anthropic:account\x00"+apiKey)).String(),
 		DeviceID:    hex.EncodeToString(device[:]),
 	}
+}
+
+// bindAnthropicAPIKeyDeviceID removes the caller's device identity at the last
+// possible boundary and replaces it with the identity derived from the API Key
+// selected for this attempt. sjson changes only metadata.user_id, preserving
+// the native Claude Code member order that participates in CCH signing.
+func bindAnthropicAPIKeyDeviceID(
+	body []byte,
+	request map[string]any,
+	cfg *model.Config,
+	apiKey string,
+) ([]byte, error) {
+	if cfg != nil && cfg.UsesOAuth() {
+		return body, nil
+	}
+	metadata, ok := request["metadata"].(map[string]any)
+	if !ok {
+		return body, nil
+	}
+	userID, ok := metadata["user_id"].(string)
+	if !ok || strings.TrimSpace(userID) == "" {
+		return body, nil
+	}
+	var identity map[string]json.RawMessage
+	if json.Unmarshal([]byte(userID), &identity) != nil || identity == nil {
+		return body, nil
+	}
+	if _, exists := identity["device_id"]; !exists {
+		return body, nil
+	}
+	credential := synthesizeAnthropicAPIKeyCredential(apiKey)
+	if credential == nil {
+		return nil, errors.New("finalize Anthropic Claude Code request: API key identity is incomplete")
+	}
+	updatedIdentity, err := sjson.SetBytes([]byte(userID), "device_id", credential.DeviceID)
+	if err != nil {
+		return nil, errors.New("finalize Anthropic Claude Code request: replace API key device identity")
+	}
+	updatedBody, err := sjson.SetBytes(body, "metadata.user_id", string(updatedIdentity))
+	if err != nil {
+		return nil, errors.New("finalize Anthropic Claude Code request: encode API key device identity")
+	}
+	metadata["user_id"] = string(updatedIdentity)
+	return updatedBody, nil
 }
 
 func anthropicStableSessionID(accountUUID, firstUserText string) string {
@@ -1176,7 +1226,8 @@ func anthropicIncomingHeaders(req *http.Request, override []http.Header) http.He
 }
 
 // anthropicRequestOwnsItsWire 判断下游已经是原生 Claude Code（含内部 Haiku 辅助
-// 请求），此时它自己的 header 就是正确的指纹，网关只做透传。
+// 请求），此时它自己的 header 就是正确的指纹；body 除 API Key 设备覆盖与 CCH
+// 重签外保持原样。
 func anthropicRequestOwnsItsWire(body []byte, incoming http.Header, cfg *model.Config, apiKey string) bool {
 	var request map[string]any
 	if json.Unmarshal(body, &request) != nil {
