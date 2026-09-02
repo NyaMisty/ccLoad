@@ -25,7 +25,7 @@ import (
 //
 // 设计原则：
 // - SQLite = source of truth
-// - 主库 = 最终一致副本；进程退出时允许丢失尚未同步的内存任务
+// - 主库 = 最终一致副本；日志批次不会互相覆盖，失败会持续重试
 // - 单实例单写者；不支持多个混合实例或外部进程同时修改主库
 type HybridStore struct {
 	sqlite  *sqlstore.SQLStore // 权威库、本地分析和临时数据
@@ -39,6 +39,7 @@ type HybridStore struct {
 
 	sqliteReadFailCount atomic.Uint64
 	analyticsPrimary    atomic.Bool
+	logSyncSequence     atomic.Uint64
 	primaryReconcileMu  sync.Mutex
 	primaryReconcile    primaryReconcileCursor
 }
@@ -70,6 +71,7 @@ func newHybridStore(sqlite, primary *sqlstore.SQLStore, initialize func(context.
 	}
 	h.primarySync = newPrimaryWriteBehindWithInitializer(primarySyncRetryDelay, primarySyncTimeout, initialize)
 	h.primarySync.configureReconcile(primarySyncMaxPending, h.reconcilePrimary, h.markPrimaryReconcileDirty)
+	h.primarySync.configureRetainedLimit(primaryLogMaxPending)
 	return h
 }
 
@@ -150,11 +152,24 @@ func cloneLogEntriesForSync(entries []*model.LogEntry) []*model.LogEntry {
 	if len(entries) == 0 {
 		return nil
 	}
-	out := make([]*model.LogEntry, len(entries))
-	for i, e := range entries {
-		out[i] = cloneLogEntryForSync(e)
+	out := make([]*model.LogEntry, 0, len(entries))
+	for _, entry := range entries {
+		if entry == nil || entry.ID <= 0 {
+			continue
+		}
+		out = append(out, cloneLogEntryForSync(entry))
 	}
 	return out
+}
+
+func (h *HybridStore) enqueuePrimaryLogs(entries []*model.LogEntry) {
+	if len(entries) == 0 {
+		return
+	}
+	key := fmt.Sprintf("logs/%d", h.logSyncSequence.Add(1))
+	h.primarySync.enqueueLossless(key, "logs", func(syncCtx context.Context) error {
+		return h.primary.BatchAddLogsReplica(syncCtx, entries)
+	})
 }
 
 // ============================================================================
@@ -602,7 +617,7 @@ func (h *HybridStore) ResetModelCooldown(ctx context.Context, channelID int64, m
 }
 
 // === Log Management ===
-// SQLite 写入成功即完成；主库只保留最后一个待同步日志批次。日志允许少量丢失。
+// SQLite 写入成功即完成；每个主库日志批次独立保留并持续重试。
 
 func (h *HybridStore) AddLog(ctx context.Context, e *model.LogEntry) error {
 	if e == nil {
@@ -621,10 +636,9 @@ func (h *HybridStore) AddLog(ctx context.Context, e *model.LogEntry) error {
 		h.markChannelDirty(channelID, false)
 	}
 	h.oauthCredentialMu.Unlock()
-	entry := cloneLogEntryForSync(e)
-	h.primarySync.enqueueBestEffort("logs/latest", "logs", func(syncCtx context.Context) error {
-		return h.primary.AddLogReplica(syncCtx, entry)
-	})
+	if e.ID > 0 {
+		h.enqueuePrimaryLogs([]*model.LogEntry{cloneLogEntryForSync(e)})
+	}
 	return nil
 }
 
@@ -646,9 +660,7 @@ func (h *HybridStore) BatchAddLogs(ctx context.Context, logs []*model.LogEntry) 
 	}
 	h.oauthCredentialMu.Unlock()
 	entries := cloneLogEntriesForSync(logs)
-	h.primarySync.enqueueBestEffort("logs/latest", "logs", func(syncCtx context.Context) error {
-		return h.primary.BatchAddLogsReplica(syncCtx, entries)
-	})
+	h.enqueuePrimaryLogs(entries)
 	return nil
 }
 

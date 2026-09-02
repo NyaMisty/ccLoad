@@ -13,11 +13,12 @@ const (
 	primarySyncTimeout      = 30 * time.Second
 	primaryReconcileTimeout = 5 * time.Minute
 	primarySyncMaxPending   = 10_000
+	primaryLogMaxPending    = 10
 	primaryFullSyncKey      = "state/full-reconcile"
 )
 
-// primarySyncTask describes a desired final state, not a database command.
-// Replacing a task with the same key is therefore safe and bounds repeated writes.
+// primarySyncTask usually describes replaceable desired state. mustRetain tasks
+// are append-only log batches with unique keys and may never be coalesced.
 type primarySyncTask struct {
 	key         string
 	op          string
@@ -25,6 +26,7 @@ type primarySyncTask struct {
 	nextAttempt time.Time
 	run         func(context.Context) error
 	bestEffort  bool
+	mustRetain  bool
 	timeout     time.Duration
 }
 
@@ -43,6 +45,8 @@ type primaryWriteBehind struct {
 	maxPending     int
 	reconcile      func(context.Context) error
 	reconcileDirty func()
+	retainedSpace  *sync.Cond
+	maxRetained    int
 	failures       atomic.Uint64
 	dropped        atomic.Uint64
 	success        atomic.Int64
@@ -67,6 +71,7 @@ func newPrimaryWriteBehindWithInitializer(
 		timeout:    timeout,
 		initialize: initialize,
 	}
+	w.retainedSpace = sync.NewCond(&w.mu)
 	go w.loop()
 	return w
 }
@@ -83,25 +88,46 @@ func (w *primaryWriteBehind) configureReconcile(
 	w.mu.Unlock()
 }
 
+func (w *primaryWriteBehind) configureRetainedLimit(maxPending int) {
+	w.mu.Lock()
+	w.maxRetained = maxPending
+	w.retainedSpace.Broadcast()
+	w.mu.Unlock()
+}
+
 func (w *primaryWriteBehind) enqueue(key, op string, run func(context.Context) error) {
-	w.enqueueTask(key, op, false, run)
+	w.enqueueTask(key, op, false, false, run)
 }
 
 func (w *primaryWriteBehind) enqueueBestEffort(key, op string, run func(context.Context) error) {
-	w.enqueueTask(key, op, true, run)
+	w.enqueueTask(key, op, true, false, run)
 }
 
-func (w *primaryWriteBehind) enqueueTask(key, op string, bestEffort bool, run func(context.Context) error) {
+// enqueueLossless retains a distinct retrying task even while replaceable
+// entity state is being collapsed into a full reconciliation.
+func (w *primaryWriteBehind) enqueueLossless(key, op string, run func(context.Context) error) {
+	w.enqueueTask(key, op, false, true, run)
+}
+
+func (w *primaryWriteBehind) enqueueTask(
+	key, op string,
+	bestEffort, mustRetain bool,
+	run func(context.Context) error,
+) {
 	if run == nil {
 		return
 	}
 	w.mu.Lock()
+	for mustRetain && !w.closed && w.maxRetained > 0 &&
+		w.tasks[key] == nil && w.retainedPendingLocked() >= w.maxRetained {
+		w.retainedSpace.Wait()
+	}
 	if w.closed {
 		w.dropped.Add(1)
 		w.mu.Unlock()
 		return
 	}
-	if !bestEffort && w.reconcile != nil {
+	if !bestEffort && !mustRetain && w.reconcile != nil {
 		if _, reconciling := w.tasks[primaryFullSyncKey]; reconciling {
 			// Lock order is write-behind -> reconcile cursor. The worker never
 			// holds the cursor lock while acquiring w.mu.
@@ -115,7 +141,7 @@ func (w *primaryWriteBehind) enqueueTask(key, op string, bestEffort bool, run fu
 		}
 		if w.maxPending > 0 && w.tasks[key] == nil && w.regularPendingLocked() >= w.maxPending {
 			for taskKey, task := range w.tasks {
-				if !task.bestEffort {
+				if !task.bestEffort && !task.mustRetain {
 					delete(w.tasks, taskKey)
 				}
 			}
@@ -128,7 +154,12 @@ func (w *primaryWriteBehind) enqueueTask(key, op string, bestEffort bool, run fu
 			return
 		}
 	}
-	if previous := w.tasks[key]; previous != nil && previous.bestEffort {
+	previous := w.tasks[key]
+	if previous != nil && previous.mustRetain {
+		w.mu.Unlock()
+		return
+	}
+	if previous != nil && previous.bestEffort {
 		w.dropped.Add(1)
 	}
 	w.nextGen++
@@ -139,6 +170,7 @@ func (w *primaryWriteBehind) enqueueTask(key, op string, bestEffort bool, run fu
 		nextAttempt: time.Now(),
 		run:         run,
 		bestEffort:  bestEffort,
+		mustRetain:  mustRetain,
 	}
 	w.mu.Unlock()
 	w.signal()
@@ -147,7 +179,17 @@ func (w *primaryWriteBehind) enqueueTask(key, op string, bestEffort bool, run fu
 func (w *primaryWriteBehind) regularPendingLocked() int {
 	count := 0
 	for _, task := range w.tasks {
-		if !task.bestEffort {
+		if !task.bestEffort && !task.mustRetain {
+			count++
+		}
+	}
+	return count
+}
+
+func (w *primaryWriteBehind) retainedPendingLocked() int {
+	count := 0
+	for _, task := range w.tasks {
+		if task.mustRetain {
 			count++
 		}
 	}
@@ -315,6 +357,9 @@ func (w *primaryWriteBehind) finish(task *primarySyncTask, err error) {
 	}
 	if err == nil {
 		delete(w.tasks, task.key)
+		if current.mustRetain {
+			w.retainedSpace.Broadcast()
+		}
 		w.success.Store(time.Now().UnixMilli())
 		w.mu.Unlock()
 		return
@@ -353,6 +398,7 @@ func (w *primaryWriteBehind) close() {
 		return
 	}
 	w.closed = true
+	w.retainedSpace.Broadcast()
 	pending := len(w.tasks)
 	if w.initialize != nil {
 		pending++

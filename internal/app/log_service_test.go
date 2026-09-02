@@ -14,11 +14,6 @@ import (
 	"ccLoad/internal/storage"
 )
 
-type retryTrackingStore struct {
-	storage.Store
-	attempts int
-}
-
 type debugCleanupResult struct {
 	deleted int64
 	err     error
@@ -76,7 +71,6 @@ func (s *debugCleanupStore) CleanupDebugLogsBatch(_ context.Context, cutoff time
 
 func TestStartCleanupLoopAcceptsNumericBoolAndUsesRetentionDefault(t *testing.T) {
 	shutdownCh := make(chan struct{})
-	isShuttingDown := &atomic.Bool{}
 	var wg sync.WaitGroup
 	store := &debugCleanupStore{
 		results:        []debugCleanupResult{{deleted: 0}},
@@ -84,7 +78,7 @@ func TestStartCleanupLoopAcceptsNumericBoolAndUsesRetentionDefault(t *testing.T)
 		retentionValue: "0",
 		done:           make(chan struct{}),
 	}
-	svc := NewLogService(store, 10, 0, 3, shutdownCh, isShuttingDown, &wg)
+	svc := NewLogService(store, 10, 0, 3, shutdownCh, &wg)
 	t.Cleanup(func() {
 		close(shutdownCh)
 		wg.Wait()
@@ -136,18 +130,12 @@ func (s *blockingDebugTruncateStore) TruncateDebugLogs(ctx context.Context) erro
 	}
 }
 
-func (s *retryTrackingStore) BatchAddLogs(_ context.Context, _ []*model.LogEntry) error {
-	s.attempts++
-	return context.DeadlineExceeded
-}
-
 // TestAddLogAsync_NormalDelivery 验证正常投递日志到 channel
 func TestAddLogAsync_NormalDelivery(t *testing.T) {
 	shutdownCh := make(chan struct{})
-	isShuttingDown := &atomic.Bool{}
 	var wg sync.WaitGroup
 
-	svc := NewLogService(nil, 10, 0, 3, shutdownCh, isShuttingDown, &wg)
+	svc := NewLogService(nil, 10, 0, 3, shutdownCh, &wg)
 
 	entry := &model.LogEntry{
 		Time:       model.JSONTime{Time: time.Now()},
@@ -169,105 +157,147 @@ func TestAddLogAsync_NormalDelivery(t *testing.T) {
 	}
 }
 
-// TestAddLogAsync_ChannelFull_DropsBehavior 验证 channel 满时日志被丢弃并计数
-func TestAddLogAsync_ChannelFull_Drops(t *testing.T) {
+func TestAddLogAsync_ChannelFullAppliesBackpressureWithoutDropping(t *testing.T) {
 	shutdownCh := make(chan struct{})
-	isShuttingDown := &atomic.Bool{}
 	var wg sync.WaitGroup
 
-	// buffer size = 1，只能容纳1条
-	svc := NewLogService(nil, 1, 0, 3, shutdownCh, isShuttingDown, &wg)
+	svc := NewLogService(nil, 1, 0, 3, shutdownCh, &wg)
+	first := &model.LogEntry{Model: "first"}
+	second := &model.LogEntry{Model: "second"}
+	svc.AddLogAsync(first)
 
-	entry := &model.LogEntry{
-		Time:       model.JSONTime{Time: time.Now()},
-		Model:      "test",
-		StatusCode: 200,
-	}
-
-	// 先填满 channel
-	svc.AddLogAsync(entry)
-
-	// 第二条应该被 drop
-	svc.AddLogAsync(entry)
-	svc.AddLogAsync(entry)
-
-	dropCount := svc.logDropCount.Load()
-	if dropCount < 1 {
-		t.Fatalf("期望 drop count >= 1, 实际=%d", dropCount)
-	}
-}
-
-// TestAddLogAsync_AfterShutdown_Noop 验证 shutdown 后不再投递日志
-func TestAddLogAsync_AfterShutdown_Noop(t *testing.T) {
-	shutdownCh := make(chan struct{})
-	isShuttingDown := &atomic.Bool{}
-	var wg sync.WaitGroup
-
-	svc := NewLogService(nil, 10, 0, 3, shutdownCh, isShuttingDown, &wg)
-
-	// 标记为关闭状态
-	isShuttingDown.Store(true)
-
-	entry := &model.LogEntry{
-		Time:       model.JSONTime{Time: time.Now()},
-		Model:      "should-not-appear",
-		StatusCode: 200,
-	}
-
-	svc.AddLogAsync(entry)
-
-	// channel 应该为空
+	enqueued := make(chan struct{})
+	go func() {
+		svc.AddLogAsync(second)
+		close(enqueued)
+	}()
 	select {
-	case <-svc.logChan:
-		t.Fatal("shutdown 后不应有日志投递到 channel")
-	default:
-		// 正确：channel 为空
+	case <-enqueued:
+		t.Fatal("full queue accepted a second log without backpressure")
+	case <-time.After(30 * time.Millisecond):
+	}
+
+	if got := <-svc.logChan; got != first {
+		t.Fatalf("first queued log=%+v", got)
+	}
+	select {
+	case <-enqueued:
+	case <-time.After(time.Second):
+		t.Fatal("blocked log producer did not resume after queue capacity became available")
+	}
+	if got := <-svc.logChan; got != second {
+		t.Fatalf("second queued log=%+v", got)
+	}
+	if metrics := svc.runtimeMetrics(); metrics.DroppedEntries != 0 {
+		t.Fatalf("dropped entries=%d, want 0", metrics.DroppedEntries)
 	}
 }
 
-// TestAddLogAsync_DropCountSampling 验证丢弃计数的采样日志逻辑
-func TestAddLogAsync_DropCountAccumulates(t *testing.T) {
+func TestCloseInputDoesNotBlockShutdownBehindFullQueue(t *testing.T) {
 	shutdownCh := make(chan struct{})
-	isShuttingDown := &atomic.Bool{}
 	var wg sync.WaitGroup
+	svc := NewLogService(nil, 1, 0, 3, shutdownCh, &wg)
+	first := &model.LogEntry{Model: "first"}
+	second := &model.LogEntry{Model: "second"}
+	svc.AddLogAsync(first)
 
-	// buffer size = 0，所有日志都会被 drop
-	svc := NewLogService(nil, 0, 0, 3, shutdownCh, isShuttingDown, &wg)
-
-	entry := &model.LogEntry{
-		Time:       model.JSONTime{Time: time.Now()},
-		Model:      "test",
-		StatusCode: 200,
+	secondEnqueued := make(chan struct{})
+	go func() {
+		svc.AddLogAsync(second)
+		close(secondEnqueued)
+	}()
+	select {
+	case <-secondEnqueued:
+		t.Fatal("test setup did not fill the queue")
+	case <-time.After(30 * time.Millisecond):
 	}
 
-	for i := 0; i < 25; i++ {
-		svc.AddLogAsync(entry)
+	returned := make(chan struct{})
+	go func() {
+		svc.CloseInput()
+		close(returned)
+	}()
+	select {
+	case <-returned:
+	case <-time.After(time.Second):
+		t.Fatal("CloseInput blocked behind a full queue")
 	}
 
-	dropCount := svc.logDropCount.Load()
-	if dropCount != 25 {
-		t.Fatalf("期望 drop count = 25, 实际=%d", dropCount)
+	if got := <-svc.logChan; got != first {
+		t.Fatalf("first queued log=%+v", got)
+	}
+	select {
+	case <-secondEnqueued:
+	case <-time.After(time.Second):
+		t.Fatal("second producer did not resume")
+	}
+	if got := <-svc.logChan; got != second {
+		t.Fatalf("second queued log=%+v", got)
+	}
+	select {
+	case _, ok := <-svc.logChan:
+		if ok {
+			t.Fatal("log input remained open")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("log input was not closed after producers drained")
 	}
 }
 
-func TestFlushLogs_ShutdownDisablesRetries(t *testing.T) {
+func TestAddLogAsyncBeforeCloseInputIsAccepted(t *testing.T) {
 	shutdownCh := make(chan struct{})
-	isShuttingDown := &atomic.Bool{}
-	isShuttingDown.Store(true)
 	var wg sync.WaitGroup
 
-	store := &retryTrackingStore{}
-	svc := NewLogService(store, 10, 0, 3, shutdownCh, isShuttingDown, &wg)
+	svc := NewLogService(nil, 10, 0, 3, shutdownCh, &wg)
+	entry := &model.LogEntry{Model: "shutdown-race"}
+	svc.AddLogAsync(entry)
 
-	entry := &model.LogEntry{
-		Time:       model.JSONTime{Time: time.Now()},
-		Model:      "test-model",
-		StatusCode: 500,
+	select {
+	case got := <-svc.logChan:
+		if got != entry {
+			t.Fatalf("queued log=%+v", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("shutdown flag caused a pending log to be discarded")
 	}
-	svc.flushLogs([]*model.LogEntry{entry})
+}
 
-	if store.attempts != 1 {
-		t.Fatalf("关停阶段应仅尝试一次刷盘，实际尝试次数=%d", store.attempts)
+type recordingLogStore struct {
+	storage.Store
+	mu      sync.Mutex
+	entries []*model.LogEntry
+}
+
+func (s *recordingLogStore) BatchAddLogs(_ context.Context, entries []*model.LogEntry) error {
+	s.mu.Lock()
+	s.entries = append(s.entries, entries...)
+	s.mu.Unlock()
+	return nil
+}
+
+func TestCloseInputDrainsAllAcceptedLogs(t *testing.T) {
+	shutdownCh := make(chan struct{})
+	var wg sync.WaitGroup
+	store := &recordingLogStore{}
+	svc := NewLogService(store, 2, 1, 3, shutdownCh, &wg)
+	svc.StartWorkers()
+
+	for i := 0; i < 5; i++ {
+		svc.AddLogAsync(&model.LogEntry{Model: fmt.Sprintf("log-%d", i)})
+	}
+	svc.CloseInput()
+	svc.CloseInput()
+	wg.Wait()
+
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	if len(store.entries) != 5 {
+		t.Fatalf("persisted entries=%d, want 5", len(store.entries))
+	}
+	for index, entry := range store.entries {
+		if entry.Model != fmt.Sprintf("log-%d", index) {
+			t.Fatalf("entry %d model=%q", index, entry.Model)
+		}
 	}
 }
 
@@ -288,11 +318,10 @@ func (s *failThenSucceedStore) BatchAddLogs(_ context.Context, _ []*model.LogEnt
 
 func TestFlushLogs_RetrySucceeds(t *testing.T) {
 	shutdownCh := make(chan struct{})
-	isShuttingDown := &atomic.Bool{}
 	var wg sync.WaitGroup
 
-	store := &failThenSucceedStore{failN: 1}
-	svc := NewLogService(store, 10, 0, 3, shutdownCh, isShuttingDown, &wg)
+	store := &failThenSucceedStore{failN: 3}
+	svc := NewLogService(store, 10, 0, 3, shutdownCh, &wg)
 
 	entry := &model.LogEntry{
 		Time:       model.JSONTime{Time: time.Now()},
@@ -301,49 +330,25 @@ func TestFlushLogs_RetrySucceeds(t *testing.T) {
 	}
 	svc.flushLogs([]*model.LogEntry{entry})
 
-	if store.attempts != 2 {
-		t.Fatalf("期望重试后成功 (attempts=2)，实际=%d", store.attempts)
+	if store.attempts != 4 {
+		t.Fatalf("期望持续重试后成功 (attempts=4)，实际=%d", store.attempts)
+	}
+	if failed := svc.runtimeMetrics().PersistenceFailedEntries; failed != 3 {
+		t.Fatalf("failed entry attempts=%d, want 3", failed)
 	}
 }
 
-func TestFlushLogs_ShutdownInterruptsBackoff(t *testing.T) {
-	shutdownCh := make(chan struct{})
-	isShuttingDown := &atomic.Bool{}
-	var wg sync.WaitGroup
-
-	store := &retryTrackingStore{}
-	// MaxRetries=2 在 config 中，但正常路径会重试。
-	// 我们在退避等待期间触发 shutdown，期望只尝试 1 次。
-	svc := NewLogService(store, 10, 0, 3, shutdownCh, isShuttingDown, &wg)
-
-	entry := &model.LogEntry{
-		Time:       model.JSONTime{Time: time.Now()},
-		Model:      "test-model",
-		StatusCode: 500,
+func TestLogFlushRetryBackoffIsCapped(t *testing.T) {
+	if got := logFlushRetryBackoff(1); got != config.LogFlushRetryBackoff {
+		t.Fatalf("first retry backoff=%v", got)
 	}
-
-	// 在短延迟后关闭 shutdownCh，中断退避等待
-	go func() {
-		time.Sleep(10 * time.Millisecond)
-		close(shutdownCh)
-	}()
-
-	start := time.Now()
-	svc.flushLogs([]*model.LogEntry{entry})
-	elapsed := time.Since(start)
-
-	if store.attempts != 1 {
-		t.Fatalf("shutdown 应中断退避，期望 attempts=1，实际=%d", store.attempts)
-	}
-	// 退避基准 100ms，如果没被中断会等 >=100ms。被中断应远小于 100ms。
-	if elapsed > 80*time.Millisecond {
-		t.Fatalf("shutdown 应快速中断退避，实际耗时=%v", elapsed)
+	if got := logFlushRetryBackoff(1_000_000); got != logFlushMaxRetryBackoff {
+		t.Fatalf("capped retry backoff=%v", got)
 	}
 }
 
 func TestStartCleanupLoop_StopsCurrentDebugCleanupRunAfterFailure(t *testing.T) {
 	shutdownCh := make(chan struct{})
-	isShuttingDown := &atomic.Bool{}
 	var wg sync.WaitGroup
 	store := &debugCleanupStore{
 		results: []debugCleanupResult{
@@ -351,7 +356,7 @@ func TestStartCleanupLoop_StopsCurrentDebugCleanupRunAfterFailure(t *testing.T) 
 		},
 		done: make(chan struct{}),
 	}
-	svc := NewLogService(store, 10, 0, 3, shutdownCh, isShuttingDown, &wg)
+	svc := NewLogService(store, 10, 0, 3, shutdownCh, &wg)
 	t.Cleanup(func() {
 		close(shutdownCh)
 		wg.Wait()
@@ -376,7 +381,6 @@ func TestStartCleanupLoop_StopsCurrentDebugCleanupRunAfterFailure(t *testing.T) 
 
 func TestStartCleanupLoop_WaitsBetweenSuccessfulFullDebugLogBatches(t *testing.T) {
 	shutdownCh := make(chan struct{})
-	isShuttingDown := &atomic.Bool{}
 	var wg sync.WaitGroup
 	store := &debugCleanupStore{
 		results: []debugCleanupResult{
@@ -385,7 +389,7 @@ func TestStartCleanupLoop_WaitsBetweenSuccessfulFullDebugLogBatches(t *testing.T
 		},
 		done: make(chan struct{}),
 	}
-	svc := NewLogService(store, 10, 0, 3, shutdownCh, isShuttingDown, &wg)
+	svc := NewLogService(store, 10, 0, 3, shutdownCh, &wg)
 	t.Cleanup(func() {
 		close(shutdownCh)
 		wg.Wait()
@@ -412,14 +416,13 @@ func TestStartCleanupLoop_WaitsBetweenSuccessfulFullDebugLogBatches(t *testing.T
 
 func TestStartCleanupLoop_DoesNotBlockWhileTruncatingDisabledDebugLogs(t *testing.T) {
 	shutdownCh := make(chan struct{})
-	isShuttingDown := &atomic.Bool{}
 	var wg sync.WaitGroup
 	store := &blockingDebugTruncateStore{
 		started: make(chan struct{}),
 		release: make(chan struct{}),
 		done:    make(chan struct{}),
 	}
-	svc := NewLogService(store, 10, 0, 3, shutdownCh, isShuttingDown, &wg)
+	svc := NewLogService(store, 10, 0, 3, shutdownCh, &wg)
 	t.Cleanup(func() {
 		close(shutdownCh)
 		wg.Wait()

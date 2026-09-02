@@ -636,7 +636,7 @@ websocat \
 
 重连时必须使用相同的 API 令牌和稳定的 execution 请求头。`Session-Id` 表示顶层 Codex 会话；存在 `Thread-Id` 时，ccLoad 组合两个请求头建立身份，使主代理和每个子代理线程分别拥有独立的 transcript、Response ID 和 turn lock。没有 `Thread-Id` 的客户端继续使用原 `Session-Id` 契约。`prompt_cache_key`、请求体 `session_id` 及其他缓存路由提示不代表 execution session，不会触发本地串行，也不会共享本地会话状态。execution session 是单进程内存状态：新安装默认最多保留 256 个会话，进程级 transcript 有效载荷总预算为 256 MiB；已有数据库记录不迁移。空闲 TTL 继续默认 15 分钟（小内存机器可设为 10 分钟）。下游全部断开 5 分钟后，每分钟运行的清理器会关闭上游物理连接，因此实际回收时间约为 5–6 分钟，但会话 transcript 会继续保留到 TTL。稳定会话及其已提交 transcript 在 TTL 到期前绝不会因会话容量或内存预算压力被逐出。会话数达到上限时只拒绝新的会话身份，已有稳定会话仍可继续。已提交载荷超预算后，包括已有会话在内的所有新回合都会在触达上游前被拒绝。两类限制都通过 WebSocket `429/rate_limit_error/rate_limit` 事件返回；客户端应等待 TTL 回收后重试，或修改设置并重启。重启会丢失内存会话，因此客户端随后必须发送不带 `previous_response_id` 的完整会话输入。
 
-Transcript 预算是新工作准入阈值，不是严格分配上限：已经准入的回合允许完成并提交。除已配置预算外，有限的最坏超量为 `responses_ws_max_sessions × max_body_bytes`。进程重启不会恢复会话或累计会话指标。多实例部署必须使用粘性路由保证重连命中同一实例；否则客户端应发送不带 `previous_response_id` 的完整会话输入。会话数、TTL 和 transcript 预算可在系统设置中通过 `responses_ws_max_sessions`、`responses_ws_session_ttl_minutes`、`responses_ws_max_transcript_bytes` 调整。`GET /admin/runtime-metrics` 的 `transcript_bytes` 表示当前有效载荷字节数，不包含 Go 运行时、WebSocket 缓冲区和请求处理中临时对象的开销；同一响应还提供 WebSocket 拒绝、日志队列/落库失败，以及混合存储主库同步积压、失败、丢弃和最后成功时间。
+Transcript 预算是新工作准入阈值，不是严格分配上限：已经准入的回合允许完成并提交。除已配置预算外，有限的最坏超量为 `responses_ws_max_sessions × max_body_bytes`。进程重启不会恢复会话或累计会话指标。多实例部署必须使用粘性路由保证重连命中同一实例；否则客户端应发送不带 `previous_response_id` 的完整会话输入。会话数、TTL 和 transcript 预算可在系统设置中通过 `responses_ws_max_sessions`、`responses_ws_session_ttl_minutes`、`responses_ws_max_transcript_bytes` 调整。`GET /admin/runtime-metrics` 的 `transcript_bytes` 表示当前有效载荷字节数，不包含 Go 运行时、WebSocket 缓冲区和请求处理中临时对象的开销；同一响应还提供 WebSocket 拒绝、日志积压/落库重试，以及混合存储主库同步积压、失败、可替换任务丢弃和最后成功时间。
 
 **Codex Alpha Search（仅原生透传）**：
 
@@ -988,7 +988,7 @@ ccLoad 使用的核心技术栈：
 | `CCLOAD_HOST_OVERRIDES` | 无 | DNS 覆盖：将上游域名钉到固定 IP，绕过 DNS 解析。格式：`host1=ip1,host2=ip2`，例如 `anyrouter.top=47.246.23.200`。不影响 TLS SNI/证书/Host 头 |
 
 > 如果你的服务挂在反向代理或负载均衡后面，建议显式设置 `TRUSTED_PROXIES`，避免伪造 `X-Forwarded-For` 干扰客户端 IP 识别和登录限速。
-> 可通过 `GET /admin/runtime-metrics` 查看 Responses WebSocket、日志队列/落库失败，以及混合存储主库待同步、失败、丢弃与最后成功时间。
+> 可通过 `GET /admin/runtime-metrics` 查看 Responses WebSocket、日志积压/落库重试，以及混合存储主库待同步、失败、可替换任务丢弃与最后成功时间。日志指标中的 `dropped_entries` 为兼容字段，固定为 `0`；`persistence_failed_entries` 统计仍被保留并重试的失败写入次数，不表示日志最终丢失。
 
 #### 混合存储模式（SQLite 权威库 + 主库异步副本）
 
@@ -997,10 +997,10 @@ HuggingFace Spaces 等环境重启后本地数据会丢失，远程 MySQL/Postgr
 - **SQLite 权威库**：配置、凭据、Key、冷却、设置和日志都同步读写本地 SQLite；SQLite 成功就是请求成功
 - **主库异步副本**：进程内 worker 按实体合并最终状态；失败任务等待 10 秒后重试，主库慢或临时故障不阻塞请求；脏实体过多时折叠为一次全量状态对账，避免内存无界增长
 - **启动语义**：SQLite 文件首次创建时从主库导入配置；`CCLOAD_SQLITE_LOG_DAYS=0` 关闭启动日志导入，否则每次启动都要求主库可用，已有日志时只从主库增量导入 `time > MAX(sqlite.logs.time)` 的尾部，日志为空时才按该变量限制导入窗口；已有 SQLite 配置和日志都不会被删除覆盖
-- **日志语义**：主库日志与日志清理只做一次 best-effort 尝试，不进入 10 秒重试；较慢时新批次会替换旧批次并计入 dropped，允许主库日志缺失
+- **日志语义**：队列满时通过背压等待容量，不丢弃条目；权威库写入失败会原样保留整批，并按封顶退避持续重试直至提交。每个主库日志副本批次也使用独立、不可合并的任务，失败后持续重试，后来的批次不能覆盖先前批次；最多保留 10 个待同步副本批次，达到上限后把背压传回日志 worker，避免主库不可用时内存无界增长。按保留天数清理和管理员主动删除渠道仍是显式删除策略
 - **健康检查**：只检查权威 SQLite；主库同步状态通过 runtime metrics 观察
 - **仅本地数据**：Web Session 与原始 DebugData 只保存在当前实例的 SQLite
-- **明确边界**：这是单实例、单写者方案。进程重启会丢失尚在内存中的同步任务，不使用 outbox，也不支持多实例混合写
+- **明确边界**：这是单实例、单写者方案。进程终止可能中断尚在内存中的主库副本任务，但已经提交的 SQLite 权威日志不会因此删除；当前不使用持久化主库同步 outbox，也不支持多实例混合写
 
 ```bash
 # MySQL 主库

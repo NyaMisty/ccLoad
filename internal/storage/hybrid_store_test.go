@@ -593,11 +593,11 @@ func TestPrimaryWriteBehindRetriesFailedFinalState(t *testing.T) {
 	}
 }
 
-func TestPrimaryWriteBehindDoesNotRetryBestEffortLogs(t *testing.T) {
+func TestPrimaryWriteBehindDoesNotRetryBestEffortTask(t *testing.T) {
 	w := newPrimaryWriteBehind(10*time.Millisecond, time.Second)
 	t.Cleanup(w.close)
 	var attempts atomic.Int64
-	w.enqueueBestEffort("logs/latest", "logs", func(context.Context) error {
+	w.enqueueBestEffort("logs/cleanup", "log cleanup", func(context.Context) error {
 		attempts.Add(1)
 		return errors.New("unavailable")
 	})
@@ -606,6 +606,129 @@ func TestPrimaryWriteBehindDoesNotRetryBestEffortLogs(t *testing.T) {
 	if attempts.Load() != 1 || w.dropped.Load() != 1 {
 		t.Fatalf("best effort attempts=%d dropped=%d", attempts.Load(), w.dropped.Load())
 	}
+}
+
+func TestPrimaryWriteBehindLosslessTaskSurvivesStateReconciliationCollapse(t *testing.T) {
+	releaseInitialization := make(chan struct{})
+	w := newPrimaryWriteBehindWithInitializer(
+		10*time.Millisecond,
+		time.Second,
+		func(ctx context.Context) error {
+			select {
+			case <-releaseInitialization:
+				return nil
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		},
+	)
+	t.Cleanup(func() {
+		select {
+		case <-releaseInitialization:
+		default:
+			close(releaseInitialization)
+		}
+		w.close()
+	})
+
+	var logRuns atomic.Int64
+	var reconcileRuns atomic.Int64
+	w.configureReconcile(1, func(context.Context) error {
+		reconcileRuns.Add(1)
+		return nil
+	}, func() {})
+	w.enqueueLossless("logs/1", "logs", func(context.Context) error {
+		logRuns.Add(1)
+		return nil
+	})
+	w.enqueue("state/1", "state", func(context.Context) error {
+		return errors.New("state should be collapsed")
+	})
+	w.enqueue("state/2", "state", func(context.Context) error {
+		return nil
+	})
+
+	w.mu.Lock()
+	_, hasLogTask := w.tasks["logs/1"]
+	_, hasReconcileTask := w.tasks[primaryFullSyncKey]
+	w.mu.Unlock()
+	if !hasLogTask || !hasReconcileTask {
+		t.Fatalf("pending tasks: lossless_log=%t reconciliation=%t", hasLogTask, hasReconcileTask)
+	}
+
+	close(releaseInitialization)
+	waitForCondition(t, time.Second, func() bool {
+		return logRuns.Load() == 1 && reconcileRuns.Load() == 1 && w.pending() == 0
+	})
+	if dropped := w.dropped.Load(); dropped != 0 {
+		t.Fatalf("dropped tasks=%d, want 0", dropped)
+	}
+}
+
+func TestPrimaryWriteBehindLosslessTaskRetriesUntilSuccess(t *testing.T) {
+	w := newPrimaryWriteBehind(10*time.Millisecond, time.Second)
+	t.Cleanup(w.close)
+	var attempts atomic.Int64
+	w.enqueueLossless("logs/1", "logs", func(context.Context) error {
+		if attempts.Add(1) == 1 {
+			return errors.New("temporary")
+		}
+		return nil
+	})
+	waitForCondition(t, time.Second, func() bool {
+		return attempts.Load() == 2 && w.pending() == 0
+	})
+	if failures := w.failures.Load(); failures != 1 {
+		t.Fatalf("failures=%d, want 1", failures)
+	}
+	if dropped := w.dropped.Load(); dropped != 0 {
+		t.Fatalf("dropped tasks=%d, want 0", dropped)
+	}
+}
+
+func TestPrimaryWriteBehindLosslessLimitAppliesBackpressure(t *testing.T) {
+	releaseInitialization := make(chan struct{})
+	w := newPrimaryWriteBehindWithInitializer(
+		10*time.Millisecond,
+		time.Second,
+		func(ctx context.Context) error {
+			select {
+			case <-releaseInitialization:
+				return nil
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		},
+	)
+	w.configureRetainedLimit(1)
+	t.Cleanup(func() {
+		select {
+		case <-releaseInitialization:
+		default:
+			close(releaseInitialization)
+		}
+		w.close()
+	})
+
+	w.enqueueLossless("logs/1", "logs", func(context.Context) error { return nil })
+	secondEnqueued := make(chan struct{})
+	go func() {
+		w.enqueueLossless("logs/2", "logs", func(context.Context) error { return nil })
+		close(secondEnqueued)
+	}()
+	select {
+	case <-secondEnqueued:
+		t.Fatal("lossless queue exceeded its retained-task limit")
+	case <-time.After(30 * time.Millisecond):
+	}
+
+	close(releaseInitialization)
+	select {
+	case <-secondEnqueued:
+	case <-time.After(time.Second):
+		t.Fatal("lossless producer did not resume after primary sync freed capacity")
+	}
+	waitForCondition(t, time.Second, func() bool { return w.pending() == 0 })
 }
 
 func TestPrimaryWriteBehindPublishesReconcileOnlyAfterDirtyMarker(t *testing.T) {

@@ -124,9 +124,6 @@ const (
 	// SQLite 场景下该超时通常不会触发（本地写入<10ms），但会影响最坏情况的关停耗时。
 	LogFlushTimeoutMs = 3000
 
-	// LogFlushMaxRetries 单批日志写入最大重试次数（含首次尝试）
-	LogFlushMaxRetries = 2
-
 	// LogFlushRetryBackoff 重试退避基准时间
 	LogFlushRetryBackoff = 100 * time.Millisecond
 )

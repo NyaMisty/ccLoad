@@ -162,7 +162,7 @@ www/                 独立介绍站(`make www-setup` 复制共享资源后可�
 - PG DSN:URL(`postgres://user:pass@host:5432/db?sslmode=disable`)或 libpq 关键字串;驱动 `pgx/stdlib`
 - 混合数据流:SQLite 是权威库,配置/鉴权/Key/冷却/设置/日志都同步读写 SQLite,提交成功即返回;主库只由进程内 write-behind worker 写入,同一实体合并最终状态,失败 10 秒后重试。分析读默认 SQLite,本地分析读取失败才允许回退主库。Web session 与 DebugData 仅存 SQLite
 - 混合启动:仅首次创建 SQLite 文件时从主库一致性快照导入配置;`CCLOAD_SQLITE_LOG_DAYS=0` 全局关闭启动日志导入,否则每次启动都要求主库可用,SQLite 有日志时从主库增量导入 `time > MAX(sqlite.logs.time)` 的尾部日志,SQLite 日志为空时才按该变量限制首次日志窗口;已有 SQLite 配置禁止被启动恢复覆盖。SQLite DSN 必须启用 `PRAGMA foreign_keys=1`
-- 混合边界:单实例、单写者;不支持外部直接修改主库或多个混合实例。无 outbox,进程退出允许丢失待同步内存任务;日志写入/清理仅单次 best-effort,不进入 10 秒重试,新日志批次可替换旧批次并计入 dropped
+- 混合边界:单实例、单写者;不支持外部直接修改主库或多个混合实例。日志队列满时背压,权威库失败保留整批并封顶退避直至提交;主库日志每批使用独立不可折叠任务并持续重试,新批次不能覆盖旧批次,最多保留 10 个副本批次后向日志 worker 传递背压。无持久化主库同步 outbox,进程终止可能中断内存副本任务,但已提交的 SQLite 权威日志仍保留;日志保留期清理是显式删除策略
 - 混合健康:Ping 只检查权威 SQLite;`RuntimeMetrics` 暴露主库 pending/failures/dropped/last_success
 - 混合队列:按实体合并内存终态;高基数脏实体达到 10000 时折叠为一次 SQLite→主库全量状态对账,不静默丢失运行中配置任务
 - 模型冷却与 URL 禁用状态写 SQLite 后作为渠道聚合终态异步复制主库,渠道删除时级联清理

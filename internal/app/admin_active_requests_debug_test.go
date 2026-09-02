@@ -67,7 +67,6 @@ func TestHandleRuntimeMetricsExposesRuntimeResources(t *testing.T) {
 	srv.maxConcurrency = 3
 	srv.concurrencySem = make(chan struct{}, srv.maxConcurrency)
 	srv.concurrencySem <- struct{}{}
-	srv.logService.logDropCount.Store(4)
 	srv.logService.logFailCount.Store(5)
 	srv.store = &runtimeMetricsStore{
 		Store: srv.store,
@@ -232,7 +231,7 @@ func TestHandleRuntimeMetricsExposesRuntimeResources(t *testing.T) {
 		t.Fatalf("unexpected primary sync metrics: %#v", storageMetrics)
 	}
 	logMetrics, ok := resp.Data["logs"].(map[string]any)
-	if !ok || logMetrics["dropped_entries"] != float64(4) || logMetrics["persistence_failed_entries"] != float64(5) {
+	if !ok || logMetrics["dropped_entries"] != float64(0) || logMetrics["persistence_failed_entries"] != float64(5) {
 		t.Fatalf("unexpected log metrics: %#v", logMetrics)
 	}
 }

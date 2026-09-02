@@ -390,7 +390,6 @@ func NewServer(store storage.Store) *Server {
 		config.DefaultLogWorkers,
 		runtimeCfg.LogRetentionDays, // 启动时读取，修改后重启生效
 		s.shutdownCh,
-		&s.isShuttingDown,
 		&s.wg,
 	)
 	// 2. AuthService（负责认证授权）
@@ -1732,7 +1731,13 @@ func (s *Server) Shutdown(ctx context.Context) error {
 		s.responsesExecutionSessions.close()
 	}
 
-	// 关闭shutdownCh，通知所有goroutine退出（幂等：由isShuttingDown守护）
+	// 先封闭日志输入。日志 worker 不响应通用 shutdown 信号，而是消费到
+	// logChan 关闭并把已接收日志全部刷盘后退出。
+	if s.logService != nil {
+		s.logService.CloseInput()
+	}
+
+	// 关闭shutdownCh，通知其他goroutine退出（幂等：由isShuttingDown守护）
 	close(s.shutdownCh)
 
 	// 停止LoginRateLimiter的cleanupLoop

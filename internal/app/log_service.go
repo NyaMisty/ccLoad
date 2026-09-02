@@ -16,6 +16,7 @@ import (
 const (
 	debugLogCleanupBatchSize  = 200
 	debugLogCleanupBatchYield = 100 * time.Millisecond
+	logFlushMaxRetryBackoff   = 5 * time.Second
 )
 
 // LogService 日志管理服务
@@ -31,10 +32,12 @@ type LogService struct {
 	store storage.Store
 
 	// 日志队列和 Worker
-	logChan      chan *model.LogEntry
-	logWorkers   int
-	logDropCount atomic.Uint64
-	logFailCount atomic.Uint64
+	logChan        chan *model.LogEntry
+	logWorkers     int
+	logInputMu     sync.RWMutex
+	logInputClosed bool
+	logInputClose  sync.Once
+	logFailCount   atomic.Uint64 // failed entry attempts; every entry remains queued for retry
 
 	// 日志保留天数（启动时确定，修改后重启生效）
 	retentionDays int
@@ -43,9 +46,8 @@ type LogService struct {
 	attemptIndexCache *attemptIndexCache
 
 	// 优雅关闭
-	shutdownCh     chan struct{}
-	isShuttingDown *atomic.Bool
-	wg             *sync.WaitGroup
+	shutdownCh chan struct{}
+	wg         *sync.WaitGroup
 }
 
 type logRuntimeMetrics struct {
@@ -60,7 +62,9 @@ func (s *LogService) runtimeMetrics() logRuntimeMetrics {
 		return logRuntimeMetrics{}
 	}
 	return logRuntimeMetrics{
-		DroppedEntries:           s.logDropCount.Load(),
+		// Retained for API compatibility. Queue pressure now applies backpressure,
+		// so the service has no code path that increments this value.
+		DroppedEntries:           0,
 		PersistenceFailedEntries: s.logFailCount.Load(),
 		BacklogEntries:           len(s.logChan),
 		QueueCapacityEntries:     cap(s.logChan),
@@ -74,7 +78,6 @@ func NewLogService(
 	logWorkers int,
 	retentionDays int, // 启动时确定，修改后重启生效
 	shutdownCh chan struct{},
-	isShuttingDown *atomic.Bool,
 	wg *sync.WaitGroup,
 ) *LogService {
 	return &LogService{
@@ -84,7 +87,6 @@ func NewLogService(
 		retentionDays:     retentionDays,
 		attemptIndexCache: newAttemptIndexCache(3000),
 		shutdownCh:        shutdownCh,
-		isShuttingDown:    isShuttingDown,
 		wg:                wg,
 	}
 }
@@ -111,29 +113,10 @@ func (s *LogService) logWorker() {
 
 	for {
 		select {
-		case <-s.shutdownCh:
-			// shutdown时尽量flush掉已排队的日志，避免“退出即丢日志”
-			for {
-				select {
-				case entry, ok := <-s.logChan:
-					if !ok {
-						s.flushIfNeeded(batch)
-						return
-					}
-					batch = append(batch, entry)
-					if len(batch) >= config.LogBatchSize {
-						s.flushLogs(batch)
-						batch = batch[:0]
-					}
-				default:
-					s.flushIfNeeded(batch)
-					return
-				}
-			}
-
 		case entry, ok := <-s.logChan:
 			if !ok {
-				// logChan已关闭，flush剩余日志并退出
+				// CloseInput closes the producer side only after in-flight
+				// submissions finish. Everything accepted is therefore drained.
 				s.flushIfNeeded(batch)
 				return
 			}
@@ -146,11 +129,7 @@ func (s *LogService) logWorker() {
 			}
 
 		case <-ticker.C:
-			// 移除嵌套select，简化定时flush逻辑
-			// 设计原则：
-			// - ticker触发时直接flush当前batch
-			// - 如果logChan关闭，下次循环会在entry <- logChan中捕获
-			// - shutdown信号在select中优先级最高，保证快速响应
+			// 定时直接刷当前批次；logChan 关闭会在下一轮被识别。
 			s.flushIfNeeded(batch)
 			batch = batch[:0]
 		}
@@ -164,58 +143,31 @@ func (s *LogService) flushLogs(logs []*model.LogEntry) {
 	}
 
 	timeout := time.Duration(config.LogFlushTimeoutMs) * time.Millisecond
-	maxRetries := config.LogFlushMaxRetries
-	if s.isShutdownInProgress() {
-		// 关停阶段不做重试，避免单批刷盘耗时放大拖垮优雅关闭预算。
-		maxRetries = 1
-	}
-
-	var lastErr error
-	attempts := 0
-retryLoop:
-	for attempt := 1; attempt <= maxRetries; attempt++ {
-		attempts = attempt
+	for attempt := 1; ; attempt++ {
 		ctx, cancel := context.WithTimeout(context.Background(), timeout)
 		err := s.store.BatchAddLogs(ctx, logs)
 		cancel()
 		if err == nil {
 			s.recordAttemptIndexes(logs)
 			if attempt > 1 {
-				log.Printf("[WARN] 日志批量写入重试成功 (attempt=%d/%d, batch_size=%d)", attempt, maxRetries, len(logs))
+				log.Printf("[WARN] 日志批量写入重试成功 (attempt=%d, batch_size=%d)", attempt, len(logs))
 			}
 			return
 		}
 
-		lastErr = err
-		if attempt < maxRetries {
-			// 运行中可能刚进入关停流程，此时停止重试，避免拖慢 drain。
-			if s.isShutdownInProgress() {
-				break
-			}
-
-			log.Printf("[WARN] 日志批量写入失败，准备重试 (attempt=%d/%d, batch_size=%d): %v", attempt, maxRetries, len(logs), err)
-			backoff := time.Duration(attempt) * config.LogFlushRetryBackoff
-			timer := time.NewTimer(backoff)
-			select {
-			case <-timer.C:
-			case <-s.shutdownCh:
-				if !timer.Stop() {
-					select {
-					case <-timer.C:
-					default:
-					}
-				}
-				break retryLoop
-			}
+		failedEntries := s.logFailCount.Add(uint64(len(logs)))
+		if attempt == 1 || attempt%10 == 0 {
+			log.Printf(
+				"[ERROR] 日志批量写入失败，保留原批次并继续重试 (attempt=%d, batch_size=%d, failed_entry_attempts=%d): %v",
+				attempt,
+				len(logs),
+				failedEntries,
+				err,
+			)
 		}
+
+		time.Sleep(logFlushRetryBackoff(attempt))
 	}
-
-	log.Printf("[ERROR] 日志批量写入最终失败 (attempts=%d, batch_size=%d): %v", attempts, len(logs), lastErr)
-	s.logFailCount.Add(uint64(len(logs)))
-}
-
-func (s *LogService) isShutdownInProgress() bool {
-	return s.isShuttingDown != nil && s.isShuttingDown.Load()
 }
 
 // flushIfNeeded 辅助函数：当batch非空时执行flush
@@ -231,23 +183,48 @@ func (s *LogService) flushIfNeeded(batch []*model.LogEntry) {
 
 // AddLogAsync 异步添加日志
 func (s *LogService) AddLogAsync(entry *model.LogEntry) {
-	// shutdown时不再写入日志
-	if s.isShuttingDown.Load() {
+	if s == nil || entry == nil {
 		return
 	}
 
-	select {
-	case s.logChan <- entry:
-		// 成功放入队列
-	default:
-		// 队列满，丢弃日志（计数用于监控）
-		count := s.logDropCount.Add(1)
-		// [FIX] 降低采样频率，每10次丢弃打印一次（原来是100次）
-		// 设计原则：及早暴露问题，避免用户在黑暗中调试
-		if count%10 == 1 {
-			log.Printf("[ERROR] 日志队列已满，日志被丢弃 (累计丢弃: %d) - 考虑增大 LOG_BUFFER_SIZE 或 LOG_WORKERS", count)
-		}
+	s.logInputMu.RLock()
+	if s.logInputClosed {
+		s.logInputMu.RUnlock()
+		// A late internal producer must not silently lose its entry. Normal
+		// server shutdown quiesces request producers before CloseInput.
+		s.flushLogs([]*model.LogEntry{entry})
+		return
 	}
+	s.logChan <- entry
+	s.logInputMu.RUnlock()
+}
+
+// CloseInput stops queue producers and lets workers drain every accepted log.
+// Closing runs asynchronously so a producer waiting on database backpressure
+// cannot prevent Server.Shutdown from honoring its context deadline.
+func (s *LogService) CloseInput() {
+	if s == nil {
+		return
+	}
+	s.logInputClose.Do(func() {
+		go func() {
+			s.logInputMu.Lock()
+			s.logInputClosed = true
+			close(s.logChan)
+			s.logInputMu.Unlock()
+		}()
+	})
+}
+
+func logFlushRetryBackoff(attempt int) time.Duration {
+	if attempt <= 0 {
+		return config.LogFlushRetryBackoff
+	}
+	maxMultiplier := int(logFlushMaxRetryBackoff / config.LogFlushRetryBackoff)
+	if attempt > maxMultiplier {
+		attempt = maxMultiplier
+	}
+	return time.Duration(attempt) * config.LogFlushRetryBackoff
 }
 
 func (s *LogService) recordAttemptIndexes(logs []*model.LogEntry) {
