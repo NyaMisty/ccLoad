@@ -247,6 +247,7 @@ func TestBuildProxyRequest_KeepsCustomHeaderRulesOnClaudeCodeWire(t *testing.T) 
 			{Action: model.RuleActionOverride, Name: "User-Agent", Value: "custom-agent"},
 			{Action: model.RuleActionAppend, Name: "Anthropic-Beta", Value: "context-1m-2025-08-07"},
 			{Action: model.RuleActionRemove, Name: "Anthropic-Beta", Value: "claude-code-20250219"},
+			{Action: model.RuleActionOverride, Name: "X-Claude-Code-Session-Id", Value: "hijack"},
 			{Action: model.RuleActionOverride, Name: "X-Api-Key", Value: "hijack"},
 		}},
 	}
@@ -297,6 +298,14 @@ func TestBuildProxyRequest_KeepsCustomHeaderRulesOnClaudeCodeWire(t *testing.T) 
 	// 认证头黑名单在该路径上同样不可被规则改写。
 	if got := headerValueFold(req.Header, "x-api-key"); got != "sk-test-key" {
 		t.Fatalf("x-api-key = %q, want the auth header protected from custom rules", got)
+	}
+	body, err := io.ReadAll(req.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := headerValueFold(req.Header, "X-Claude-Code-Session-Id"),
+		anthropicSessionIDFromBody(body); got == "hijack" || got != want {
+		t.Fatalf("session header = %q, want key-derived body session %q", got, want)
 	}
 }
 

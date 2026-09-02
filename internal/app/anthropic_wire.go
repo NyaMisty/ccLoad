@@ -123,23 +123,30 @@ func finalizeAnthropicClaudeCodeMessagesBody(
 	if err := json.Unmarshal(body, &request); err != nil {
 		return nil, errors.New("finalize Anthropic Claude Code request: invalid JSON body")
 	}
+	sourceSessionID := resolveAnthropicSessionID(body, cfg, apiKey, headers)
+	upstreamSessionID := anthropicUpstreamSessionID(cfg, apiKey, sourceSessionID)
 	var err error
 	body, err = bindAnthropicAPIKeyDeviceID(body, request, cfg, apiKey)
 	if err != nil {
 		return nil, err
 	}
 	helperShape := nativeAnthropicHaikuHelperShape(body, request, headers)
+	normalizeAnthropicOAuthModel(request)
+	messages, _ := request["messages"].([]any)
+	nativeRequest := isNativeAnthropicClaudeCodeRequest(request, headers, cfg, apiKey)
+	body, err = bindAnthropicAPIKeySessionID(body, request, cfg, apiKey, upstreamSessionID)
+	if err != nil {
+		return nil, err
+	}
 	if helperShape != anthropicHaikuHelperNone {
 		if helperShape == anthropicHaikuHelperStructured {
 			return finalizeAnthropicCCH(body)
 		}
 		return body, nil
 	}
-	normalizeAnthropicOAuthModel(request)
-	messages, _ := request["messages"].([]any)
-	if isNativeAnthropicClaudeCodeRequest(request, headers, cfg, apiKey) {
+	if nativeRequest {
 		// Native Claude Code owns sampling, prompt-cache placement and JSON member
-		// order. API-key attempts replace only device_id; then CCH is refreshed.
+		// order. API-key attempts replace key-scoped identity fields; then CCH is refreshed.
 		return finalizeAnthropicCCH(body)
 	}
 	// 缓存窗口归调用方：调用方自己声明了 1h，网关注入的 breakpoint 就跟到 1h，否则
@@ -192,7 +199,7 @@ func finalizeAnthropicClaudeCodeMessagesBody(
 				}
 			}
 		}
-		if err := injectAnthropicClaudeCodeMetadata(request, cfg, apiKey, messages, headers); err != nil {
+		if err := injectAnthropicClaudeCodeMetadata(request, cfg, apiKey, messages, upstreamSessionID); err != nil {
 			return nil, err
 		}
 		ensureAnthropicCloakedCacheBreakpoints(request, messagePrefixCount, cloakCacheTTL)
@@ -680,7 +687,7 @@ func injectAnthropicClaudeCodeMetadata(
 	cfg *model.Config,
 	apiKey string,
 	messages []any,
-	headers http.Header,
+	sessionID string,
 ) error {
 	credential := anthropicCredentialForWire(cfg, apiKey)
 	if credential == nil {
@@ -693,7 +700,6 @@ func injectAnthropicClaudeCodeMetadata(
 	if credential.DeviceID == "" || identitySeed == "" {
 		return errors.New("finalize Anthropic Claude Code request: credential identity is incomplete")
 	}
-	sessionID := anthropicSessionIDFromHeaders(headers)
 	if sessionID == "" {
 		sessionID = anthropicStableSessionID(identitySeed, anthropicFirstUserText(messages))
 	}
@@ -788,8 +794,59 @@ func bindAnthropicAPIKeyDeviceID(
 	return updatedBody, nil
 }
 
+// bindAnthropicAPIKeySessionID replaces only the wire-facing session. Routing
+// and affinity continue to use the inbound session captured before finalization.
+func bindAnthropicAPIKeySessionID(
+	body []byte,
+	request map[string]any,
+	cfg *model.Config,
+	apiKey string,
+	sessionID string,
+) ([]byte, error) {
+	if strings.TrimSpace(apiKey) == "" || sessionID == "" || cfg != nil && cfg.UsesOAuth() {
+		return body, nil
+	}
+	metadata, ok := request["metadata"].(map[string]any)
+	if !ok {
+		return body, nil
+	}
+	userID, ok := metadata["user_id"].(string)
+	if !ok || strings.TrimSpace(userID) == "" {
+		return body, nil
+	}
+	var identity map[string]json.RawMessage
+	if json.Unmarshal([]byte(userID), &identity) != nil || identity == nil {
+		return body, nil
+	}
+	if _, exists := identity["session_id"]; !exists {
+		return body, nil
+	}
+	updatedIdentity, err := sjson.SetBytes([]byte(userID), "session_id", sessionID)
+	if err != nil {
+		return nil, errors.New("finalize Anthropic Claude Code request: replace API key session identity")
+	}
+	updatedBody, err := sjson.SetBytes(body, "metadata.user_id", string(updatedIdentity))
+	if err != nil {
+		return nil, errors.New("finalize Anthropic Claude Code request: encode API key session identity")
+	}
+	metadata["user_id"] = string(updatedIdentity)
+	return updatedBody, nil
+}
+
 func anthropicStableSessionID(accountUUID, firstUserText string) string {
 	return uuid.NewSHA1(uuid.NameSpaceOID, []byte(accountUUID+"\x00"+firstUserText)).String()
+}
+
+func anthropicUpstreamSessionID(cfg *model.Config, apiKey, sourceSessionID string) string {
+	sourceSessionID = canonicalClaudeSessionID(sourceSessionID)
+	apiKey = strings.TrimSpace(apiKey)
+	if sourceSessionID == "" || apiKey == "" || cfg != nil && cfg.UsesOAuth() {
+		return sourceSessionID
+	}
+	return uuid.NewSHA1(
+		uuid.NameSpaceOID,
+		[]byte("ccload:anthropic:session\x00"+apiKey+"\x00"+sourceSessionID),
+	).String()
 }
 
 func anthropicSessionIDFromHeaders(headers http.Header) string {
@@ -1187,7 +1244,7 @@ func injectAnthropicOAuthHeaders(
 		delete(req.Header, name)
 	}
 	setRawHeader(req.Header, "Authorization", "Bearer "+strings.TrimSpace(accessToken))
-	applyAnthropicClaudeCodeHeaders(req, anthropicClaudeCodeBetas(body), resolveAnthropicSessionID(body, cfg, "", incoming))
+	applyAnthropicClaudeCodeHeaders(req, anthropicClaudeCodeBetas(body), resolveFinalAnthropicSessionID(body, cfg, "", incoming))
 }
 
 // injectAnthropicAPIKeyHeaders 为 API Key 渠道重建 Claude Code CLI 请求头，与
@@ -1206,6 +1263,9 @@ func injectAnthropicAPIKeyHeaders(
 	incoming := anthropicIncomingHeaders(req, incomingHeaders)
 	if anthropicRequestOwnsItsWire(body, incoming, cfg, apiKey) {
 		applyAnthropicNativeHeaders(req, incoming)
+		if sessionID := anthropicSessionIDFromBody(body); sessionID != "" {
+			setRawHeader(req.Header, "X-Claude-Code-Session-Id", sessionID)
+		}
 		applyAnthropicAPIKeyAuth(req, apiKey)
 		return
 	}
@@ -1214,7 +1274,7 @@ func injectAnthropicAPIKeyHeaders(
 	}
 	applyAnthropicAPIKeyAuth(req, apiKey)
 	applyAnthropicClaudeCodeHeaders(
-		req, anthropicClaudeCodeBetas(body), resolveAnthropicSessionID(body, cfg, apiKey, incoming),
+		req, anthropicClaudeCodeBetas(body), resolveFinalAnthropicSessionID(body, cfg, apiKey, incoming),
 	)
 }
 
@@ -1233,8 +1293,44 @@ func anthropicRequestOwnsItsWire(body []byte, incoming http.Header, cfg *model.C
 	if json.Unmarshal(body, &request) != nil {
 		return false
 	}
-	return nativeAnthropicHaikuHelperShape(body, request, incoming) != anthropicHaikuHelperNone ||
-		isNativeAnthropicClaudeCodeRequest(request, incoming, cfg, apiKey)
+	identityHeaders := anthropicHeadersForFinalizedSession(body, incoming, cfg, apiKey)
+	return nativeAnthropicHaikuHelperShape(body, request, identityHeaders) != anthropicHaikuHelperNone ||
+		isNativeAnthropicClaudeCodeRequest(request, identityHeaders, cfg, apiKey)
+}
+
+func anthropicHeadersForFinalizedSession(
+	body []byte,
+	incoming http.Header,
+	cfg *model.Config,
+	apiKey string,
+) http.Header {
+	if strings.TrimSpace(apiKey) == "" || cfg != nil && cfg.UsesOAuth() {
+		return incoming
+	}
+	sessionID := anthropicSessionIDFromBody(body)
+	if sessionID == "" || anthropicHeaderValue(incoming, "X-Claude-Code-Session-Id") == sessionID {
+		return incoming
+	}
+	headers := incoming.Clone()
+	if headers == nil {
+		headers = make(http.Header)
+	}
+	setRawHeader(headers, "X-Claude-Code-Session-Id", sessionID)
+	return headers
+}
+
+func enforceAnthropicAPIKeySessionHeader(
+	req *http.Request,
+	cfg *model.Config,
+	apiKey string,
+	body []byte,
+) {
+	if req == nil || strings.TrimSpace(apiKey) == "" || cfg != nil && cfg.UsesOAuth() {
+		return
+	}
+	if sessionID := anthropicSessionIDFromBody(body); sessionID != "" {
+		setRawHeader(req.Header, "X-Claude-Code-Session-Id", sessionID)
+	}
 }
 
 // anthropicAPIKeyAuthorizationAllowed 判断 x-api-key 之外能否再带 Bearer。第一方
@@ -1370,12 +1466,11 @@ func deleteRawHeader(headers http.Header, name string) {
 	}
 }
 
-// resolveAnthropicSessionID 解析写入 X-Claude-Code-Session-Id 的会话 ID。
+// resolveAnthropicSessionID resolves the stable source session before any
+// selected-key wire identity is applied.
 //
 // 优先级：下游显式声明的 header → body 的 metadata.user_id.session_id → 凭证身份
-// 与首条用户消息稳定派生 → 随机。body 这一级不能省：finalizeAnthropicOAuthMessages
-// Body 先把 session_id 写进 metadata.user_id，这里读回来才能保证 header 与 body 同值，
-// 而 isNativeAnthropicClaudeCodeRequest 正是按这个等式识别原生 Claude Code 请求的。
+// 与首条用户消息稳定派生 → 随机。
 func resolveAnthropicSessionID(body []byte, cfg *model.Config, apiKey string, headers http.Header) string {
 	if sessionID := anthropicSessionIDFromHeaders(headers); sessionID != "" {
 		return sessionID
@@ -1389,6 +1484,18 @@ func resolveAnthropicSessionID(body []byte, cfg *model.Config, apiKey string, he
 		return anthropicStableSessionID(credential.AccountUUID, anthropicFirstUserText(messages))
 	}
 	return uuid.NewString()
+}
+
+func resolveFinalAnthropicSessionID(
+	body []byte,
+	cfg *model.Config,
+	apiKey string,
+	headers http.Header,
+) string {
+	if sessionID := anthropicSessionIDFromBody(body); sessionID != "" {
+		return sessionID
+	}
+	return anthropicUpstreamSessionID(cfg, apiKey, resolveAnthropicSessionID(body, cfg, apiKey, headers))
 }
 
 func anthropicSessionIDFromBody(body []byte) string {

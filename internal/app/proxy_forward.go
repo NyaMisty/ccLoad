@@ -250,6 +250,9 @@ func (s *Server) buildProxyRequest(
 	if wireRebuilt {
 		applyHeaderRules(req.Header, cfg.HeaderRules())
 	}
+	if anthropicClaudeCodeWire {
+		enforceAnthropicAPIKeySessionHeader(req, cfg, apiKey, body)
+	}
 
 	// 6.2 anyrouter 渠道：确保 anthropic-beta 包含 context-1m。必须排在指纹重建
 	// 之后——重建清空了整个请求头，之前注入的 beta flag 会随之丢失。
@@ -305,9 +308,24 @@ func (s *Server) prepareTranslatedUpstreamBody(
 			if err != nil {
 				break
 			}
-			helperShape := nativeAnthropicHaikuHelperShape(body, request, headers)
+			identityHeaders := anthropicHeadersForFinalizedSession(body, headers, cfg, apiKey)
+			helperShape := nativeAnthropicHaikuHelperShape(body, request, identityHeaders)
+			nativeRequest := isNativeAnthropicClaudeCodeRequest(request, identityHeaders, cfg, apiKey)
+			sessionSourceBody := sourceBody
+			if len(sessionSourceBody) == 0 {
+				sessionSourceBody = body
+			}
+			upstreamSessionID := anthropicUpstreamSessionID(
+				cfg,
+				apiKey,
+				resolveAnthropicSessionID(sessionSourceBody, cfg, apiKey, headers),
+			)
+			body, err = bindAnthropicAPIKeySessionID(body, request, cfg, apiKey, upstreamSessionID)
+			if err != nil {
+				break
+			}
 			if helperShape != anthropicHaikuHelperNone ||
-				isNativeAnthropicClaudeCodeRequest(request, headers, cfg, apiKey) {
+				nativeRequest {
 				body, err = finalizeAnthropicCCH(body)
 			} else {
 				body, err = normalizeAnthropicMessagesBody(body)

@@ -14,8 +14,10 @@ import (
 const claudeAffinityTestResponse = `{"id":"msg_affinity","type":"message","role":"assistant","content":[{"type":"text","text":"ok"}],"model":"claude-sonnet-4-6","stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}`
 
 type claudeAffinityAttempt struct {
-	channel string
-	apiKey  string
+	channel       string
+	apiKey        string
+	headerSession string
+	bodySession   string
 }
 
 type claudeAffinityAttemptLog struct {
@@ -23,11 +25,14 @@ type claudeAffinityAttemptLog struct {
 	attempts []claudeAffinityAttempt
 }
 
-func (log *claudeAffinityAttemptLog) add(channel, apiKey string) {
+func (log *claudeAffinityAttemptLog) add(channel string, request *http.Request) {
+	body, _ := io.ReadAll(request.Body)
 	log.mu.Lock()
 	log.attempts = append(log.attempts, claudeAffinityAttempt{
-		channel: channel,
-		apiKey:  apiKey,
+		channel:       channel,
+		apiKey:        headerValueFold(request.Header, "x-api-key"),
+		headerSession: request.Header.Get("X-Claude-Code-Session-Id"),
+		bodySession:   anthropicSessionIDFromBody(body),
 	})
 	log.mu.Unlock()
 }
@@ -60,7 +65,7 @@ func TestProxy_NativeAnthropicSoftAffinityAcrossKeysAndChannels(t *testing.T) {
 
 	primary := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		apiKey := headerValueFold(r.Header, "x-api-key")
-		attemptLog.add("primary", apiKey)
+		attemptLog.add("primary", r)
 
 		preferredMu.RLock()
 		currentPreferred := preferredKey
@@ -79,7 +84,7 @@ func TestProxy_NativeAnthropicSoftAffinityAcrossKeysAndChannels(t *testing.T) {
 	t.Cleanup(primary.Close)
 
 	fallback := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		attemptLog.add("fallback", headerValueFold(r.Header, "x-api-key"))
+		attemptLog.add("fallback", r)
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = io.WriteString(w, claudeAffinityTestResponse)
 	}))
@@ -143,6 +148,15 @@ func TestProxy_NativeAnthropicSoftAffinityAcrossKeysAndChannels(t *testing.T) {
 		if response.Code != http.StatusOK {
 			t.Fatalf("session %s status=%d body=%s", sessionID, response.Code, response.Body.String())
 		}
+		for index, attempt := range attemptLog.snapshot() {
+			want := anthropicUpstreamSessionID(nil, attempt.apiKey, sessionID)
+			if attempt.headerSession != want || attempt.bodySession != want {
+				t.Fatalf(
+					"attempt %d key=%q header/body session=%q/%q, want %q from inbound %q",
+					index, attempt.apiKey, attempt.headerSession, attempt.bodySession, want, sessionID,
+				)
+			}
+		}
 	}
 	assertAttempts := func(want ...claudeAffinityAttempt) {
 		t.Helper()
@@ -151,7 +165,7 @@ func TestProxy_NativeAnthropicSoftAffinityAcrossKeysAndChannels(t *testing.T) {
 			t.Fatalf("attempts=%+v, want %+v", got, want)
 		}
 		for index := range want {
-			if got[index] != want[index] {
+			if got[index].channel != want[index].channel || got[index].apiKey != want[index].apiKey {
 				t.Fatalf("attempts=%+v, want %+v", got, want)
 			}
 		}

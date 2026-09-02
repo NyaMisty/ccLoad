@@ -441,9 +441,13 @@ func TestProxy_NativeAnthropicAPIKeyRebuildsAndNormalizesWire(t *testing.T) {
 	if strings.Contains(betas, "extended-cache-ttl-2025-04-11") {
 		t.Fatalf("Anthropic-Beta=%q declared extended cache TTL for a caller that never asked", betas)
 	}
-	if upstreamHeaders.Get("X-Claude-Code-Session-Id") != nativeSessionID || headerValueFold(upstreamHeaders, "x-client-request-id") == "" ||
+	wantSessionID := anthropicUpstreamSessionID(nil, "sk-ant-official", nativeSessionID)
+	if upstreamHeaders.Get("X-Claude-Code-Session-Id") != wantSessionID || headerValueFold(upstreamHeaders, "x-client-request-id") == "" ||
 		upstreamHeaders.Get("X-Stainless-Runtime-Version") != "v26.3.0" {
 		t.Fatalf("Claude Code identity headers=%v", upstreamHeaders)
+	}
+	if bodySessionID := anthropicSessionIDFromBody(upstreamBody); bodySessionID != wantSessionID {
+		t.Fatalf("body session=%q header session=%q", bodySessionID, wantSessionID)
 	}
 	// 下游 UA 不是 claude-cli，网关按 Claude Code CLI 指纹重写 body：system 换成
 	// 三段式 CLI 提示，调用方原本的 system 降级为 messages 前缀而不是被丢弃。
@@ -770,7 +774,7 @@ func TestProxy_NativeAnthropicAPIKeyPreservesExplicitCachePolicy(t *testing.T) {
 	}
 }
 
-func TestProxy_NativeAnthropicDeviceFollowsRetriedAPIKey(t *testing.T) {
+func TestProxy_NativeAnthropicIdentityFollowsRetriedAPIKey(t *testing.T) {
 	const (
 		firstKey      = "sk-anthropic-device-first"
 		secondKey     = "sk-anthropic-device-second"
@@ -780,14 +784,17 @@ func TestProxy_NativeAnthropicDeviceFollowsRetriedAPIKey(t *testing.T) {
 		responseBody  = `{"id":"msg_1","type":"message","role":"assistant","content":[{"type":"text","text":"ok"}],"model":"claude-sonnet-4-6","stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}`
 	)
 	type attempt struct {
-		key  string
-		body []byte
+		key       string
+		sessionID string
+		body      []byte
 	}
 	var attempts []attempt
 	upstream := newTestHTTPServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
 		key := headerValueFold(r.Header, "x-api-key")
-		attempts = append(attempts, attempt{key: key, body: body})
+		attempts = append(attempts, attempt{
+			key: key, sessionID: r.Header.Get("X-Claude-Code-Session-Id"), body: body,
+		})
 		w.Header().Set("Content-Type", "application/json")
 		if key == firstKey {
 			w.WriteHeader(http.StatusBadGateway)
@@ -854,8 +861,12 @@ func TestProxy_NativeAnthropicDeviceFollowsRetriedAPIKey(t *testing.T) {
 		if got := gjson.Get(userID, "account_uuid").String(); got != nativeAccount {
 			t.Fatalf("attempt %d account_uuid=%q, want %q", index, got, nativeAccount)
 		}
-		if got := gjson.Get(userID, "session_id").String(); got != nativeSession {
-			t.Fatalf("attempt %d session_id=%q, want %q", index, got, nativeSession)
+		wantSession := anthropicUpstreamSessionID(nil, attempt.key, nativeSession)
+		if got := gjson.Get(userID, "session_id").String(); got != wantSession {
+			t.Fatalf("attempt %d body session_id=%q, want %q", index, got, wantSession)
+		}
+		if attempt.sessionID != wantSession {
+			t.Fatalf("attempt %d header session_id=%q, want %q", index, attempt.sessionID, wantSession)
 		}
 		resigned, err := finalizeAnthropicCCH(attempt.body)
 		if err != nil || !bytes.Equal(resigned, attempt.body) {
@@ -865,6 +876,9 @@ func TestProxy_NativeAnthropicDeviceFollowsRetriedAPIKey(t *testing.T) {
 	if firstDevice := synthesizeAnthropicAPIKeyCredential(firstKey).DeviceID; firstDevice ==
 		synthesizeAnthropicAPIKeyCredential(secondKey).DeviceID {
 		t.Fatalf("distinct selected keys share device_id %q", firstDevice)
+	}
+	if attempts[0].sessionID == attempts[1].sessionID {
+		t.Fatalf("distinct selected keys share session_id %q", attempts[0].sessionID)
 	}
 }
 

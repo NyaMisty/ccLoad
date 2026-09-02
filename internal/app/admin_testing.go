@@ -1692,6 +1692,9 @@ func (s *Server) newTestUpstreamRequest(
 	if wireRebuilt {
 		applyHeaderRules(req.Header, cfgForBuild.HeaderRules())
 	}
+	if isAnthropicClaudeCodeMessagesRequest(cfgForBuild, requestProtocol, requestPlan.endpointPath) {
+		enforceAnthropicAPIKeySessionHeader(req, cfgForBuild, requestPlan.apiKey, requestPlan.requestBody)
+	}
 	// anyrouter 渠道：确保 anthropic-beta 包含 context-1m，与代理链路步骤 6.2 对齐。
 	if requestProtocol == protocol.Anthropic && isAnyrouterChannel(cfgForBuild) {
 		injectAnthropicBetaFlag(req, "context-1m-2025-08-07")

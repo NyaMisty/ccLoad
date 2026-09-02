@@ -1379,12 +1379,17 @@ func TestAnthropicOAuthPreservesMarkerlessHaikuHelper(t *testing.T) {
 		t.Fatal(err)
 	}
 	apiKeyUserID := gjson.GetBytes(apiKeyBody, "metadata.user_id").String()
+	apiKeySessionID := anthropicUpstreamSessionID(
+		&model.Config{Name: "anthropic-api-key"},
+		"sk-ant-helper",
+		sessionID,
+	)
 	if got, want := gjson.Get(apiKeyUserID, "device_id").String(),
 		synthesizeAnthropicAPIKeyCredential("sk-ant-helper").DeviceID; got != want {
 		t.Fatalf("API Key helper device_id=%q, want %q", got, want)
 	}
 	if gjson.Get(apiKeyUserID, "account_uuid").String() != "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb" ||
-		gjson.Get(apiKeyUserID, "session_id").String() != sessionID ||
+		gjson.Get(apiKeyUserID, "session_id").String() != apiKeySessionID ||
 		gjson.GetBytes(apiKeyBody, "system").Exists() ||
 		!anthropicJSONObjectHasOrderedKeys(apiKeyBody, []string{"model", "max_tokens", "messages", "metadata"}) {
 		t.Fatalf("API Key helper native shape changed: %s", apiKeyBody)
@@ -1859,7 +1864,42 @@ func TestSynthesizedAnthropicAPIKeyIdentityIsStable(t *testing.T) {
 	}
 }
 
-func TestAnthropicAPIKeyNativeDeviceFollowsSelectedKey(t *testing.T) {
+func TestAnthropicUpstreamSessionIDIsStablePerKeyAndSourceSession(t *testing.T) {
+	const (
+		sourceSession = "e03895ad-8b34-4a84-bbf6-002e8909b17b"
+		otherSession  = "11111111-2222-4333-8444-555555555555"
+	)
+	cfg := &model.Config{Name: "anthropic-api-key"}
+	first := anthropicUpstreamSessionID(cfg, "sk-ant-stable", sourceSession)
+	again := anthropicUpstreamSessionID(cfg, "  sk-ant-stable  ", sourceSession)
+	otherKey := anthropicUpstreamSessionID(cfg, "sk-ant-other", sourceSession)
+	otherSource := anthropicUpstreamSessionID(cfg, "sk-ant-stable", otherSession)
+
+	if first != again || first == sourceSession || first == otherKey || first == otherSource {
+		t.Fatalf(
+			"session mapping source/first/again/other-key/other-source=%q/%q/%q/%q/%q",
+			sourceSession, first, again, otherKey, otherSource,
+		)
+	}
+	if want := "a2961203-886a-5acc-b86b-870d6d333000"; first != want {
+		t.Fatalf("stable session vector changed: got %q, want %q", first, want)
+	}
+	if _, err := uuid.Parse(first); err != nil {
+		t.Fatalf("derived session ID=%q, want UUID: %v", first, err)
+	}
+	if got := anthropicUpstreamSessionID(cfg, "", sourceSession); got != sourceSession {
+		t.Fatalf("blank-key session=%q, want source %q", got, sourceSession)
+	}
+	if got := anthropicUpstreamSessionID(
+		&model.Config{AuthType: model.AuthTypeAnthropicOAuth},
+		"oauth-access",
+		sourceSession,
+	); got != sourceSession {
+		t.Fatalf("OAuth session=%q, want source %q", got, sourceSession)
+	}
+}
+
+func TestAnthropicAPIKeyNativeIdentityFollowsSelectedKey(t *testing.T) {
 	const (
 		callerDevice = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 		accountUUID  = "9b079a70-8780-5404-bbaf-d74217f5adfd"
@@ -1902,8 +1942,9 @@ func TestAnthropicAPIKeyNativeDeviceFollowsSelectedKey(t *testing.T) {
 		if got := gjson.Get(userID, "account_uuid").String(); got != accountUUID {
 			t.Fatalf("account_uuid=%q, want %q", got, accountUUID)
 		}
-		if got := gjson.Get(userID, "session_id").String(); got != sessionID {
-			t.Fatalf("session_id=%q, want %q", got, sessionID)
+		if got, want := gjson.Get(userID, "session_id").String(),
+			anthropicUpstreamSessionID(cfg, apiKey, sessionID); got != want {
+			t.Fatalf("session_id=%q, want selected-key session %q", got, want)
 		}
 		if got := gjson.Get(userID, "parent_session_id").String(); got != "parent" {
 			t.Fatalf("parent_session_id=%q, want parent", got)
@@ -1921,6 +1962,9 @@ func TestAnthropicAPIKeyNativeDeviceFollowsSelectedKey(t *testing.T) {
 	firstDevice := gjson.Get(gjson.GetBytes(first, "metadata.user_id").String(), "device_id").String()
 	againDevice := gjson.Get(gjson.GetBytes(again, "metadata.user_id").String(), "device_id").String()
 	otherDevice := gjson.Get(gjson.GetBytes(other, "metadata.user_id").String(), "device_id").String()
+	firstSession := anthropicSessionIDFromBody(first)
+	againSession := anthropicSessionIDFromBody(again)
+	otherSession := anthropicSessionIDFromBody(other)
 	if want := synthesizeAnthropicAPIKeyCredential("sk-ant-device-a").DeviceID; firstDevice != want {
 		t.Fatalf("device_id=%q, want selected-key device %q", firstDevice, want)
 	}
@@ -1928,15 +1972,20 @@ func TestAnthropicAPIKeyNativeDeviceFollowsSelectedKey(t *testing.T) {
 		t.Fatalf("device mapping caller/a/again/b=%q/%q/%q/%q",
 			callerDevice, firstDevice, againDevice, otherDevice)
 	}
+	if firstSession == sessionID || firstSession != againSession || firstSession == otherSession {
+		t.Fatalf("session mapping caller/a/again/b=%q/%q/%q/%q",
+			sessionID, firstSession, againSession, otherSession)
+	}
 }
 
-func TestPrepareTranslatedAnthropicBodyRebindsFinalizedDeviceToCurrentKey(t *testing.T) {
+func TestPrepareTranslatedAnthropicBodyRebindsFinalizedIdentityToCurrentKey(t *testing.T) {
 	srv := newInMemoryServer(t)
 	cfg := &model.Config{Name: "anthropic-api-key"}
 	headers := http.Header{"Content-Type": {"application/json"}, "User-Agent": {"third-party-client"}}
+	const sourceSessionID = "e03895ad-8b34-4a84-bbf6-002e8909b17b"
 	source := []byte(`{
 		"model":"claude-sonnet-4-6",
-		"metadata":{"user_id":"{\"device_id\":\"caller-device\",\"account_uuid\":\"caller-account\",\"session_id\":\"e03895ad-8b34-4a84-bbf6-002e8909b17b\"}"},
+		"metadata":{"user_id":"{\"device_id\":\"caller-device\",\"account_uuid\":\"caller-account\",\"session_id\":\"` + sourceSessionID + `\"}"},
 		"messages":[{"role":"user","content":"hello"}]
 	}`)
 
@@ -1963,6 +2012,20 @@ func TestPrepareTranslatedAnthropicBodyRebindsFinalizedDeviceToCurrentKey(t *tes
 	}
 	if device(first) == device(rebound) {
 		t.Fatalf("device_id did not change with selected key: %q", device(first))
+	}
+	firstSession := anthropicSessionIDFromBody(first)
+	reboundSession := anthropicSessionIDFromBody(rebound)
+	if want := anthropicUpstreamSessionID(cfg, "sk-ant-first", sourceSessionID); firstSession != want {
+		t.Fatalf("first session_id=%q, want %q", firstSession, want)
+	}
+	if want := anthropicUpstreamSessionID(cfg, "sk-ant-second", sourceSessionID); reboundSession != want {
+		t.Fatalf("rebound session_id=%q, want %q", reboundSession, want)
+	}
+	if firstSession == reboundSession {
+		t.Fatalf("session_id did not change with selected key: %q", firstSession)
+	}
+	if cascaded := anthropicUpstreamSessionID(cfg, "sk-ant-second", firstSession); reboundSession == cascaded {
+		t.Fatalf("rebound session cascaded from prior attempt: %q", reboundSession)
 	}
 	resigned, err := finalizeAnthropicCCH(rebound)
 	if err != nil || !bytes.Equal(resigned, rebound) {
