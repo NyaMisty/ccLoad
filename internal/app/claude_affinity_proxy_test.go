@@ -66,7 +66,7 @@ func TestProxy_NativeAnthropicSoftAffinityAcrossKeysAndChannels(t *testing.T) {
 		currentPreferred := preferredKey
 		preferredMu.RUnlock()
 		mode := failureMode.Load()
-		if mode == 2 || mode == 1 && apiKey == currentPreferred {
+		if mode == 1 && apiKey == currentPreferred {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusBadGateway)
 			_, _ = io.WriteString(w, `{"error":{"type":"api_error","message":"provider unavailable"}}`)
@@ -169,6 +169,15 @@ func TestProxy_NativeAnthropicSoftAffinityAcrossKeysAndChannels(t *testing.T) {
 	if preferredKey == primaryKeyA {
 		otherKey = primaryKeyB
 	}
+	originalKey := preferredKey
+	keys, err := env.store.GetAPIKeys(context.Background(), primaryCfg.ID)
+	if err != nil {
+		t.Fatalf("get primary Keys: %v", err)
+	}
+	keyIndexes := make(map[string]int, len(keys))
+	for _, key := range keys {
+		keyIndexes[key.APIKey] = key.KeyIndex
+	}
 
 	attemptLog.reset()
 	send(sessionA)
@@ -178,8 +187,35 @@ func TestProxy_NativeAnthropicSoftAffinityAcrossKeysAndChannels(t *testing.T) {
 	send(sessionB)
 	assertAttempts(claudeAffinityAttempt{channel: "primary", apiKey: otherKey})
 
+	// Disabling the bound Key makes normal routing select the other Key. Once
+	// that Key succeeds, re-enabling the old Key must not pull the session back.
+	if err := env.store.SetAPIKeyDisabled(
+		context.Background(), primaryCfg.ID, keyIndexes[originalKey], true,
+	); err != nil {
+		t.Fatalf("disable original affinity Key: %v", err)
+	}
+	env.server.InvalidateAPIKeysCache(primaryCfg.ID)
+
+	attemptLog.reset()
+	send(sessionA)
+	assertAttempts(claudeAffinityAttempt{channel: "primary", apiKey: otherKey})
+
+	if err := env.store.SetAPIKeyDisabled(
+		context.Background(), primaryCfg.ID, keyIndexes[originalKey], false,
+	); err != nil {
+		t.Fatalf("re-enable original affinity Key: %v", err)
+	}
+	env.server.InvalidateAPIKeysCache(primaryCfg.ID)
+
+	attemptLog.reset()
+	send(sessionA)
+	assertAttempts(claudeAffinityAttempt{channel: "primary", apiKey: otherKey})
+	preferredMu.Lock()
+	preferredKey = otherKey
+	preferredMu.Unlock()
+
 	// Make the fallback channel globally preferable. The established session
-	// must still try its original healthy channel and Key first.
+	// must still try its newly bound healthy channel and Key first.
 	fallbackCfg.Priority = 200
 	if _, err := env.store.UpdateConfig(context.Background(), fallbackCfg.ID, fallbackCfg); err != nil {
 		t.Fatalf("raise fallback priority: %v", err)
@@ -190,8 +226,8 @@ func TestProxy_NativeAnthropicSoftAffinityAcrossKeysAndChannels(t *testing.T) {
 	send(sessionA)
 	assertAttempts(claudeAffinityAttempt{channel: "primary", apiKey: preferredKey})
 
-	// A failed preferred Key resumes the untouched channel order. The affinity
-	// must not degrade into a preference for another Key on the same channel.
+	// A failed preferred Key resumes the untouched channel order. The first
+	// fallback that succeeds becomes the session's new affinity target.
 	failureMode.Store(1)
 	attemptLog.reset()
 	send(sessionA)
@@ -200,14 +236,6 @@ func TestProxy_NativeAnthropicSoftAffinityAcrossKeysAndChannels(t *testing.T) {
 		claudeAffinityAttempt{channel: "fallback", apiKey: fallbackKey},
 	)
 
-	keys, err := env.store.GetAPIKeys(context.Background(), primaryCfg.ID)
-	if err != nil {
-		t.Fatalf("get primary Keys: %v", err)
-	}
-	keyIndexes := make(map[string]int, len(keys))
-	for _, key := range keys {
-		keyIndexes[key.APIKey] = key.KeyIndex
-	}
 	if err := env.store.ResetKeyCooldown(
 		context.Background(), primaryCfg.ID, keyIndexes[preferredKey],
 	); err != nil {
@@ -218,40 +246,7 @@ func TestProxy_NativeAnthropicSoftAffinityAcrossKeysAndChannels(t *testing.T) {
 
 	attemptLog.reset()
 	send(sessionA)
-	assertAttempts(claudeAffinityAttempt{channel: "primary", apiKey: preferredKey})
-
-	// The fallback success must not replace the still-live original Key.
-	failureMode.Store(2)
-	attemptLog.reset()
-	send(sessionA)
-	assertAttempts(
-		claudeAffinityAttempt{channel: "primary", apiKey: preferredKey},
-		claudeAffinityAttempt{channel: "fallback", apiKey: fallbackKey},
-	)
-
-	attemptLog.reset()
-	send(sessionA)
 	assertAttempts(claudeAffinityAttempt{channel: "fallback", apiKey: fallbackKey})
-
-	for _, keyIndex := range keyIndexes {
-		if err := env.store.ResetKeyCooldown(context.Background(), primaryCfg.ID, keyIndex); err != nil {
-			t.Fatalf("reset primary Key %d cooldown: %v", keyIndex, err)
-		}
-	}
-	if err := env.store.ResetChannelCooldown(context.Background(), primaryCfg.ID); err != nil {
-		t.Fatalf("reset primary channel cooldown: %v", err)
-	}
-	if err := env.store.ResetModelCooldown(
-		context.Background(), primaryCfg.ID, "claude-sonnet-4-6",
-	); err != nil {
-		t.Fatalf("reset primary model cooldown: %v", err)
-	}
-	env.server.invalidateChannelRelatedCache(primaryCfg.ID)
-	failureMode.Store(0)
-
-	attemptLog.reset()
-	send(sessionA)
-	assertAttempts(claudeAffinityAttempt{channel: "primary", apiKey: preferredKey})
 }
 
 func TestProxy_TranslatedAnthropicDoesNotCreateSoftAffinity(t *testing.T) {

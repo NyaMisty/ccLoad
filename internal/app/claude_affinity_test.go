@@ -88,7 +88,7 @@ func TestClaudeSessionAffinityRequestIdentity(t *testing.T) {
 	}
 }
 
-func TestClaudeSessionAffinityPersistsFirstKeyUntilExpiry(t *testing.T) {
+func TestClaudeSessionAffinityFollowsLatestSuccessfulKey(t *testing.T) {
 	ctx := context.Background()
 	store, err := storage.CreateSQLiteStore(":memory:")
 	if err != nil {
@@ -157,38 +157,39 @@ func TestClaudeSessionAffinityPersistsFirstKeyUntilExpiry(t *testing.T) {
 	if err = affinity.remember(ctx, fallback); err != nil {
 		t.Fatalf("remember fallback key: %v", err)
 	}
+	if got, found := affinity.targetSnapshot(); !found || got.apiKeyHash != fallback.apiKeyHash {
+		t.Fatalf("in-memory affinity did not follow fallback: got=%+v found=%t", got, found)
+	}
 
 	reloaded := newAffinity()
 	if err = reloaded.load(ctx); err != nil {
 		t.Fatalf("reload affinity: %v", err)
 	}
-	if got, found := reloaded.targetSnapshot(); !found || got.apiKeyHash != first.apiKeyHash {
-		t.Fatalf("fallback replaced live key: got=%+v found=%t", got, found)
+	if got, found := reloaded.targetSnapshot(); !found || got.apiKeyHash != fallback.apiKeyHash {
+		t.Fatalf("persisted affinity did not follow fallback: got=%+v found=%t", got, found)
 	}
 
 	now = now.Add(30 * time.Minute)
 	if err = reloaded.remember(ctx, first); err != nil {
-		t.Fatalf("renew first key: %v", err)
+		t.Fatalf("move affinity back to first key: %v", err)
 	}
-	now = now.Add(31 * time.Minute)
-	renewed := newAffinity()
-	if err = renewed.load(ctx); err != nil {
-		t.Fatalf("load renewed affinity: %v", err)
+	movedAgain := newAffinity()
+	if err = movedAgain.load(ctx); err != nil {
+		t.Fatalf("load affinity moved back to first key: %v", err)
 	}
-	if got, found := renewed.targetSnapshot(); !found || got.apiKeyHash != first.apiKeyHash {
-		t.Fatalf("matching success did not renew key: got=%+v found=%t", got, found)
+	if got, found := movedAgain.targetSnapshot(); !found ||
+		got.apiKeyHash != first.apiKeyHash ||
+		!got.expiresAt.Equal(now.Add(claudeSessionAffinityTTL)) {
+		t.Fatalf("latest successful key was not persisted: got=%+v found=%t", got, found)
 	}
 
-	now = now.Add(30 * time.Minute)
-	if err = renewed.remember(ctx, fallback); err != nil {
-		t.Fatalf("bind fallback after expiry: %v", err)
+	now = now.Add(claudeSessionAffinityTTL + time.Second)
+	expired := newAffinity()
+	if err = expired.load(ctx); err != nil {
+		t.Fatalf("load expired affinity: %v", err)
 	}
-	rebound := newAffinity()
-	if err = rebound.load(ctx); err != nil {
-		t.Fatalf("load rebound affinity: %v", err)
-	}
-	if got, found := rebound.targetSnapshot(); !found || got.apiKeyHash != fallback.apiKeyHash {
-		t.Fatalf("expired key was not rebound: got=%+v found=%t", got, found)
+	if _, found := expired.targetSnapshot(); found {
+		t.Fatal("expired affinity remained available")
 	}
 }
 

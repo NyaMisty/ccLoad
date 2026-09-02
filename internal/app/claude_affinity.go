@@ -176,11 +176,8 @@ func (affinity *claudeSessionAffinity) remember(
 		return err
 	}
 
-	current, ok := affinity.targetSnapshot()
-	if !ok || current.apiKeyHash == target.apiKeyHash {
-		affinity.target = target
-		affinity.hasTarget = true
-	}
+	affinity.target = target
+	affinity.hasTarget = true
 	return nil
 }
 

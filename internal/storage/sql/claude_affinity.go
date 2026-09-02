@@ -51,9 +51,8 @@ func (s *SQLStore) GetClaudeSessionAffinity(
 	return &affinity, nil
 }
 
-// RememberClaudeSessionAffinity preserves the first successful API key while
-// the binding is live. A success on the same key renews it; a fallback key can
-// claim the session only after expiry.
+// RememberClaudeSessionAffinity makes the latest successful API key the
+// session's preferred key and renews the binding TTL.
 func (s *SQLStore) RememberClaudeSessionAffinity(
 	ctx context.Context,
 	affinity *model.ClaudeSessionAffinity,
@@ -75,15 +74,12 @@ func (s *SQLStore) RememberClaudeSessionAffinity(
 			api_key_id = excluded.api_key_id,
 			api_key_hash = excluded.api_key_hash,
 			expires_at = excluded.expires_at,
-			updated_at = excluded.updated_at
-		WHERE claude_session_affinities.expires_at <= ?
-			OR claude_session_affinities.api_key_hash = excluded.api_key_hash`
+			updated_at = excluded.updated_at`
 	args := []any{
 		strings.TrimSpace(affinity.SubjectSessionHash),
 		affinity.APIKeyID,
 		strings.TrimSpace(affinity.APIKeyHash),
 		timeToUnix(affinity.ExpiresAt),
-		timeToUnix(now),
 		timeToUnix(now),
 	}
 	if s.IsMySQL() {
@@ -92,13 +88,10 @@ func (s *SQLStore) RememberClaudeSessionAffinity(
 				(subject_session_hash, api_key_id, api_key_hash, expires_at, updated_at)
 			VALUES (?, ?, ?, ?, ?)
 			ON DUPLICATE KEY UPDATE
-				api_key_id = IF(expires_at <= ? OR api_key_hash = VALUES(api_key_hash), VALUES(api_key_id), api_key_id),
-				api_key_hash = IF(expires_at <= ? OR api_key_hash = VALUES(api_key_hash), VALUES(api_key_hash), api_key_hash),
-				expires_at = IF(expires_at <= ? OR api_key_hash = VALUES(api_key_hash), VALUES(expires_at), expires_at),
-				updated_at = IF(expires_at <= ? OR api_key_hash = VALUES(api_key_hash), VALUES(updated_at), updated_at)`
-		for range 3 {
-			args = append(args, timeToUnix(now))
-		}
+				api_key_id = VALUES(api_key_id),
+				api_key_hash = VALUES(api_key_hash),
+				expires_at = VALUES(expires_at),
+				updated_at = VALUES(updated_at)`
 	}
 
 	if _, err := s.ExecContext(ctx, query, args...); err != nil {
