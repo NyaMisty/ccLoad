@@ -157,7 +157,9 @@ func TestClaudeSessionAffinityFollowsLatestSuccessfulKey(t *testing.T) {
 	if err = affinity.remember(ctx, fallback); err != nil {
 		t.Fatalf("remember fallback key: %v", err)
 	}
-	if got, found := affinity.targetSnapshot(); !found || got.apiKeyHash != fallback.apiKeyHash {
+	if got, found := affinity.targetSnapshot(); !found ||
+		got.targetKind != model.ClaudeAffinityTargetAPIKey ||
+		got.apiKeyHash != fallback.apiKeyHash {
 		t.Fatalf("in-memory affinity did not follow fallback: got=%+v found=%t", got, found)
 	}
 
@@ -198,9 +200,9 @@ func TestClaudeSessionAffinitySelectsOnlyHealthyBoundKey(t *testing.T) {
 	preferred := &model.Config{ID: 2}
 	affinity := &claudeSessionAffinity{
 		target: claudeAffinityTarget{
+			targetKind: model.ClaudeAffinityTargetAPIKey,
 			apiKeyID:   22,
-			channelID:  preferred.ID,
-			keyIndex:   99,
+			channelID:  999,
 			apiKeyHash: claudeAffinityAPIKeyHash("sk-preferred"),
 			expiresAt:  now.Add(time.Hour),
 		},
@@ -224,5 +226,43 @@ func TestClaudeSessionAffinitySelectsOnlyHealthyBoundKey(t *testing.T) {
 	apiKeys[1].Disabled = true
 	if _, _, pinned = selectClaudeAffinityKey(preferred, apiKeys, nil, affinity); pinned {
 		t.Fatal("disabled preferred key must not override normal fallback selection")
+	}
+}
+
+func TestClaudeAffinityTargetKinds(t *testing.T) {
+	t.Parallel()
+
+	apiKeyTarget, ok := newClaudeAffinityTarget(
+		&model.Config{ID: 7, AuthType: model.AuthTypeAPIKey},
+		17,
+		3,
+		"sk-api",
+	)
+	if !ok || apiKeyTarget.targetKind != model.ClaudeAffinityTargetAPIKey ||
+		apiKeyTarget.apiKeyID != 17 || apiKeyTarget.channelID != 7 {
+		t.Fatalf("API key target = %+v, ok=%t", apiKeyTarget, ok)
+	}
+
+	zaiTarget, ok := newClaudeAffinityTarget(
+		&model.Config{ID: 8, AuthType: model.AuthTypeZAIOAuth},
+		0,
+		-1,
+		"zai-id.secret",
+	)
+	if !ok || zaiTarget.targetKind != model.ClaudeAffinityTargetZAICodingPlan ||
+		zaiTarget.apiKeyID != 0 || zaiTarget.channelID != 8 {
+		t.Fatalf("ZCode target = %+v, ok=%t", zaiTarget, ok)
+	}
+	if zaiTarget.apiKeyHash == apiKeyTarget.apiKeyHash {
+		t.Fatal("different actual keys produced the same affinity hash")
+	}
+
+	if _, ok = newClaudeAffinityTarget(
+		&model.Config{ID: 9, AuthType: model.AuthTypeAnthropicOAuth},
+		0,
+		-1,
+		"oauth-token",
+	); ok {
+		t.Fatal("non-ZCode OAuth credential must not become a Claude affinity target")
 	}
 }

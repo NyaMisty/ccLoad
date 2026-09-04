@@ -651,6 +651,10 @@ func (s *Server) runProxyAttemptLoopWithFailureBoundary(
 	for index, cfg := range cands {
 		result, err := s.tryChannelWithKeys(ctx, cfg, reqCtx, w)
 
+		if err != nil && errors.Is(err, errClaudeAffinityTargetAlreadyTried) {
+			continue
+		}
+
 		// 所有Key冷却：触发渠道级冷却(503)，防止后续请求重复尝试
 		// 使用 cooldownManager.HandleError 统一处理（DRY原则）
 		if err != nil && errors.Is(err, ErrAllKeysUnavailable) {

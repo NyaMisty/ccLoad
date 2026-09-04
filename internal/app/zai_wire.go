@@ -36,16 +36,16 @@ type zaiRequestIdentity struct {
 }
 
 // finalizeZAICodingPlanBody replaces the caller's metadata.user_id with the
-// channel's ZCode fingerprint. A foreign client fingerprint (Claude Code's, for
-// example) must never reach the Coding Plan upstream.
-func finalizeZAICodingPlanBody(body []byte, cfg *model.Config) ([]byte, error) {
+// channel's ZCode fingerprint and the already key-scoped upstream session. A
+// foreign client fingerprint must never reach the Coding Plan upstream.
+func finalizeZAICodingPlanBody(body []byte, cfg *model.Config, sessionID string) ([]byte, error) {
 	var request map[string]any
 	if err := json.Unmarshal(body, &request); err != nil {
 		return nil, errors.New("finalize z.ai Coding Plan request: invalid JSON body")
 	}
 	identity, err := json.Marshal(zaiRequestIdentity{
 		DeviceID:  zaiDeviceID(cfg),
-		SessionID: resolveZAISessionID(body, cfg),
+		SessionID: sessionID,
 	})
 	if err != nil {
 		return nil, errors.New("finalize z.ai Coding Plan request: invalid identity")
@@ -93,22 +93,59 @@ func injectZAICodingPlanHeaders(req *http.Request, cfg *model.Config, apiKey str
 	}
 	setRawHeader(req.Header, "x-request-id", uuid.NewString())
 	setRawHeader(req.Header, "x-zcode-trace-id", uuid.NewString())
-	setRawHeader(req.Header, "x-session-id", resolveZAISessionID(body, cfg))
+	setRawHeader(req.Header, "x-session-id", resolveFinalZAISessionID(body, cfg, apiKey, incoming))
 }
 
-// resolveZAISessionID keeps one conversation on a single session identifier:
-// the caller's own session when it sends one, otherwise a value derived from
-// the channel fingerprint and the opening user message.
-func resolveZAISessionID(body []byte, cfg *model.Config) string {
-	if sessionID := anthropicSessionIDFromBody(body); sessionID != "" {
+// resolveZAISourceSessionID resolves the session before applying the selected
+// Coding Plan key. sourceBody and headers always belong to the inbound request,
+// so retries never derive from a preceding attempt's wire session.
+func resolveZAISourceSessionID(sourceBody, anthropicBody []byte, cfg *model.Config, headers http.Header) string {
+	if sessionID := anthropicSessionIDFromHeaders(headers); sessionID != "" {
+		return sessionID
+	}
+	if sessionID := anthropicSessionIDFromBody(sourceBody); sessionID != "" {
+		return sessionID
+	}
+	if sessionID := anthropicSessionIDFromBody(anthropicBody); sessionID != "" {
 		return sessionID
 	}
 	if deviceID := zaiDeviceID(cfg); deviceID != "" {
-		request, _ := decodeAnthropicRequest(body)
+		request, _ := decodeAnthropicRequest(anthropicBody)
 		messages, _ := request["messages"].([]any)
 		return anthropicStableSessionID(deviceID, anthropicFirstUserText(messages))
 	}
 	return uuid.NewString()
+}
+
+func zaiUpstreamSessionID(apiKey, sourceSessionID string) string {
+	apiKey = strings.TrimSpace(apiKey)
+	sourceSessionID = canonicalClaudeSessionID(sourceSessionID)
+	if apiKey == "" || sourceSessionID == "" {
+		return sourceSessionID
+	}
+	return uuid.NewSHA1(
+		uuid.NameSpaceOID,
+		[]byte("ccload:zai:session\x00"+apiKey+"\x00"+sourceSessionID),
+	).String()
+}
+
+func resolveFinalZAISessionID(body []byte, cfg *model.Config, apiKey string, headers http.Header) string {
+	if sessionID := anthropicSessionIDFromBody(body); sessionID != "" {
+		return sessionID
+	}
+	return zaiUpstreamSessionID(
+		apiKey,
+		resolveZAISourceSessionID(nil, body, cfg, headers),
+	)
+}
+
+func enforceZAISessionHeader(req *http.Request, body []byte) {
+	if req == nil {
+		return
+	}
+	if sessionID := anthropicSessionIDFromBody(body); sessionID != "" {
+		setRawHeader(req.Header, "x-session-id", sessionID)
+	}
 }
 
 func zaiDeviceID(cfg *model.Config) string {

@@ -177,6 +177,7 @@ func (s *Server) buildProxyRequest(
 		return nil, err
 	}
 	anthropicClaudeCodeWire := isAnthropicClaudeCodeMessagesRequest(cfg, upstreamProtocol, requestPath)
+	zaiCodingPlanWire := isZAICodingPlanRequest(cfg, upstreamProtocol, requestPath)
 	if isAnthropicMessagesRequest(upstreamProtocol, requestPath) {
 		if err = validateAnthropicLegacySystemRequestForUpstream(body, cfg, apiKey, hdr, parsedUpstreamURL); err != nil {
 			return nil, err
@@ -235,7 +236,7 @@ func (s *Server) buildProxyRequest(
 	} else if isAnthropicOAuthMessagesRequest(cfg, upstreamProtocol, requestPath) {
 		injectAnthropicOAuthHeaders(req, cfg, apiKey, body, hdr)
 		wireRebuilt = true
-	} else if isZAICodingPlanRequest(cfg, upstreamProtocol, requestPath) {
+	} else if zaiCodingPlanWire {
 		injectZAICodingPlanHeaders(req, cfg, apiKey, body, hdr)
 		wireRebuilt = true
 	} else if anthropicClaudeCodeWire {
@@ -252,6 +253,9 @@ func (s *Server) buildProxyRequest(
 	}
 	if anthropicClaudeCodeWire {
 		enforceAnthropicAPIKeySessionHeader(req, cfg, apiKey, body)
+	}
+	if zaiCodingPlanWire {
+		enforceZAISessionHeader(req, body)
 	}
 
 	// 6.2 anyrouter 渠道：确保 anthropic-beta 包含 context-1m。必须排在指纹重建
@@ -296,7 +300,8 @@ func (s *Server) prepareTranslatedUpstreamBody(
 		var err error
 		switch {
 		case !claudeCodeWire:
-			// Z.ai Coding Plan 自带 ZCode 指纹，只做 Anthropic 线协议归一。
+			// Z.ai Coding Plan 自带 ZCode 指纹，不携带 Claude Code 的 billing/CCH。
+			body = stripAnthropicBillingHeaders(body)
 			body, err = normalizeAnthropicMessagesBody(body)
 		case anthropicAlreadyFinalized:
 			var request map[string]any
@@ -340,7 +345,12 @@ func (s *Server) prepareTranslatedUpstreamBody(
 	// Z.ai Coding Plan 的 ZCode 设备指纹走 body 的 metadata.user_id。必须留在这个
 	// 共享入口里：挂在代理链路的独立分支上，管理测试就会发出没有指纹的请求。
 	if isZAICodingPlanRequest(cfg, upstreamProtocol, requestPath) {
-		return finalizeZAICodingPlanBody(body, cfg)
+		sourceSessionID := resolveZAISourceSessionID(sourceBody, body, cfg, headers)
+		return finalizeZAICodingPlanBody(
+			body,
+			cfg,
+			zaiUpstreamSessionID(apiKey, sourceSessionID),
+		)
 	}
 	if cfg != nil && cfg.UsesAntigravityOAuth() {
 		return prepareAntigravityRequestBody(
@@ -3454,12 +3464,14 @@ func (s *Server) tryChannelWithKeys(ctx context.Context, cfg *model.Config, reqC
 	}
 
 	triedKeys := make(map[int]bool) // 本次请求内已尝试过的Key
-	if !reqCtx.claudeAffinityProbe && reqCtx.claudeAffinityTriedChannel == cfg.ID {
+	if !reqCtx.claudeAffinityProbe {
 		for _, apiKey := range apiKeys {
-			if apiKey != nil && apiKey.KeyIndex == reqCtx.claudeAffinityTriedKey {
+			if apiKey != nil && reqCtx.claudeAffinityKeyWasTried(cfg, apiKey.APIKey) {
 				triedKeys[apiKey.KeyIndex] = true
-				break
 			}
+		}
+		if len(triedKeys) == actualKeyCount {
+			return nil, errClaudeAffinityTargetAlreadyTried
 		}
 	}
 
@@ -3522,6 +3534,7 @@ func (s *Server) tryChannelWithKeys(ctx context.Context, cfg *model.Config, reqC
 				break
 			}
 		}
+		reqCtx.recordClaudeAffinityProbeKey(cfg, selectedKey)
 
 		// 标记Key为已尝试
 		triedKeys[keyIndex] = true
@@ -3593,6 +3606,7 @@ func (s *Server) tryOAuthChannel(
 	var rejectedAccessToken string
 	var rejectedResult *proxyResult
 	for attempt := 0; attempt < 2; attempt++ {
+		reqCtx.apiKeyID = 0
 		runtimeCfg, accessToken, credentialErr := loadCredential(attempt == 1, rejectedAccessToken)
 		accessToken = strings.TrimSpace(accessToken)
 		if runtimeCfg == nil {
@@ -3617,6 +3631,7 @@ func (s *Server) tryOAuthChannel(
 			}
 			log.Printf("[WARN] %s OAuth refresh failed; checking existing access token: channel_id=%d", provider, cfg.ID)
 		}
+		reqCtx.recordClaudeAffinityProbeKey(runtimeCfg, accessToken)
 
 		immediate, lastFailure, err := s.attemptKeyAcrossURLs(
 			ctx, runtimeCfg, urls, selector, cooldown.NoKeyIndex, accessToken, reqCtx, w,
@@ -3789,6 +3804,12 @@ func (s *Server) tryZAIOAuthChannel(
 	reqCtx *proxyRequestContext,
 	w http.ResponseWriter,
 ) (*proxyResult, error) {
+	if reqCtx != nil && !reqCtx.claudeAffinityProbe && s.zaiCredentials != nil {
+		credential, err := s.zaiCredentials.credential(ctx, cfg, false)
+		if err == nil && reqCtx.claudeAffinityKeyWasTried(cfg, credential.APIKey) {
+			return nil, errClaudeAffinityTargetAlreadyTried
+		}
+	}
 	return s.tryOAuthChannel(ctx, cfg, reqCtx, w, "Z.ai", false, func(forceRefresh bool, _ string) (*model.Config, string, error) {
 		credential, err := s.zaiCredentials.credential(ctx, cfg, forceRefresh)
 		if credential == nil {

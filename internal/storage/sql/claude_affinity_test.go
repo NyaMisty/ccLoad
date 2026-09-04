@@ -44,9 +44,9 @@ func TestClaudeSessionAffinitySurvivesSQLiteReopen(t *testing.T) {
 	const keyHash = "2222222222222222222222222222222222222222222222222222222222222222"
 	if err = firstStore.RememberClaudeSessionAffinity(ctx, &model.ClaudeSessionAffinity{
 		SubjectSessionHash: subjectHash,
+		TargetKind:         model.ClaudeAffinityTargetAPIKey,
 		APIKeyID:           keys[0].ID,
 		ChannelID:          cfg.ID,
-		KeyIndex:           3,
 		APIKeyHash:         keyHash,
 		ExpiresAt:          now.Add(time.Hour),
 		UpdatedAt:          now,
@@ -67,7 +67,8 @@ func TestClaudeSessionAffinitySurvivesSQLiteReopen(t *testing.T) {
 	if err != nil {
 		t.Fatalf("get reopened affinity: %v", err)
 	}
-	if got == nil || got.APIKeyID != keys[0].ID || got.ChannelID != cfg.ID || got.KeyIndex != 3 ||
+	if got == nil || got.TargetKind != model.ClaudeAffinityTargetAPIKey ||
+		got.APIKeyID != keys[0].ID || got.ChannelID != cfg.ID ||
 		got.APIKeyHash != keyHash || !got.ExpiresAt.Equal(now.Add(time.Hour)) {
 		t.Fatalf("reopened affinity=%+v", got)
 	}
@@ -79,7 +80,27 @@ func TestClaudeSessionAffinitySurvivesSQLiteReopen(t *testing.T) {
 	if err != nil {
 		t.Fatalf("get affinity after key delete: %v", err)
 	}
-	if got != nil {
-		t.Fatalf("affinity survived bound key deletion: %+v", got)
+	if got == nil || got.APIKeyHash != keyHash {
+		t.Fatalf("key-authoritative affinity was lost with its locator row: %+v", got)
+	}
+
+	const zaiKeyHash = "3333333333333333333333333333333333333333333333333333333333333333"
+	if err = secondStore.RememberClaudeSessionAffinity(ctx, &model.ClaudeSessionAffinity{
+		SubjectSessionHash: subjectHash,
+		TargetKind:         model.ClaudeAffinityTargetZAICodingPlan,
+		ChannelID:          cfg.ID,
+		APIKeyHash:         zaiKeyHash,
+		ExpiresAt:          now.Add(2 * time.Hour),
+		UpdatedAt:          now,
+	}, now); err != nil {
+		t.Fatalf("remember ZCode affinity: %v", err)
+	}
+	got, err = secondStore.GetClaudeSessionAffinity(ctx, subjectHash, now.Add(time.Minute))
+	if err != nil {
+		t.Fatalf("get ZCode affinity: %v", err)
+	}
+	if got == nil || got.TargetKind != model.ClaudeAffinityTargetZAICodingPlan ||
+		got.APIKeyID != 0 || got.ChannelID != cfg.ID || got.APIKeyHash != zaiKeyHash {
+		t.Fatalf("ZCode affinity=%+v", got)
 	}
 }

@@ -567,7 +567,7 @@ curl -X POST http://localhost:8080/v1/messages \
   }'
 ```
 
-Claude Code 直通 Anthropic Messages 时，ccLoad 会对合法 UUID 会话建立持久化软亲和：优先读取入站 `X-Claude-Code-Session-Id`，缺失或非法时回退入站 `metadata.user_id.session_id`，并在同一入站 API 令牌范围内优先使用最近一次成功的上游 API Key。表中的 API Key 行 ID 标识亲和目标，渠道 ID 和 Key 下标只负责路由定位，命中前仍会校验 Key 哈希，不绑定 URL。亲和只探测仍有权限且未禁用、未冷却的 Key；Key 不可用或失败时会回到完全未改动的普通渠道顺序。首个成功的 fallback Key 会立即成为新的亲和目标，旧 Key 恢复后不会把 session 拉回去。绑定从最后一次成功命中起保留 1 小时，写入 `claude_session_affinities`，且不保存明文令牌、session 或 Key。发往 API Key 上游时，Header 与 Body 中的 Session ID 由“实际选中的上游 Key + 入站 Session ID”稳定派生：同一组合保持不变，换 Key 就换上游 Session，切回原 Key 则恢复原值；亲和查找仍使用未派生的入站 Session。OAuth 渠道没有 API Key，因此不参与派生或亲和。`device_id` 不参与会话识别，仍由每次实际选中的上游 Key 稳定派生。
+Claude Code 直通 Anthropic Messages 时，ccLoad 会对合法 UUID 会话建立持久化软亲和：优先读取入站 `X-Claude-Code-Session-Id`，缺失或非法时回退入站 `metadata.user_id.session_id`，并在同一入站 API 令牌范围内优先使用最近一次成功的实际上游 Key。目标类型与 Key 哈希共同标识亲和目标，API Key 行 ID 和渠道 ID 只作查找提示，不绑定 URL。亲和只探测仍有权限且未禁用、未冷却的 Key；Key 不可用或失败时会回到完全未改动的普通渠道顺序。首个成功的 fallback Key 会立即成为新的亲和目标，旧 Key 恢复后不会把 session 拉回去。绑定从最后一次成功命中起保留 1 小时，写入 `claude_session_affinities`，且不保存明文令牌、session 或 Key。普通 API Key 上游的 Header 与 Body Session ID 由“实际选中的 Key + 入站 Session ID”稳定派生。Z.ai Coding Plan 是 OAuth 特例：实际 `id.secret` Key 参与同一套亲和，wire Session 使用独立的 ZCode 派生域并同时写入 `metadata.user_id.session_id` 与 `x-session-id`；401 重解析成功后立即改绑新 Coding Plan Key。每次重试都从原始入站 Session 派生，绝不使用前一次 attempt 的派生结果。其他 OAuth 渠道不参与亲和。
 
 **OpenAI 兼容 API 代理（Chat Completions）**：
 
@@ -1235,7 +1235,7 @@ storage/
 - `channels` - 渠道配置（渠道级冷却内联，UNIQUE 约束 name，含上游协议、定时检测配置、RPM/并发限制配置）
 - `api_keys` - API 密钥（Key 级冷却内联，支持多 Key 策略）
 - `channel_model_cooldowns` - 模型级运行时冷却，主键为渠道和实际上游模型
-- `claude_session_affinities` - 按上游 API Key 持久化的 Claude 直通软亲和
+- `claude_session_affinities` - 按普通 API Key 或 Z.ai Coding Plan Key 持久化的 Claude 直通软亲和
 - `logs` - 请求日志（含base_url上游URL追踪）
 - `log_inbound_requests` - 与 `logs` 关联的原始入站请求快照
 - `log_upstream_requests` - 实际发往上游的请求快照，包含网关内部重试

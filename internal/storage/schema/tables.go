@@ -54,19 +54,21 @@ func DefineAPIKeysTable() *TableBuilder {
 		Index("idx_api_keys_channel_cooldown", "channel_id, cooldown_until")
 }
 
-// DefineClaudeSessionAffinitiesTable defines persistent, API-key-scoped soft
-// affinity for native Claude sessions. api_key_id owns the binding and
-// api_key_hash guards in-place key rotation.
+// DefineClaudeSessionAffinitiesTable defines persistent, key-scoped soft
+// affinity for native Claude sessions. Locator columns are intentionally not
+// foreign keys: target_kind plus api_key_hash own the binding, so moving the
+// same key between channels does not change its identity.
 func DefineClaudeSessionAffinitiesTable() *TableBuilder {
 	return NewTable("claude_session_affinities").
 		Column("subject_session_hash CHAR(64) PRIMARY KEY").
-		Column("api_key_id INT NOT NULL").
+		Column("target_kind VARCHAR(32) NOT NULL").
+		Column("api_key_id INT NULL").
+		Column("channel_id INT NOT NULL").
 		Column("api_key_hash CHAR(64) NOT NULL").
 		Column("expires_at BIGINT NOT NULL").
 		Column("updated_at BIGINT NOT NULL").
-		Column("FOREIGN KEY (api_key_id) REFERENCES api_keys(id) ON DELETE CASCADE").
 		Index("idx_claude_session_affinities_expires", "expires_at").
-		Index("idx_claude_session_affinities_key", "api_key_id")
+		Index("idx_claude_session_affinities_target", "target_kind, api_key_hash")
 }
 
 // DefineChannelModelsTable 定义channel_models表结构

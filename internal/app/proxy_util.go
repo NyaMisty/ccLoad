@@ -178,11 +178,10 @@ type proxyRequestContext struct {
 	inboundRequest             *model.RequestLogEntry
 	upstreamRequests           []*model.RequestLogEntry
 	thinkingEffort             string
-	routingSession             *responsesExecutionSession // 当前 Responses execution session 的首选渠道
-	claudeAffinity             *claudeSessionAffinity     // 当前 Claude session 的直通软亲和
-	claudeAffinityProbe        bool                       // 当前只尝试亲和 Key，不允许扩展为同渠道其他 Key
-	claudeAffinityTriedChannel int64                      // 亲和探测已尝试的渠道定位
-	claudeAffinityTriedKey     int                        // 普通回退时避免在同一请求内重复探测 Key
+	routingSession             *responsesExecutionSession            // 当前 Responses execution session 的首选渠道
+	claudeAffinity             *claudeSessionAffinity                // 当前 Claude session 的直通软亲和
+	claudeAffinityProbe        bool                                  // 当前只尝试亲和 Key，不允许扩展为同渠道其他 Key
+	claudeAffinityTriedKeys    map[claudeAffinityAttemptKey]struct{} // 普通回退时避免重复探测实际 Key
 	nativeCodexWS              *codexUpstreamWebsocketSession
 	nativeCodexBody            []byte
 	quotaOverdraftTranscript   []byte

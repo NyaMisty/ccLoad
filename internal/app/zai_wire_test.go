@@ -9,6 +9,8 @@ import (
 	"ccLoad/internal/model"
 	"ccLoad/internal/protocol"
 	"ccLoad/internal/zaiauth"
+
+	"github.com/google/uuid"
 )
 
 func newZAITestChannel() *model.Config {
@@ -38,7 +40,9 @@ func TestFinalizeZAICodingPlanBodyStampsZCodeFingerprint(t *testing.T) {
 	t.Parallel()
 	cfg := newZAITestChannel()
 	body := []byte(`{"model":"glm-4.7","messages":[{"role":"user","content":"hello"}]}`)
-	finalized, err := finalizeZAICodingPlanBody(body, cfg)
+	sourceSessionID := resolveZAISourceSessionID(nil, body, cfg, nil)
+	sessionID := zaiUpstreamSessionID("key-id.secret", sourceSessionID)
+	finalized, err := finalizeZAICodingPlanBody(body, cfg, sessionID)
 	if err != nil {
 		t.Fatalf("finalizeZAICodingPlanBody() error = %v", err)
 	}
@@ -49,11 +53,11 @@ func TestFinalizeZAICodingPlanBodyStampsZCodeFingerprint(t *testing.T) {
 	if identity.AccountUUID != "" {
 		t.Fatalf("account uuid = %q, ZCode always sends an empty value", identity.AccountUUID)
 	}
-	if identity.SessionID == "" {
-		t.Fatal("session id must be present")
+	if identity.SessionID != sessionID {
+		t.Fatalf("session id = %q, want %q", identity.SessionID, sessionID)
 	}
 	// The same conversation must keep one session identifier.
-	repeat, err := finalizeZAICodingPlanBody(body, cfg)
+	repeat, err := finalizeZAICodingPlanBody(body, cfg, sessionID)
 	if err != nil {
 		t.Fatalf("finalizeZAICodingPlanBody() error = %v", err)
 	}
@@ -66,8 +70,10 @@ func TestFinalizeZAICodingPlanBodyStampsZCodeFingerprint(t *testing.T) {
 func TestFinalizeZAICodingPlanBodyReplacesForeignFingerprint(t *testing.T) {
 	t.Parallel()
 	cfg := newZAITestChannel()
+	const sourceSessionID = "3f2504e0-4f89-41d3-9a0c-0305e82c3301"
 	body := []byte(`{"model":"glm-4.7","metadata":{"user_id":"{\"device_id\":\"other-device\",\"session_id\":\"3f2504e0-4f89-41d3-9a0c-0305e82c3301\"}","keep":"me"},"messages":[]}`)
-	finalized, err := finalizeZAICodingPlanBody(body, cfg)
+	sessionID := zaiUpstreamSessionID("key-id.secret", sourceSessionID)
+	finalized, err := finalizeZAICodingPlanBody(body, cfg, sessionID)
 	if err != nil {
 		t.Fatalf("finalizeZAICodingPlanBody() error = %v", err)
 	}
@@ -75,9 +81,8 @@ func TestFinalizeZAICodingPlanBodyReplacesForeignFingerprint(t *testing.T) {
 	if identity.DeviceID != cfg.ZAIDeviceID {
 		t.Fatalf("device id = %q", identity.DeviceID)
 	}
-	// The caller's own session identifier is preserved: only the device changes.
-	if identity.SessionID != "3f2504e0-4f89-41d3-9a0c-0305e82c3301" {
-		t.Fatalf("session id = %q", identity.SessionID)
+	if identity.SessionID != sessionID || identity.SessionID == sourceSessionID {
+		t.Fatalf("session id = %q, want key-scoped %q", identity.SessionID, sessionID)
 	}
 	var request map[string]any
 	if err := json.Unmarshal(finalized, &request); err != nil {
@@ -91,8 +96,27 @@ func TestFinalizeZAICodingPlanBodyReplacesForeignFingerprint(t *testing.T) {
 
 func TestFinalizeZAICodingPlanBodyRejectsInvalidJSON(t *testing.T) {
 	t.Parallel()
-	if _, err := finalizeZAICodingPlanBody([]byte("not json"), newZAITestChannel()); err == nil {
+	if _, err := finalizeZAICodingPlanBody([]byte("not json"), newZAITestChannel(), uuid.NewString()); err == nil {
 		t.Fatal("finalizeZAICodingPlanBody() expected an error")
+	}
+}
+
+func TestZAIUpstreamSessionIDIsStableAndScopedToCodingPlanKey(t *testing.T) {
+	t.Parallel()
+
+	const sourceSessionID = "3f2504e0-4f89-41d3-9a0c-0305e82c3301"
+	first := zaiUpstreamSessionID(" key-88.secret ", sourceSessionID)
+	repeat := zaiUpstreamSessionID("key-88.secret", sourceSessionID)
+	second := zaiUpstreamSessionID("key-89.secret", sourceSessionID)
+	want := uuid.NewSHA1(
+		uuid.NameSpaceOID,
+		[]byte("ccload:zai:session\x00key-88.secret\x00"+sourceSessionID),
+	).String()
+	if first != want || repeat != first {
+		t.Fatalf("stable session = %q/%q, want %q", first, repeat, want)
+	}
+	if second == first {
+		t.Fatalf("different Coding Plan keys shared session %q", first)
 	}
 }
 
@@ -108,8 +132,20 @@ func TestInjectZAICodingPlanHeadersReplicatesZCodeIdentity(t *testing.T) {
 	request.Header.Set("X-Api-Key", "downstream-key")
 	request.Header.Set("X-Stainless-Lang", "js")
 	incoming := http.Header{"Accept": []string{"text/event-stream"}}
+	sessionID := zaiUpstreamSessionID(
+		"key-id.secret",
+		"3f2504e0-4f89-41d3-9a0c-0305e82c3301",
+	)
+	body, err := finalizeZAICodingPlanBody(
+		[]byte(`{"messages":[]}`),
+		cfg,
+		sessionID,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
 
-	injectZAICodingPlanHeaders(request, cfg, "key-id.secret", []byte(`{"messages":[]}`), incoming)
+	injectZAICodingPlanHeaders(request, cfg, "key-id.secret", body, incoming)
 
 	if anthropicHeaderValue(request.Header, "Authorization") != "" {
 		t.Fatal("ZCode authenticates with x-api-key only")
@@ -133,7 +169,7 @@ func TestInjectZAICodingPlanHeadersReplicatesZCodeIdentity(t *testing.T) {
 	}
 	if anthropicHeaderValue(request.Header, "x-request-id") == "" ||
 		anthropicHeaderValue(request.Header, "x-zcode-trace-id") == "" ||
-		anthropicHeaderValue(request.Header, "x-session-id") == "" {
+		anthropicHeaderValue(request.Header, "x-session-id") != sessionID {
 		t.Fatalf("attribution headers missing: %v", request.Header)
 	}
 	// Header names must reach the wire in ZCode's own casing.
@@ -161,6 +197,29 @@ func TestInjectZAICodingPlanHeadersKeepsClientAnthropicVersion(t *testing.T) {
 	injectZAICodingPlanHeaders(request, newZAITestChannel(), "key-id.secret", []byte(`{}`), incoming)
 	if got := anthropicHeaderValue(request.Header, "anthropic-version"); got != "2024-01-01" {
 		t.Fatalf("anthropic-version = %q", got)
+	}
+}
+
+func TestEnforceZAISessionHeaderKeepsBodyAndHeaderEqual(t *testing.T) {
+	t.Parallel()
+
+	const sessionID = "3f2504e0-4f89-41d3-9a0c-0305e82c3301"
+	body, err := finalizeZAICodingPlanBody(
+		[]byte(`{"messages":[]}`),
+		newZAITestChannel(),
+		sessionID,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request, err := http.NewRequest(http.MethodPost, "https://example.com/v1/messages", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("X-Session-ID", "overridden")
+	enforceZAISessionHeader(request, body)
+	if got := anthropicHeaderValue(request.Header, "x-session-id"); got != sessionID {
+		t.Fatalf("x-session-id = %q, want body session %q", got, sessionID)
 	}
 }
 

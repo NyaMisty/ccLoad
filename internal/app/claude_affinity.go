@@ -24,12 +24,14 @@ var claudeAffinityWriteFailureCount atomic.Uint64
 var claudeAffinityCleanupFailureCount atomic.Uint64
 var claudeAffinityProbeFailureCount atomic.Uint64
 
-// claudeAffinityTarget identifies one API key row. ChannelID and KeyIndex are
-// runtime locators; APIKeyHash must also match before the key is preferred.
+var errClaudeAffinityTargetAlreadyTried = errors.New("claude session affinity target already tried")
+
+// claudeAffinityTarget identifies one upstream key. Row and channel IDs are
+// lookup hints; targetKind plus apiKeyHash are authoritative.
 type claudeAffinityTarget struct {
+	targetKind string
 	apiKeyID   int64
 	channelID  int64
-	keyIndex   int
 	apiKeyHash string
 	expiresAt  time.Time
 }
@@ -40,16 +42,39 @@ func newClaudeAffinityTarget(
 	keyIndex int,
 	apiKey string,
 ) (claudeAffinityTarget, bool) {
-	if cfg == nil || cfg.UsesOAuth() || apiKeyID <= 0 ||
-		keyIndex < 0 || strings.TrimSpace(apiKey) == "" {
+	apiKey = strings.TrimSpace(apiKey)
+	if cfg == nil || cfg.ID <= 0 || apiKey == "" {
 		return claudeAffinityTarget{}, false
 	}
-	return claudeAffinityTarget{
-		apiKeyID:   apiKeyID,
+	target := claudeAffinityTarget{
+		targetKind: claudeAffinityTargetKind(cfg),
 		channelID:  cfg.ID,
-		keyIndex:   keyIndex,
 		apiKeyHash: claudeAffinityAPIKeyHash(apiKey),
-	}, true
+	}
+	switch target.targetKind {
+	case model.ClaudeAffinityTargetZAICodingPlan:
+	case model.ClaudeAffinityTargetAPIKey:
+		if apiKeyID <= 0 || keyIndex < 0 {
+			return claudeAffinityTarget{}, false
+		}
+		target.apiKeyID = apiKeyID
+	default:
+		return claudeAffinityTarget{}, false
+	}
+	return target, true
+}
+
+func claudeAffinityTargetKind(cfg *model.Config) string {
+	switch {
+	case cfg == nil:
+		return ""
+	case cfg.UsesZAIOAuth():
+		return model.ClaudeAffinityTargetZAICodingPlan
+	case !cfg.UsesOAuth():
+		return model.ClaudeAffinityTargetAPIKey
+	default:
+		return ""
+	}
 }
 
 type claudeSessionAffinity struct {
@@ -132,9 +157,9 @@ func (affinity *claudeSessionAffinity) load(ctx context.Context) error {
 		return nil
 	}
 	affinity.target = claudeAffinityTarget{
+		targetKind: entry.TargetKind,
 		apiKeyID:   entry.APIKeyID,
 		channelID:  entry.ChannelID,
-		keyIndex:   entry.KeyIndex,
 		apiKeyHash: entry.APIKeyHash,
 		expiresAt:  entry.ExpiresAt,
 	}
@@ -157,17 +182,17 @@ func (affinity *claudeSessionAffinity) remember(
 	target claudeAffinityTarget,
 ) error {
 	if affinity == nil || affinity.store == nil ||
-		target.apiKeyID <= 0 || target.channelID <= 0 ||
-		target.keyIndex < 0 || target.apiKeyHash == "" {
+		!validClaudeAffinityTarget(target) ||
+		target.channelID <= 0 || target.apiKeyHash == "" {
 		return nil
 	}
 	now := affinity.now()
 	target.expiresAt = now.Add(claudeSessionAffinityTTL)
 	entry := &model.ClaudeSessionAffinity{
 		SubjectSessionHash: affinity.subjectSessionHash,
+		TargetKind:         target.targetKind,
 		APIKeyID:           target.apiKeyID,
 		ChannelID:          target.channelID,
-		KeyIndex:           target.keyIndex,
 		APIKeyHash:         target.apiKeyHash,
 		ExpiresAt:          target.expiresAt,
 		UpdatedAt:          now,
@@ -181,6 +206,17 @@ func (affinity *claudeSessionAffinity) remember(
 	return nil
 }
 
+func validClaudeAffinityTarget(target claudeAffinityTarget) bool {
+	switch target.targetKind {
+	case model.ClaudeAffinityTargetAPIKey:
+		return target.apiKeyID > 0
+	case model.ClaudeAffinityTargetZAICodingPlan:
+		return target.apiKeyID == 0
+	default:
+		return false
+	}
+}
+
 func selectClaudeAffinityKey(
 	cfg *model.Config,
 	apiKeys []*model.APIKey,
@@ -188,7 +224,9 @@ func selectClaudeAffinityKey(
 	affinity *claudeSessionAffinity,
 ) (int, string, bool) {
 	target, ok := affinity.targetSnapshot()
-	if !ok || cfg == nil || target.channelID != cfg.ID || target.apiKeyHash == "" {
+	if !ok || cfg == nil ||
+		target.targetKind != model.ClaudeAffinityTargetAPIKey ||
+		target.apiKeyHash == "" {
 		return 0, "", false
 	}
 	now := affinity.now()
@@ -196,12 +234,112 @@ func selectClaudeAffinityKey(
 		if apiKey == nil || apiKey.Disabled || apiKey.IsCoolingDown(now) || triedKeys[apiKey.KeyIndex] {
 			continue
 		}
-		if apiKey.ID == target.apiKeyID &&
-			claudeAffinityAPIKeyHash(apiKey.APIKey) == target.apiKeyHash {
+		if claudeAffinityAPIKeyHash(apiKey.APIKey) == target.apiKeyHash {
 			return apiKey.KeyIndex, apiKey.APIKey, true
 		}
 	}
 	return 0, "", false
+}
+
+type claudeAffinityAttemptKey struct {
+	targetKind string
+	apiKeyHash string
+}
+
+func (reqCtx *proxyRequestContext) recordClaudeAffinityProbeKey(cfg *model.Config, apiKey string) {
+	if reqCtx == nil || !reqCtx.claudeAffinityProbe {
+		return
+	}
+	targetKind := claudeAffinityTargetKind(cfg)
+	apiKey = strings.TrimSpace(apiKey)
+	if targetKind == "" || apiKey == "" {
+		return
+	}
+	if reqCtx.claudeAffinityTriedKeys == nil {
+		reqCtx.claudeAffinityTriedKeys = make(map[claudeAffinityAttemptKey]struct{}, 1)
+	}
+	reqCtx.claudeAffinityTriedKeys[claudeAffinityAttemptKey{
+		targetKind: targetKind,
+		apiKeyHash: claudeAffinityAPIKeyHash(apiKey),
+	}] = struct{}{}
+}
+
+func (reqCtx *proxyRequestContext) claudeAffinityKeyWasTried(cfg *model.Config, apiKey string) bool {
+	if reqCtx == nil || len(reqCtx.claudeAffinityTriedKeys) == 0 {
+		return false
+	}
+	targetKind := claudeAffinityTargetKind(cfg)
+	apiKey = strings.TrimSpace(apiKey)
+	if targetKind == "" || apiKey == "" {
+		return false
+	}
+	_, tried := reqCtx.claudeAffinityTriedKeys[claudeAffinityAttemptKey{
+		targetKind: targetKind,
+		apiKeyHash: claudeAffinityAPIKeyHash(apiKey),
+	}]
+	return tried
+}
+
+func (s *Server) claudeAffinityTargetMatches(
+	ctx context.Context,
+	cfg *model.Config,
+	affinity *claudeSessionAffinity,
+	target claudeAffinityTarget,
+) (bool, error) {
+	if cfg == nil {
+		return false, nil
+	}
+	switch target.targetKind {
+	case model.ClaudeAffinityTargetAPIKey:
+		if cfg.UsesOAuth() {
+			return false, nil
+		}
+		apiKeys, err := s.getAPIKeys(ctx, cfg.ID)
+		if err != nil {
+			return false, err
+		}
+		_, _, available := selectClaudeAffinityKey(cfg, apiKeys, nil, affinity)
+		return available, nil
+	case model.ClaudeAffinityTargetZAICodingPlan:
+		if !cfg.UsesZAIOAuth() || s.zaiCredentials == nil {
+			return false, nil
+		}
+		credential, err := s.zaiCredentials.credential(ctx, cfg, false)
+		if err != nil {
+			return false, err
+		}
+		return claudeAffinityAPIKeyHash(credential.APIKey) == target.apiKeyHash, nil
+	default:
+		return false, nil
+	}
+}
+
+func (s *Server) findClaudeAffinityTargetChannel(
+	ctx context.Context,
+	candidates []*model.Config,
+	affinity *claudeSessionAffinity,
+	target claudeAffinityTarget,
+) *model.Config {
+	for pass := 0; pass < 2; pass++ {
+		for _, candidate := range candidates {
+			isHint := candidate != nil && candidate.ID == target.channelID
+			if pass == 0 && !isHint || pass == 1 && isHint {
+				continue
+			}
+			matches, err := s.claudeAffinityTargetMatches(ctx, candidate, affinity, target)
+			if err != nil {
+				count := claudeAffinityProbeFailureCount.Add(1)
+				if count%100 == 1 {
+					log.Printf("[WARN] 检查 Claude session 亲和 Key 失败 (累计: %d): %v", count, err)
+				}
+				continue
+			}
+			if matches {
+				return candidate
+			}
+		}
+	}
+	return nil
 }
 
 // tryClaudeAffinityKey makes one key-scoped attempt before ordinary channel
@@ -221,37 +359,16 @@ func (s *Server) tryClaudeAffinityKey(
 		return nil, false
 	}
 
-	var targetChannel *model.Config
-	for _, candidate := range candidates {
-		if candidate != nil && candidate.ID == target.channelID {
-			targetChannel = candidate
-			break
-		}
-	}
-	if targetChannel == nil || targetChannel.UsesOAuth() {
-		return nil, false
-	}
-
-	apiKeys, err := s.getAPIKeys(ctx, targetChannel.ID)
-	if err != nil {
-		count := claudeAffinityProbeFailureCount.Add(1)
-		if count%100 == 1 {
-			log.Printf("[WARN] 检查 Claude session 亲和 Key 失败 (累计: %d): %v", count, err)
-		}
-		return nil, false
-	}
-	keyIndex, _, available := selectClaudeAffinityKey(
-		targetChannel,
-		apiKeys,
-		nil,
+	targetChannel := s.findClaudeAffinityTargetChannel(
+		ctx,
+		candidates,
 		reqCtx.claudeAffinity,
+		target,
 	)
-	if !available {
+	if targetChannel == nil {
 		return nil, false
 	}
 
-	reqCtx.claudeAffinityTriedChannel = targetChannel.ID
-	reqCtx.claudeAffinityTriedKey = keyIndex
 	reqCtx.claudeAffinityProbe = true
 	result, err := s.tryChannelWithKeys(ctx, targetChannel, reqCtx, w)
 	reqCtx.claudeAffinityProbe = false
