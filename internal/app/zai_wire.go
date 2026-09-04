@@ -21,10 +21,22 @@ import (
 // ccLoad replicates all three so Coding Plan traffic proxied here is the same
 // traffic ZCode itself would have sent.
 
-// isZAICodingPlanRequest reports whether this attempt is a Coding Plan
-// Anthropic Messages call owned by a Z.ai channel.
+func isZAICodingPlanBaseURL(raw string) bool {
+	return strings.EqualFold(strings.TrimRight(strings.TrimSpace(raw), "/"), zaiauth.CodingPlanProxyBaseURL)
+}
+
+// isZAICodingPlanRequest reports whether this attempt uses the ZCode Coding
+// Plan wire contract. API-key channels opt in by using the dedicated endpoint.
 func isZAICodingPlanRequest(cfg *model.Config, upstream protocol.Protocol, requestPath string) bool {
-	return cfg != nil && cfg.UsesZAIOAuth() && isAnthropicMessagesRequest(upstream, requestPath)
+	if cfg == nil || !isAnthropicMessagesRequest(upstream, requestPath) {
+		return false
+	}
+	if cfg.UsesZAIOAuth() {
+		return true
+	}
+	return cfg.GetAuthType() == model.AuthTypeAPIKey &&
+		len(cfg.URLs) == 1 && !cfg.URLs[0].Exact &&
+		isZAICodingPlanBaseURL(cfg.URLs[0].URL)
 }
 
 // zaiRequestIdentity is ZCode's metadata.user_id payload. Field order matches

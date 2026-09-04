@@ -19,6 +19,7 @@ import (
 	"ccLoad/internal/protocol"
 	"ccLoad/internal/protocol/builtin"
 	"ccLoad/internal/util"
+	"ccLoad/internal/zaiauth"
 
 	"github.com/andybalholm/brotli"
 	"github.com/google/uuid"
@@ -2044,6 +2045,10 @@ func TestZAICodingPlanSkipsClaudeCodeFingerprint(t *testing.T) {
 		want bool
 	}{
 		{name: "API key channel", cfg: &model.Config{Name: "anthropic"}, want: true},
+		{name: "API key ZCode channel", cfg: &model.Config{
+			AuthType: model.AuthTypeAPIKey,
+			URLs:     model.ChannelURLs{{URL: zaiauth.CodingPlanProxyBaseURL}},
+		}},
 		{name: "Anthropic OAuth channel", cfg: &model.Config{AuthType: model.AuthTypeAnthropicOAuth}, want: true},
 		{name: "Z.ai Coding Plan channel", cfg: &model.Config{AuthType: model.AuthTypeZAIOAuth}},
 	}

@@ -23,6 +23,7 @@ import (
 	"ccLoad/internal/model"
 	"ccLoad/internal/protocol"
 	"ccLoad/internal/util"
+	"ccLoad/internal/zaiauth"
 
 	"github.com/bytedance/sonic"
 	"github.com/tidwall/gjson"
@@ -345,10 +346,15 @@ func (s *Server) prepareTranslatedUpstreamBody(
 	// Z.ai Coding Plan 的 ZCode 设备指纹走 body 的 metadata.user_id。必须留在这个
 	// 共享入口里：挂在代理链路的独立分支上，管理测试就会发出没有指纹的请求。
 	if isZAICodingPlanRequest(cfg, upstreamProtocol, requestPath) {
-		sourceSessionID := resolveZAISourceSessionID(sourceBody, body, cfg, headers)
+		zaiCfg := cfg
+		if cfg.GetAuthType() == model.AuthTypeAPIKey {
+			zaiCfg = cfg.Clone()
+			zaiCfg.ZAIDeviceID = zaiauth.DeriveDeviceID(zaiauth.Identity{}, apiKey)
+		}
+		sourceSessionID := resolveZAISourceSessionID(sourceBody, body, zaiCfg, headers)
 		return finalizeZAICodingPlanBody(
 			body,
-			cfg,
+			zaiCfg,
 			zaiUpstreamSessionID(apiKey, sourceSessionID),
 		)
 	}

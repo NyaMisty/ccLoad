@@ -41,8 +41,8 @@ func TestNewZAIOAuthChannelUsesZCodeRoutedEndpoint(t *testing.T) {
 	}
 }
 
-// The routed Coding Plan endpoint carries /v1 in its path, which ordinary
-// channels reject. Saving a Z.ai channel from the editor must stay possible.
+// The routed Coding Plan endpoint carries /v1 in its path. Both managed Z.ai
+// channels and ordinary API-key channels using that exact endpoint may save it.
 func TestValidateChannelBaseURLAllowsZAIRoutedEndpoint(t *testing.T) {
 	t.Parallel()
 	normalized, err := validateChannelBaseURL(zaiauth.CodingPlanProxyBaseURL, model.AuthTypeZAIOAuth)
@@ -52,8 +52,12 @@ func TestValidateChannelBaseURLAllowsZAIRoutedEndpoint(t *testing.T) {
 	if normalized != zaiauth.CodingPlanProxyBaseURL {
 		t.Fatalf("normalized = %q", normalized)
 	}
-	if _, err := validateChannelBaseURL(zaiauth.CodingPlanProxyBaseURL, model.AuthTypeAPIKey); err == nil {
-		t.Fatal("API key channels must keep rejecting endpoint paths")
+	normalized, err = validateChannelBaseURL(zaiauth.CodingPlanProxyBaseURL, model.AuthTypeAPIKey)
+	if err != nil || normalized != zaiauth.CodingPlanProxyBaseURL {
+		t.Fatalf("API key ZCode endpoint = %q, err=%v", normalized, err)
+	}
+	if _, err = validateChannelBaseURL("https://api.example.com/v1", model.AuthTypeAPIKey); err == nil {
+		t.Fatal("ordinary API key endpoint paths must remain rejected")
 	}
 }
 

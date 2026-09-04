@@ -31,8 +31,50 @@ func TestZAICodingPlanRequestDetection(t *testing.T) {
 	if isZAICodingPlanRequest(cfg, protocol.Codex, "/v1/responses") {
 		t.Fatal("non-Anthropic upstreams must not use the Coding Plan contract")
 	}
-	if isZAICodingPlanRequest(&model.Config{AuthType: model.AuthTypeAPIKey}, protocol.Anthropic, "/v1/messages") {
-		t.Fatal("API key channels must not use the Coding Plan contract")
+	apiKeyCfg := &model.Config{
+		AuthType: model.AuthTypeAPIKey,
+		URLs:     model.ChannelURLs{{URL: zaiauth.CodingPlanProxyBaseURL, Protocols: []string{"anthropic"}}},
+	}
+	if !isZAICodingPlanRequest(apiKeyCfg, protocol.Anthropic, "/v1/messages") {
+		t.Fatal("API key channels using the ZCode endpoint must use the Coding Plan contract")
+	}
+	apiKeyCfg.URLs[0].URL = "https://api.anthropic.com"
+	if isZAICodingPlanRequest(apiKeyCfg, protocol.Anthropic, "/v1/messages") {
+		t.Fatal("ordinary Anthropic API key channels must not use the Coding Plan contract")
+	}
+}
+
+func TestPrepareZAICodingPlanBodyDerivesAPIKeyDeviceID(t *testing.T) {
+	t.Parallel()
+
+	const (
+		apiKey          = "key-id.secret"
+		sourceSessionID = "3f2504e0-4f89-41d3-9a0c-0305e82c3301"
+	)
+	cfg := &model.Config{
+		AuthType: model.AuthTypeAPIKey,
+		URLs:     model.ChannelURLs{{URL: zaiauth.CodingPlanProxyBaseURL, Protocols: []string{"anthropic"}}},
+	}
+	body := []byte(`{"model":"glm-4.7","messages":[{"role":"user","content":"hello"}]}`)
+	finalized, err := (&Server{}).prepareTranslatedUpstreamBody(
+		cfg,
+		protocol.Anthropic,
+		"/v1/messages",
+		body,
+		body,
+		apiKey,
+		http.Header{"X-Claude-Code-Session-Id": {sourceSessionID}},
+		false,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	identity := decodeZAIRequestIdentity(t, finalized)
+	if want := zaiauth.DeriveDeviceID(zaiauth.Identity{}, apiKey); identity.DeviceID != want {
+		t.Fatalf("device id = %q, want %q", identity.DeviceID, want)
+	}
+	if want := zaiUpstreamSessionID(apiKey, sourceSessionID); identity.SessionID != want {
+		t.Fatalf("session id = %q, want %q", identity.SessionID, want)
 	}
 }
 

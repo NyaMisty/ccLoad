@@ -114,7 +114,9 @@ func validateChannelBaseURL(raw, authType string) (string, error) {
 		strings.HasSuffix(strings.TrimRight(u.Path, "/"), "/v1")
 	// Z.ai Coding Plan is a second exception: ZCode publishes the routed
 	// endpoint (…/api/v1/ultra-zai/anthropic) and runtime appends /v1/messages.
-	isZAIRoutedBasePath := model.NormalizeAuthType(authType) == model.AuthTypeZAIOAuth
+	normalizedAuthType := model.NormalizeAuthType(authType)
+	isZAIRoutedBasePath := normalizedAuthType == model.AuthTypeZAIOAuth ||
+		(normalizedAuthType == model.AuthTypeAPIKey && isZAICodingPlanBaseURL(parseRaw))
 	if !exactURL && !isXAIVersionedBasePath && !isZAIRoutedBasePath && strings.Contains(u.Path, "/v1") {
 		return "", fmt.Errorf("url should not contain API endpoint path like /v1 (current path: %q)", u.Path)
 	}
