@@ -17,7 +17,12 @@ import (
 	"github.com/google/uuid"
 )
 
-const claudeSessionAffinityTTL = time.Hour
+const (
+	claudeSessionAffinityTTL      = time.Hour
+	claudeAffinityConcurrencyWait = 5 * time.Second
+)
+
+type claudeAffinityConcurrencyWaitContextKey struct{}
 
 var claudeAffinityLoadFailureCount atomic.Uint64
 var claudeAffinityWriteFailureCount atomic.Uint64
@@ -370,7 +375,12 @@ func (s *Server) tryClaudeAffinityKey(
 	}
 
 	reqCtx.claudeAffinityProbe = true
-	result, err := s.tryChannelWithKeys(ctx, targetChannel, reqCtx, w)
+	affinityCtx := context.WithValue(
+		ctx,
+		claudeAffinityConcurrencyWaitContextKey{},
+		claudeAffinityConcurrencyWait,
+	)
+	result, err := s.tryChannelWithKeys(affinityCtx, targetChannel, reqCtx, w)
 	reqCtx.claudeAffinityProbe = false
 	if err != nil {
 		if !errors.Is(err, ErrAllKeysUnavailable) &&

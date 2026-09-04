@@ -7,6 +7,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"ccLoad/internal/model"
 )
@@ -200,6 +201,35 @@ func TestProxy_NativeAnthropicSoftAffinityAcrossKeysAndChannels(t *testing.T) {
 	attemptLog.reset()
 	send(sessionB)
 	assertAttempts(claudeAffinityAttempt{channel: "primary", apiKey: otherKey})
+
+	// A busy affinity Key gets a short chance to free its slot before normal
+	// routing is allowed to select another Key.
+	primaryCfg.MaxConcurrency = 1
+	if _, err := env.store.UpdateConfig(context.Background(), primaryCfg.ID, primaryCfg); err != nil {
+		t.Fatalf("set primary Key concurrency: %v", err)
+	}
+	env.server.InvalidateChannelListCache()
+	heldRelease, _, _, ok := env.server.channelConcurrencyLimiter.acquire(
+		primaryCfg.ID, preferredKey, primaryCfg.MaxConcurrency,
+	)
+	if !ok {
+		t.Fatal("pre-acquire affinity Key failed")
+	}
+	defer heldRelease()
+	timer := time.AfterFunc(50*time.Millisecond, heldRelease)
+	defer timer.Stop()
+
+	attemptLog.reset()
+	send(sessionA)
+	assertAttempts(claudeAffinityAttempt{channel: "primary", apiKey: preferredKey})
+	timer.Stop()
+	heldRelease()
+
+	primaryCfg.MaxConcurrency = 0
+	if _, err := env.store.UpdateConfig(context.Background(), primaryCfg.ID, primaryCfg); err != nil {
+		t.Fatalf("restore primary Key concurrency: %v", err)
+	}
+	env.server.InvalidateChannelListCache()
 
 	// Disabling the bound Key makes normal routing select the other Key. Once
 	// that Key succeeds, re-enabling the old Key must not pull the session back.

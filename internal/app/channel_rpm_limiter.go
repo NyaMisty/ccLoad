@@ -143,6 +143,39 @@ func (s *Server) reserveUpstreamRequest(cfg *model.Config, apiKey string) (relea
 	return nil, &channelRPMExceededError{retryAfter: reservation.retryAfter}
 }
 
+func (s *Server) reserveUpstreamRequestWithConcurrencyWait(
+	ctx context.Context,
+	cfg *model.Config,
+	apiKey string,
+	wait time.Duration,
+) (func(), error) {
+	release, err := s.reserveUpstreamRequest(cfg, apiKey)
+	if err == nil || wait <= 0 || !errors.Is(err, ErrKeyConcurrencyExceeded) {
+		return release, err
+	}
+	concurrencyErr := err
+
+	waitCtx, cancel := context.WithTimeout(ctx, wait)
+	defer cancel()
+	release, err = s.waitForKeyConcurrencySlot(waitCtx, cfg, apiKey)
+	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, ctxErr
+		}
+		if errors.Is(err, context.DeadlineExceeded) {
+			return nil, concurrencyErr
+		}
+		return nil, err
+	}
+
+	reservation := s.reserveChannelRPM(cfg)
+	if reservation.allowed {
+		return release, nil
+	}
+	release()
+	return nil, &channelRPMExceededError{retryAfter: reservation.retryAfter}
+}
+
 func (s *Server) waitForUpstreamRequest(ctx context.Context, cfg *model.Config, apiKey string) (func(), error) {
 	for {
 		release, err := s.waitForKeyConcurrencySlot(ctx, cfg, apiKey)
@@ -175,7 +208,8 @@ func channelRPMRetryAfter(err error) time.Duration {
 }
 
 func (s *Server) doUpstreamRequest(cfg *model.Config, apiKey string, req *http.Request) (*http.Response, error) {
-	release, err := s.reserveUpstreamRequest(cfg, apiKey)
+	wait, _ := req.Context().Value(claudeAffinityConcurrencyWaitContextKey{}).(time.Duration)
+	release, err := s.reserveUpstreamRequestWithConcurrencyWait(req.Context(), cfg, apiKey, wait)
 	return s.doReservedUpstreamRequest(cfg, req, release, err)
 }
 

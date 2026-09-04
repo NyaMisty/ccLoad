@@ -65,6 +65,49 @@ func TestKeyConcurrencyLimiterWaitIsScopedToKey(t *testing.T) {
 	}
 }
 
+func TestReserveUpstreamRequestWithConcurrencyWait(t *testing.T) {
+	t.Run("acquires released affinity slot", func(t *testing.T) {
+		server := &Server{channelConcurrencyLimiter: newChannelConcurrencyLimiter()}
+		cfg := &model.Config{ID: 7, MaxConcurrency: 1}
+		heldRelease, _, _, ok := server.channelConcurrencyLimiter.acquire(cfg.ID, "key-a", 1)
+		if !ok {
+			t.Fatal("pre-acquire affinity Key failed")
+		}
+		defer heldRelease()
+
+		timer := time.AfterFunc(30*time.Millisecond, heldRelease)
+		defer timer.Stop()
+
+		release, err := server.reserveUpstreamRequestWithConcurrencyWait(
+			context.Background(), cfg, "key-a", time.Second,
+		)
+		if err != nil {
+			t.Fatalf("wait for released affinity slot: %v", err)
+		}
+		release()
+	})
+
+	t.Run("timeout remains a concurrency error", func(t *testing.T) {
+		server := &Server{channelConcurrencyLimiter: newChannelConcurrencyLimiter()}
+		cfg := &model.Config{ID: 7, MaxConcurrency: 1}
+		heldRelease, _, _, ok := server.channelConcurrencyLimiter.acquire(cfg.ID, "key-a", 1)
+		if !ok {
+			t.Fatal("pre-acquire affinity Key failed")
+		}
+		defer heldRelease()
+
+		_, err := server.reserveUpstreamRequestWithConcurrencyWait(
+			context.Background(), cfg, "key-a", 30*time.Millisecond,
+		)
+		if !errors.Is(err, ErrKeyConcurrencyExceeded) {
+			t.Fatalf("wait timeout error=%v, want ErrKeyConcurrencyExceeded", err)
+		}
+		if errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("wait timeout leaked context deadline instead of allowing fallback: %v", err)
+		}
+	})
+}
+
 func TestDoUpstreamRequestHoldsPerKeyConcurrencyUntilBodyClosed(t *testing.T) {
 	t.Parallel()
 
