@@ -73,6 +73,22 @@ type AuthToken struct {
 
 	// 并发限制（2026-04新增）
 	MaxConcurrency int `json:"max_concurrency"` // 最大并发请求数，0表示无限制
+
+	// 调度优先级（2026-10新增）
+	// 数值越大越优先：全局并发槽位竞争时高优先级令牌插队获得槽位。
+	// 0 视为默认优先级 100，避免旧数据把令牌调成最低优先级。
+	Priority int `json:"priority"`
+}
+
+// AuthTokenPriorityDefault 是未显式配置时的优先级（DB 列默认值）。
+const AuthTokenPriorityDefault = 100
+
+// EffectivePriority 返回参与调度的优先级，把 0/负数归一到默认值。
+func (t *AuthToken) EffectivePriority() int {
+	if t.Priority <= 0 {
+		return AuthTokenPriorityDefault
+	}
+	return t.Priority
 }
 
 // 渠道限制模式常量
@@ -349,6 +365,7 @@ type authTokenJSON struct {
 	AllowedChannelIDs        []int64   `json:"allowed_channel_ids,omitempty"`
 	ChannelRestrictionMode   string    `json:"channel_restriction_mode,omitempty"`
 	MaxConcurrency           int       `json:"max_concurrency"`
+	Priority                 int       `json:"priority"`
 }
 
 // MarshalJSON 自定义JSON序列化，将MicroUSD转换为USD浮点数
@@ -392,5 +409,6 @@ func (t AuthToken) MarshalJSON() ([]byte, error) {
 		AllowedChannelIDs:        t.AllowedChannelIDs,
 		ChannelRestrictionMode:   channelRestrictionMode,
 		MaxConcurrency:           t.MaxConcurrency,
+		Priority:                 t.EffectivePriority(),
 	})
 }

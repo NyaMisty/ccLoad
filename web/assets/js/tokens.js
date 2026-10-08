@@ -260,6 +260,7 @@
           <col class="tokens-colgroup-token-usage">
           <col class="tokens-colgroup-cost">
           <col class="tokens-colgroup-concurrency">
+          <col class="tokens-colgroup-priority">
           <col class="tokens-colgroup-stream">
           <col class="tokens-colgroup-non-stream">
           <col class="tokens-colgroup-last-used">
@@ -274,6 +275,7 @@
             <th class="tokens-table-head-center">${t('tokens.table.tokenUsage')}</th>
             <th class="tokens-table-head-center">${t('tokens.table.totalCost')}</th>
             <th class="tokens-table-head-center">${t('tokens.table.concurrency')}</th>
+            <th class="tokens-table-head-center" title="${t('tokens.table.priorityTitle')}">${t('tokens.table.priority')}</th>
             <th class="tokens-table-head-center">${t('tokens.table.streamAvg')}</th>
             <th class="tokens-table-head-center">${t('tokens.table.nonStreamAvg')}</th>
             <th>${t('tokens.table.lastUsed')}</th>
@@ -337,6 +339,7 @@
       const tokensHtml = buildTokensHtml(token);
       const costHtml = buildCostHtml(token.total_cost_usd, token.effective_cost_usd);
       const concurrencyHtml = buildConcurrencyHtml(token.max_concurrency);
+      const priorityHtml = buildPriorityHtml(token.priority);
       const streamAvgHtml = buildResponseTimeHtml(token.stream_avg_ttfb, token.stream_count, window.getFirstByteTimingColor);
       const nonStreamAvgHtml = buildResponseTimeHtml(token.non_stream_avg_rt, token.non_stream_count, window.getDurationTimingColor);
       const costCellClass = token.total_cost_usd > 0 ? '' : 'mobile-empty-cell';
@@ -364,6 +367,7 @@
         costHtml: costHtml,
         costCellClass: costCellClass,
         concurrencyHtml: concurrencyHtml,
+        priorityHtml: priorityHtml,
         streamAvgHtml: streamAvgHtml,
         streamCellClass: streamCellClass,
         nonStreamAvgHtml: nonStreamAvgHtml,
@@ -376,6 +380,7 @@
         mobileLabelTokenUsage: t('tokens.table.tokenUsage'),
         mobileLabelCost: t('tokens.table.totalCost'),
         mobileLabelConcurrency: t('tokens.table.concurrency'),
+        mobileLabelPriority: t('tokens.table.priority'),
         mobileLabelStream: t('tokens.table.streamAvg'),
         mobileLabelNonStream: t('tokens.table.nonStreamAvg'),
         mobileLabelLastUsed: t('tokens.table.lastUsed'),
@@ -533,6 +538,11 @@
       return `<span class="metric-value">${limit.toLocaleString()}</span>`;
     }
 
+    function buildPriorityHtml(priority) {
+      const value = Number(priority) || 100;
+      return `<span class="metric-value">${value.toLocaleString()}</span>`;
+    }
+
     function parseMaxConcurrencyInput(rawValue) {
       const normalized = String(rawValue ?? '').trim();
       if (normalized === '') {
@@ -542,6 +552,20 @@
       const parsed = Number(normalized);
       if (!Number.isFinite(parsed) || !Number.isInteger(parsed) || parsed < 0) {
         return { error: t('tokens.msg.maxConcurrencyInteger') };
+      }
+
+      return { value: parsed };
+    }
+
+    function parsePriorityInput(rawValue) {
+      const normalized = String(rawValue ?? '').trim();
+      if (normalized === '') {
+        return { value: 0 };
+      }
+
+      const parsed = Number(normalized);
+      if (!Number.isFinite(parsed) || !Number.isInteger(parsed) || parsed < 0) {
+        return { error: t('tokens.msg.priorityInteger') };
       }
 
       return { value: parsed };
@@ -599,6 +623,7 @@
       const tokensHtml = buildTokensHtml(token);
       const costHtml = buildCostHtml(token.total_cost_usd, token.effective_cost_usd);
       const concurrencyHtml = buildConcurrencyHtml(token.max_concurrency);
+      const priorityHtml = buildPriorityHtml(token.priority);
       const streamAvgHtml = buildResponseTimeHtml(token.stream_avg_ttfb, token.stream_count, window.getFirstByteTimingColor);
       const nonStreamAvgHtml = buildResponseTimeHtml(token.non_stream_avg_rt, token.non_stream_count, window.getDurationTimingColor);
       const costCellClass = token.total_cost_usd > 0 ? '' : ' mobile-empty-cell';
@@ -622,6 +647,7 @@
           <td class="tokens-col-token-usage" data-mobile-label="${t('tokens.table.tokenUsage')}">${tokensHtml}</td>
           <td class="tokens-col-cost${costCellClass}" data-mobile-label="${t('tokens.table.totalCost')}">${costHtml}</td>
           <td class="tokens-col-concurrency" data-mobile-label="${t('tokens.table.concurrency')}">${concurrencyHtml}</td>
+          <td class="tokens-col-priority" data-mobile-label="${t('tokens.table.priority')}">${priorityHtml}</td>
           <td class="tokens-col-stream${streamCellClass}" data-mobile-label="${t('tokens.table.streamAvg')}">${streamAvgHtml}</td>
           <td class="tokens-col-non-stream${nonStreamCellClass}" data-mobile-label="${t('tokens.table.nonStreamAvg')}">${nonStreamAvgHtml}</td>
           <td class="tokens-col-last-used" data-mobile-label="${t('tokens.table.lastUsed')}">${lastUsed}</td>
@@ -650,6 +676,7 @@
       document.getElementById('tokenMonthlyCostLimitUSD').value = 0;
       document.getElementById('tokenCostLimitUSD').value = 0;
       document.getElementById('tokenMaxConcurrency').value = 0;
+      document.getElementById('tokenPriority').value = 100;
       document.getElementById('tokenActive').checked = true;
       document.getElementById('customExpiryContainer').style.display = 'none';
       document.getElementById('createModal').style.display = 'block';
@@ -686,6 +713,7 @@
       const monthlyCostLimitUSD = parseFloat(document.getElementById('tokenMonthlyCostLimitUSD').value) || 0;
       const costLimitUSD = parseFloat(document.getElementById('tokenCostLimitUSD').value) || 0;
       const maxConcurrencyResult = parseMaxConcurrencyInput(document.getElementById('tokenMaxConcurrency').value);
+      const priorityResult = parsePriorityInput(document.getElementById('tokenPriority').value);
       if (dailyCostLimitUSD < 0 || monthlyCostLimitUSD < 0 || costLimitUSD < 0) {
         window.showNotification(t('tokens.msg.costLimitNegative'), 'error');
         return;
@@ -694,7 +722,12 @@
         window.showNotification(maxConcurrencyResult.error, 'error');
         return;
       }
+      if (priorityResult.error) {
+        window.showNotification(priorityResult.error, 'error');
+        return;
+      }
       const maxConcurrency = maxConcurrencyResult.value;
+      const priority = priorityResult.value;
       try {
         const data = await fetchDataWithAuth(`${API_BASE}/auth-tokens`, {
           method: 'POST',
@@ -708,7 +741,8 @@
             cost_daily_limit_usd: dailyCostLimitUSD,
             cost_monthly_limit_usd: monthlyCostLimitUSD,
             cost_limit_usd: costLimitUSD,
-            max_concurrency: maxConcurrency
+            max_concurrency: maxConcurrency,
+            priority
           })
         });
 
@@ -768,6 +802,9 @@
       const maxConcurrencyInput = document.getElementById('editMaxConcurrency');
       maxConcurrencyInput.value = token.max_concurrency || 0;
 
+      const priorityInput = document.getElementById('editPriority');
+      priorityInput.value = token.priority || 100;
+
       // 初始化模型限制状态（2026-01新增）
       editAllowedModels = (token.allowed_models || []).slice();
       selectedAllowedModelIndices.clear();
@@ -825,6 +862,7 @@
       const monthlyCostLimitUSD = parseFloat(document.getElementById('editMonthlyCostLimitUSD').value) || 0;
       const costLimitUSD = parseFloat(document.getElementById('editCostLimitUSD').value) || 0;
       const maxConcurrencyResult = parseMaxConcurrencyInput(document.getElementById('editMaxConcurrency').value);
+      const priorityResult = parsePriorityInput(document.getElementById('editPriority').value);
       if (dailyCostLimitUSD < 0 || monthlyCostLimitUSD < 0 || costLimitUSD < 0) {
         window.showNotification(t('tokens.msg.costLimitNegative'), 'error');
         return;
@@ -833,7 +871,12 @@
         window.showNotification(maxConcurrencyResult.error, 'error');
         return;
       }
+      if (priorityResult.error) {
+        window.showNotification(priorityResult.error, 'error');
+        return;
+      }
       const maxConcurrency = maxConcurrencyResult.value;
+      const priority = priorityResult.value;
       let customDate = '';
       let expiresAt = null;
       if (expiryType !== 'never') {
@@ -870,7 +913,8 @@
             cost_daily_limit_usd: dailyCostLimitUSD,
             cost_monthly_limit_usd: monthlyCostLimitUSD,
             cost_limit_usd: costLimitUSD,        // 总限额
-            max_concurrency: maxConcurrency      // 2026-04新增：并发上限
+            max_concurrency: maxConcurrency,     // 2026-04新增：并发上限
+            priority                             // 2026-10新增：调度优先级
           })
         });
         closeEditModal();

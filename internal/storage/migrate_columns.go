@@ -617,6 +617,25 @@ func ensureAuthTokensMaxConcurrency(ctx context.Context, db *sql.DB, dialect Dia
 	}
 }
 
+// ensureAuthTokensPriority 确保auth_tokens表有调度优先级字段（2026-10新增）。
+// 语义：数值越大越优先，默认 100；历史行由列默认值回填为 100。
+func ensureAuthTokensPriority(ctx context.Context, db *sql.DB, dialect Dialect) error {
+	switch dialect {
+	case DialectMySQL:
+		return ensureMySQLColumns(ctx, db, "auth_tokens", []mysqlColumnDef{
+			{name: "priority", definition: "INT NOT NULL DEFAULT 100"},
+		})
+	case DialectPostgres:
+		return ensurePostgresColumns(ctx, db, "auth_tokens", []mysqlColumnDef{
+			{name: "priority", definition: "INT NOT NULL DEFAULT 100"},
+		})
+	default:
+		return ensureSQLiteColumns(ctx, db, "auth_tokens", []sqliteColumnDef{
+			{name: "priority", definition: "INTEGER NOT NULL DEFAULT 100"},
+		})
+	}
+}
+
 // ensureChannelsDailyCostLimit 确保channels表有daily_cost_limit字段
 func ensureChannelsDailyCostLimit(ctx context.Context, db *sql.DB, dialect Dialect) error {
 	return ensureColumn(ctx, db, dialect, "channels", "daily_cost_limit",

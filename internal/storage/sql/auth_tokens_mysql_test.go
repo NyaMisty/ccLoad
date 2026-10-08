@@ -100,7 +100,7 @@ func (r *foundRowsRows) Columns() []string {
 		"cost_used_microusd", "cost_limit_microusd",
 		"cost_daily_used_microusd", "cost_daily_limit_microusd", "cost_daily_period_start",
 		"cost_monthly_used_microusd", "cost_monthly_limit_microusd", "cost_monthly_period_start",
-		"allowed_models", "allowed_channel_ids", "channel_restriction_mode", "max_concurrency",
+		"allowed_models", "allowed_channel_ids", "channel_restriction_mode", "max_concurrency", "priority",
 	}
 }
 
@@ -154,6 +154,7 @@ func authTokenDriverValues(token *model.AuthToken) []driver.Value {
 		`[42]`,
 		mode,
 		token.MaxConcurrency,
+		int64(token.EffectivePriority()),
 	}
 }
 

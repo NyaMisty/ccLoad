@@ -245,6 +245,9 @@ func migrate(ctx context.Context, db *sql.DB, dialect Dialect) error {
 			if err := validateAuthTokensMaxConcurrency(ctx, db); err != nil {
 				return fmt.Errorf("validate auth_tokens max_concurrency: %w", err)
 			}
+			if err := ensureAuthTokensPriority(ctx, db, dialect); err != nil {
+				return fmt.Errorf("migrate auth_tokens priority: %w", err)
+			}
 		}
 
 		// 增量迁移：channel_models表添加redirect_model字段，迁移数据后删除channels冗余字段

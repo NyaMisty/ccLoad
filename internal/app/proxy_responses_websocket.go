@@ -404,14 +404,15 @@ func (s *Server) executeResponsesWebsocketTurn(
 		return responsesWebsocketTurnResult{}, errors.New("missing model in normalized websocket request")
 	}
 
-	release, err := s.acquireConcurrencySlotForContext(ctx)
+	tokenHash, _ := c.Get("token_hash")
+	tokenHashString, _ := tokenHash.(string)
+
+	release, err := s.acquireConcurrencySlotForContext(ctx, tokenHashString)
 	if err != nil {
 		return responsesWebsocketTurnResult{}, err
 	}
 	defer release()
 
-	tokenHash, _ := c.Get("token_hash")
-	tokenHashString, _ := tokenHash.(string)
 	releaseTokenSlot, activeTokenRequests, maxTokenRequests, acquired := s.authService.acquireTokenConcurrencySlot(tokenHashString)
 	if !acquired {
 		return responsesWebsocketTurnResult{}, fmt.Errorf(

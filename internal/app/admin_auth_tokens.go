@@ -163,6 +163,7 @@ func (s *Server) HandleCreateAuthToken(c *gin.Context) {
 		CostDailyLimitUSD      *float64 `json:"cost_daily_limit_usd"`     // 日限额（0=无限制）
 		CostMonthlyLimitUSD    *float64 `json:"cost_monthly_limit_usd"`   // 月限额（0=无限制）
 		MaxConcurrency         *int     `json:"max_concurrency"`          // 最大并发请求数（0=无限制）
+		Priority               *int     `json:"priority"`                 // 调度优先级（0=默认100）
 	}
 
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -183,6 +184,10 @@ func (s *Server) HandleCreateAuthToken(c *gin.Context) {
 	}
 	if req.MaxConcurrency != nil && *req.MaxConcurrency < 0 {
 		RespondErrorMsg(c, http.StatusBadRequest, "max_concurrency must be >= 0")
+		return
+	}
+	if req.Priority != nil && *req.Priority < 0 {
+		RespondErrorMsg(c, http.StatusBadRequest, "priority must be >= 0")
 		return
 	}
 	channelRestrictionMode, err := model.NormalizeChannelRestrictionMode(req.ChannelRestrictionMode)
@@ -229,6 +234,9 @@ func (s *Server) HandleCreateAuthToken(c *gin.Context) {
 	if req.MaxConcurrency != nil {
 		authToken.MaxConcurrency = *req.MaxConcurrency
 	}
+	if req.Priority != nil {
+		authToken.Priority = *req.Priority
+	}
 	if err := authToken.ValidateUsageLimits(); err != nil {
 		RespondErrorMsg(c, http.StatusBadRequest, err.Error())
 		return
@@ -262,6 +270,7 @@ func (s *Server) HandleCreateAuthToken(c *gin.Context) {
 		"allowed_channel_ids":      authToken.AllowedChannelIDs,
 		"channel_restriction_mode": authToken.ChannelRestrictionMode,
 		"max_concurrency":          authToken.MaxConcurrency,
+		"priority":                 authToken.EffectivePriority(),
 	})
 }
 
@@ -285,6 +294,7 @@ func (s *Server) HandleUpdateAuthToken(c *gin.Context) {
 		CostDailyLimitUSD      *float64          `json:"cost_daily_limit_usd"`     // 日限额（0=无限制）
 		CostMonthlyLimitUSD    *float64          `json:"cost_monthly_limit_usd"`   // 月限额（0=无限制）
 		MaxConcurrency         *int              `json:"max_concurrency"`          // 最大并发请求数（0=无限制）
+		Priority               *int              `json:"priority"`                 // 调度优先级（0=默认100）
 	}
 
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -305,6 +315,10 @@ func (s *Server) HandleUpdateAuthToken(c *gin.Context) {
 	}
 	if req.MaxConcurrency != nil && *req.MaxConcurrency < 0 {
 		RespondErrorMsg(c, http.StatusBadRequest, "max_concurrency must be >= 0")
+		return
+	}
+	if req.Priority != nil && *req.Priority < 0 {
+		RespondErrorMsg(c, http.StatusBadRequest, "priority must be >= 0")
 		return
 	}
 	var channelRestrictionMode string
@@ -357,6 +371,9 @@ func (s *Server) HandleUpdateAuthToken(c *gin.Context) {
 	}
 	if req.MaxConcurrency != nil {
 		token.MaxConcurrency = *req.MaxConcurrency
+	}
+	if req.Priority != nil {
+		token.Priority = *req.Priority
 	}
 	if err := token.ValidateUsageLimits(); err != nil {
 		RespondErrorMsg(c, http.StatusBadRequest, err.Error())

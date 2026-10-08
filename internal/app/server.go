@@ -133,6 +133,11 @@ type Server struct {
 	// 并发控制
 	concurrencySem chan struct{} // 信号量：限制最大并发请求数（防止goroutine爆炸）
 	maxConcurrency int           // 最大并发数（默认1000）
+	// 优先级调度：槽位不足时按令牌 priority 从等待队列派发（越大越优先，同优先级FIFO）。
+	// 信号量的读写全部收敛到 concurrencyWaitMu 之下，快路径只是多一次无竞争的锁。
+	concurrencyWaitMu   sync.Mutex
+	concurrencyWaiters  []*concurrencyWaiter
+	concurrencyWaitSeq  atomic.Uint64
 
 	// 优雅关闭机制
 	baseCtx                 context.Context    // server生命周期context，Shutdown时取消

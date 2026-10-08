@@ -135,6 +135,17 @@
           </div>
         </div>
 
+        <div class="form-group form-row-inline">
+          <label class="form-label form-row-inline__label" data-i18n="tokens.priorityLabel">优先级</label>
+          <div class="form-row-inline__content token-limit-control">
+            <div class="token-limit-input-line">
+              <span class="token-limit-prefix-slot token-limit-prefix-slot--empty" aria-hidden="true"></span>
+              <input type="number" id="tokenPriority" class="form-input field-grow" min="0" step="1" data-i18n-placeholder="tokens.priorityPlaceholder" placeholder="默认 100，数值越大越优先">
+              <span class="token-limit-hint token-limit-hint--inline" data-i18n="tokens.priorityHint">并发排队时数值大的令牌优先</span>
+            </div>
+          </div>
+        </div>
+
         <div class="form-group">
           <label class="token-active-label">
             <input type="checkbox" id="tokenActive" checked class="control-checkbox">
@@ -272,6 +283,17 @@
                   <span class="token-limit-prefix-slot token-limit-prefix-slot--empty" aria-hidden="true"></span>
                   <input type="number" id="editMaxConcurrency" class="form-input field-grow" min="0" step="1" data-i18n-placeholder="tokens.maxConcurrencyPlaceholder" placeholder="0 表示无限制">
                   <span class="token-limit-hint token-limit-hint--inline" data-i18n="tokens.zeroUnlimitedHint">0 表示无限制</span>
+                </div>
+              </div>
+            </div>
+
+            <div class="form-group form-row-inline token-edit-field token-edit-field--priority">
+              <label class="form-label form-row-inline__label" data-i18n="tokens.priorityLabel">优先级</label>
+              <div class="form-row-inline__content token-limit-control">
+                <div class="token-limit-input-line">
+                  <span class="token-limit-prefix-slot token-limit-prefix-slot--empty" aria-hidden="true"></span>
+                  <input type="number" id="editPriority" class="form-input field-grow" min="0" step="1" data-i18n-placeholder="tokens.priorityPlaceholder" placeholder="默认 100，数值越大越优先">
+                  <span class="token-limit-hint token-limit-hint--inline" data-i18n="tokens.priorityHint">并发排队时数值大的令牌优先</span>
                 </div>
               </div>
             </div>
@@ -502,6 +524,7 @@
       <td class="tokens-col-token-usage" data-mobile-label="{{mobileLabelTokenUsage}}">{{{tokensHtml}}}</td>
       <td class="tokens-col-cost {{costCellClass}}" data-mobile-label="{{mobileLabelCost}}">{{{costHtml}}}</td>
       <td class="tokens-col-concurrency" data-mobile-label="{{mobileLabelConcurrency}}">{{{concurrencyHtml}}}</td>
+      <td class="tokens-col-priority" data-mobile-label="{{mobileLabelPriority}}">{{{priorityHtml}}}</td>
       <td class="tokens-col-stream {{streamCellClass}}" data-mobile-label="{{mobileLabelStream}}">{{{streamAvgHtml}}}</td>
       <td class="tokens-col-non-stream {{nonStreamCellClass}}" data-mobile-label="{{mobileLabelNonStream}}">{{{nonStreamAvgHtml}}}</td>
       <td class="tokens-col-last-used" data-mobile-label="{{mobileLabelLastUsed}}">{{{lastUsed}}}</td>

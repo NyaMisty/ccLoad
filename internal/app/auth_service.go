@@ -48,6 +48,7 @@ type AuthService struct {
 	authTokenChannels   map[string]model.ChannelRestriction // Token哈希 → 已校验的渠道限制策略
 	authTokenCostLimits map[string]tokenCostLimit           // Token哈希 → 费用限额状态（仅限额>0的令牌）
 	authTokenMaxConns   map[string]int                      // Token哈希 → 最大并发请求数（0=无限制）
+	authTokenPriorities map[string]int                      // Token哈希 → 调度优先级（越大越优先，缺失=默认100）
 	authTokenActiveReqs map[string]int                      // Token哈希 → 当前进行中请求数
 	authTokensMux       sync.RWMutex                        // 并发保护（支持热更新）
 	authTokensRefreshMu sync.Mutex
@@ -169,6 +170,7 @@ func NewAuthService(
 		authTokenChannels:      make(map[string]model.ChannelRestriction),
 		authTokenCostLimits:    make(map[string]tokenCostLimit),
 		authTokenMaxConns:      make(map[string]int),
+		authTokenPriorities:    make(map[string]int),
 		authTokenActiveReqs:    make(map[string]int),
 		loginRateLimiter:       loginRateLimiter,
 		apiTokenSessionLimiter: newAPITokenSessionLimiter(nil),
@@ -643,6 +645,7 @@ func (s *AuthService) RequireAPIAuth() gin.HandlerFunc {
 			delete(s.authTokenChannels, tokenHash)
 			delete(s.authTokenCostLimits, tokenHash)
 			delete(s.authTokenMaxConns, tokenHash)
+			delete(s.authTokenPriorities, tokenHash)
 			s.authTokensMux.Unlock()
 			if tokenID > 0 {
 				if err := s.revokeWebSessions([]int64{tokenID}); err != nil {
@@ -859,6 +862,7 @@ func (s *AuthService) reloadAuthTokensLocked() error {
 	newTokenChannels := make(map[string]model.ChannelRestriction, len(tokens))
 	newTokenCostLimits := make(map[string]tokenCostLimit, len(tokens))
 	newTokenMaxConns := make(map[string]int, len(tokens))
+	newTokenPriorities := make(map[string]int, len(tokens))
 	for _, t := range tokens {
 		if err := t.ValidateUsageLimits(); err != nil {
 			return fmt.Errorf("invalid auth token %d: %w", t.ID, err)
@@ -900,6 +904,7 @@ func (s *AuthService) reloadAuthTokensLocked() error {
 		if t.MaxConcurrency > 0 {
 			newTokenMaxConns[t.Token] = t.MaxConcurrency
 		}
+		newTokenPriorities[t.Token] = t.EffectivePriority()
 	}
 
 	// 原子替换（避免读写竞争）
@@ -940,6 +945,7 @@ func (s *AuthService) reloadAuthTokensLocked() error {
 	s.authTokenChannels = newTokenChannels
 	s.authTokenCostLimits = newTokenCostLimits
 	s.authTokenMaxConns = newTokenMaxConns
+	s.authTokenPriorities = newTokenPriorities
 	s.authTokensMux.Unlock()
 	s.authTokensReloadAt.Store(time.Now().UnixMilli())
 	if err := s.revokeWebSessions(revokedTokenIDs); err != nil {
@@ -1082,6 +1088,22 @@ func (s *AuthService) IsChannelAllowed(tokenHash string, channelID int64) bool {
 		return true
 	}
 	return restriction.Allows(channelID)
+}
+
+// TokenPriority 返回令牌的调度优先级（越大越优先）。
+// 未知令牌（空哈希/已删除）或未初始化的服务用默认优先级，
+// 绝不因查不到而把请求降为最低优先级。
+func (s *AuthService) TokenPriority(tokenHash string) int {
+	if s == nil || tokenHash == "" {
+		return model.AuthTokenPriorityDefault
+	}
+	s.authTokensMux.RLock()
+	priority, ok := s.authTokenPriorities[tokenHash]
+	s.authTokensMux.RUnlock()
+	if !ok || priority <= 0 {
+		return model.AuthTokenPriorityDefault
+	}
+	return priority
 }
 
 func (s *AuthService) acquireTokenConcurrencySlot(tokenHash string) (release func(), active, limit int, ok bool) {

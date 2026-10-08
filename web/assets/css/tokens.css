@@ -102,6 +102,9 @@
     .tokens-colgroup-concurrency {
       width: 6%;
     }
+    .tokens-colgroup-priority {
+      width: 6%;
+    }
     .tokens-colgroup-stream {
       width: 7%;
     }
@@ -261,6 +264,7 @@
     .tokens-col-token-usage,
     .tokens-col-cost,
     .tokens-col-concurrency,
+    .tokens-col-priority,
     .tokens-col-stream,
     .tokens-col-non-stream {
       text-align: center;
@@ -1196,14 +1200,17 @@
       .tokens-table .tokens-col-concurrency {
         order: 22;
       }
-      .tokens-table .tokens-col-stream {
+      .tokens-table .tokens-col-priority {
         order: 23;
       }
-      .tokens-table .tokens-col-non-stream {
+      .tokens-table .tokens-col-stream {
         order: 24;
       }
-      .tokens-table .tokens-col-last-used {
+      .tokens-table .tokens-col-non-stream {
         order: 25;
+      }
+      .tokens-table .tokens-col-last-used {
+        order: 26;
       }
       .tokens-table .tokens-col-actions {
         order: 30;
@@ -1243,6 +1250,7 @@
       .tokens-table .tokens-col-token-usage,
       .tokens-table .tokens-col-cost,
       .tokens-table .tokens-col-concurrency,
+      .tokens-table .tokens-col-priority,
       .tokens-table .tokens-col-stream,
       .tokens-table .tokens-col-non-stream,
       .tokens-table .tokens-col-last-used {
@@ -1257,6 +1265,7 @@
       .tokens-table .tokens-col-token-usage::before,
       .tokens-table .tokens-col-cost::before,
       .tokens-table .tokens-col-concurrency::before,
+      .tokens-table .tokens-col-priority::before,
       .tokens-table .tokens-col-stream::before,
       .tokens-table .tokens-col-non-stream::before,
       .tokens-table .tokens-col-last-used::before {

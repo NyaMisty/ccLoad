@@ -52,7 +52,9 @@ var ErrKeyConcurrencyExceeded = errors.New("api key concurrency limit exceeded")
 // acquireConcurrencySlot 获取并发槽位，返回release函数和状态
 // ok=false 表示客户端已取消请求
 func (s *Server) acquireConcurrencySlot(c *gin.Context) (release func(), ok bool) {
-	release, err := s.acquireConcurrencySlotForContext(c.Request.Context())
+	tokenHash, _ := c.Get("token_hash")
+	tokenHashStr, _ := tokenHash.(string)
+	release, err := s.acquireConcurrencySlotForContext(c.Request.Context(), tokenHashStr)
 	if err == nil {
 		return release, true
 	}
@@ -64,13 +66,114 @@ func (s *Server) acquireConcurrencySlot(c *gin.Context) (release func(), ok bool
 	return nil, false
 }
 
-func (s *Server) acquireConcurrencySlotForContext(ctx context.Context) (func(), error) {
+// concurrencyWaiter 是全局并发槽位等待队列中的一项。
+// ready 在获得槽位时关闭；abandoned 标记等待者已放弃（ctx 取消）。
+type concurrencyWaiter struct {
+	priority  int
+	seq       uint64
+	ready     chan struct{}
+	granted   bool
+	abandoned bool
+}
+
+// acquireConcurrencySlotForContext 获取全局并发槽位；槽位不足时按令牌优先级排队。
+// tokenHash 为空（未认证路径）使用默认优先级；高优先级等待者先于低优先级获得槽位，
+// 同优先级严格 FIFO。客户端取消时立即出队；若槽位已被授予则交还并重新派发。
+func (s *Server) acquireConcurrencySlotForContext(ctx context.Context, tokenHash string) (func(), error) {
+	priority := s.authService.TokenPriority(tokenHash)
+
+	s.concurrencyWaitMu.Lock()
 	select {
 	case s.concurrencySem <- struct{}{}:
-		return func() { <-s.concurrencySem }, nil
+		s.concurrencyWaitMu.Unlock()
+		return s.makeConcurrencyRelease(priority), nil
+	default:
+	}
+	waiter := &concurrencyWaiter{
+		priority: priority,
+		seq:      s.concurrencyWaitSeq.Add(1),
+		ready:    make(chan struct{}),
+	}
+	s.concurrencyWaiters = append(s.concurrencyWaiters, waiter)
+	s.concurrencyWaitMu.Unlock()
+
+	select {
+	case <-waiter.ready:
+		return s.makeConcurrencyRelease(waiter.priority), nil
 	case <-ctx.Done():
+		s.concurrencyWaitMu.Lock()
+		granted := waiter.granted
+		waiter.abandoned = true
+		s.dropConcurrencyWaiterLocked(waiter)
+		s.concurrencyWaitMu.Unlock()
+		if granted {
+			// 槽位在与取消竞争的瞬间已被授予：交还并重新派发给其他等待者。
+			s.makeConcurrencyRelease(waiter.priority)()
+		}
 		return nil, ctx.Err()
 	}
+}
+
+// makeConcurrencyRelease 返回槽位释放函数：归还信号量并立即把槽位派发给队首等待者。
+func (s *Server) makeConcurrencyRelease(releasedPriority int) func() {
+	return func() {
+		s.concurrencyWaitMu.Lock()
+		<-s.concurrencySem
+		s.dispatchConcurrencySlotLocked()
+		s.concurrencyWaitMu.Unlock()
+	}
+}
+
+// dropConcurrencyWaiterLocked 从等待队列移除指定等待者（放弃或已授予后清理）。
+func (s *Server) dropConcurrencyWaiterLocked(waiter *concurrencyWaiter) {
+	for i, w := range s.concurrencyWaiters {
+		if w == waiter {
+			s.concurrencyWaiters = append(s.concurrencyWaiters[:i], s.concurrencyWaiters[i+1:]...)
+			return
+		}
+	}
+}
+
+// dispatchConcurrencySlotLocked 把一个空闲槽位授予等待队列中优先级最高的等待者。
+// 必须持 concurrencyWaitMu 调用；同优先级按入队顺序（seq）FIFO。
+// 没有可派发的等待者时槽位留在信号量里，快路径可直接取用。
+func (s *Server) dispatchConcurrencySlotLocked() {
+	for len(s.concurrencyWaiters) > 0 {
+		best := 0
+		for i, w := range s.concurrencyWaiters {
+			if w.abandoned || w.granted {
+				continue
+			}
+			if s.concurrencyWaiters[best].abandoned || s.concurrencyWaiters[best].granted ||
+				w.priority > s.concurrencyWaiters[best].priority ||
+				(w.priority == s.concurrencyWaiters[best].priority && w.seq < s.concurrencyWaiters[best].seq) {
+				best = i
+			}
+		}
+		w := s.concurrencyWaiters[best]
+		if w.abandoned || w.granted {
+			// 全部等待者都已放弃/已授予：整体清理，槽位留在信号量。
+			s.pruneConcurrencyWaitersLocked()
+			return
+		}
+		s.concurrencyWaiters = append(s.concurrencyWaiters[:best], s.concurrencyWaiters[best+1:]...)
+		w.granted = true
+		s.concurrencySem <- struct{}{}
+		close(w.ready)
+		return
+	}
+}
+
+// pruneConcurrencyWaitersLocked 清理队列中已放弃/已授予的残留项。
+func (s *Server) pruneConcurrencyWaitersLocked() {
+	kept := s.concurrencyWaiters[:0]
+	for _, w := range s.concurrencyWaiters {
+		if w.abandoned || w.granted {
+			continue
+		}
+		kept = append(kept, w)
+	}
+	s.concurrencyWaiters = kept
 }
 
 // ============================================================================
