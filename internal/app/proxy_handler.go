@@ -337,20 +337,25 @@ func (s *Server) selectRouteCandidates(ctx context.Context, c *gin.Context, orig
 	requestMethod := c.Request.Method
 	requestFamily := protocol.DetectRequestFamily(c.Request.URL.Path)
 
+	tokenHash := ""
+	if v, ok := c.Get("token_hash"); ok {
+		tokenHash, _ = v.(string)
+	}
+
 	// 智能路由选择：根据请求类型选择不同的路由策略
 	if requestMethod == http.MethodGet && clientProtocol == util.ProtocolGemini {
 		// Gemini 模型列表请求仍可路由到任意启用渠道。
-		return s.selectCandidatesByClientProtocol(ctx, util.ProtocolGemini)
+		return s.selectCandidatesByClientProtocol(ctx, util.ProtocolGemini, tokenHash)
 	}
 
 	if clientProtocol == "" {
 		return nil, errUnknownClientProtocol
 	}
 	if requestFamily == protocol.RequestFamilyAlphaSearch {
-		return s.selectAlphaSearchCandidates(ctx, originalModel)
+		return s.selectAlphaSearchCandidates(ctx, originalModel, tokenHash)
 	}
 
-	return s.selectCandidatesByModelAndClientProtocol(ctx, originalModel, clientProtocol)
+	return s.selectCandidatesByModelAndClientProtocol(ctx, originalModel, clientProtocol, tokenHash)
 }
 
 // ============================================================================
@@ -513,6 +518,11 @@ func (s *Server) HandleProxyRequest(c *gin.Context) {
 	if err != nil {
 		if errors.Is(err, errUnknownClientProtocol) {
 			c.JSON(http.StatusNotFound, gin.H{"error": "unsupported path"})
+			return
+		}
+		// 令牌渠道限制排除了全部候选（含全冷却兜底候选）：403，不重试不兜底。
+		if errors.Is(err, ErrNoAllowedChannelForToken) {
+			c.JSON(http.StatusForbidden, gin.H{"error": err.Error()})
 			return
 		}
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "internal error"})
