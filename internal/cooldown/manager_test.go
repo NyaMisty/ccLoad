@@ -2202,3 +2202,68 @@ func TestHandleError_WebsocketConnectionLimit(t *testing.T) {
 		t.Error("connection slot exhaustion must not cool down the model")
 	}
 }
+
+// GLM 1302（每分钟请求频率限制）：Key 级固定 15 秒冷却。
+// 与通用 429 的模型作用域路径区分开：1302 是按 Key 计的 RPM 限制，
+// 同渠道其他 Key 应立即顶上，模型与渠道不得冷却。
+func TestHandleError_GLM1302IsShortKeyCooldown(t *testing.T) {
+	store, cleanup := setupTestStore(t)
+	defer cleanup()
+	manager := NewManager(store, nil)
+	ctx := context.Background()
+
+	cfg, err := store.CreateConfig(ctx, &model.Config{
+		Name:     "test-glm-1302-key-cooldown",
+		URLs:     model.ChannelURLs{{URL: "https://api.example.com"}},
+		Priority: 10,
+		Enabled:  true,
+		ModelEntries: []model.ModelEntry{
+			{Model: "model-a"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("create config: %v", err)
+	}
+	if err := store.CreateAPIKeysBatch(ctx, []*model.APIKey{
+		{ChannelID: cfg.ID, KeyIndex: 0, APIKey: "sk-glm-a", KeyStrategy: model.KeyStrategySequential},
+		{ChannelID: cfg.ID, KeyIndex: 1, APIKey: "sk-glm-b", KeyStrategy: model.KeyStrategySequential},
+	}); err != nil {
+		t.Fatalf("create API keys: %v", err)
+	}
+
+	before := time.Now()
+	action := manager.HandleError(ctx, ErrorInput{
+		ChannelID:  cfg.ID,
+		Model:      "model-a",
+		KeyIndex:   0,
+		StatusCode: 429,
+		ErrorBody:  []byte(`{"type":"error","error":{"type":"rate_limit_error","code":"1302","message":"[1302][Rate limit reached for requests][xxx]"},"request_id":"xxx"}`),
+	})
+	after := time.Now()
+
+	if action != ActionRetryKey {
+		t.Fatalf("action=%v, want ActionRetryKey", action)
+	}
+	until, exists := getKeyCooldownUntil(ctx, store, cfg.ID, 0)
+	if !exists {
+		t.Fatal("key 0 should be cooled")
+	}
+	minUntil := before.Add(util.GLMRequestRateLimitCooldown).Add(-time.Second)
+	maxUntil := after.Add(util.GLMRequestRateLimitCooldown).Add(time.Second)
+	if until.Before(minUntil) || until.After(maxUntil) {
+		t.Fatalf("key 0 cooldown until=%v, want between %v and %v", until, minUntil, maxUntil)
+	}
+	if modelUntil, exists := getModelCooldownUntil(ctx, store, cfg.ID, "model-a"); exists && modelUntil.After(time.Now()) {
+		t.Fatalf("1302 must not cool model, until=%v", modelUntil)
+	}
+	if keyUntil, exists := getKeyCooldownUntil(ctx, store, cfg.ID, 1); exists && keyUntil.After(time.Now()) {
+		t.Fatalf("1302 must not cool other keys, until=%v", keyUntil)
+	}
+	channelCfg, err := store.GetConfig(ctx, cfg.ID)
+	if err != nil {
+		t.Fatalf("get config: %v", err)
+	}
+	if channelCfg.IsCoolingDown(time.Now()) {
+		t.Fatal("1302 must not cool the whole channel")
+	}
+}

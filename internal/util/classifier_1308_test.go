@@ -220,3 +220,78 @@ func TestClassifyHTTPResponseWithMeta_GlobalFixedWindowQuotaCoolsModelUntilRetry
 			want.Format(time.RFC3339))
 	}
 }
+
+func TestClassifyHTTPResponseWithMeta_GLM1302IsFixedShortKeyCooldown(t *testing.T) {
+	before := time.Now()
+	got := ClassifyHTTPResponseWithMeta(429, nil, []byte(`{"type":"error","error":{"type":"rate_limit_error","code":"1302","message":"[1302][Rate limit reached for requests][20261019064529f974e9f1b8e7d6c5a0f]"},"request_id":"20261019064529f974e9f1b8e7d6c5a0f"}`))
+	after := time.Now()
+
+	if got.Level != ErrorLevelKey {
+		t.Fatalf("Level=%v, want ErrorLevelKey", got.Level)
+	}
+	if got.ModelScoped {
+		t.Fatal("1302 must not be model-scoped: it is a per-key RPM limit")
+	}
+	if !got.HasKeyCooldownUntil {
+		t.Fatal("expected fixed key cooldown until")
+	}
+	if got.KeyCooldownReason != "1302" {
+		t.Fatalf("KeyCooldownReason=%q, want 1302", got.KeyCooldownReason)
+	}
+
+	minUntil := before.Add(GLMRequestRateLimitCooldown)
+	maxUntil := after.Add(GLMRequestRateLimitCooldown)
+	if got.KeyCooldownUntil.Before(minUntil) || got.KeyCooldownUntil.After(maxUntil) {
+		t.Fatalf("KeyCooldownUntil=%s, want between %s and %s",
+			got.KeyCooldownUntil.Format(time.RFC3339Nano),
+			minUntil.Format(time.RFC3339Nano),
+			maxUntil.Format(time.RFC3339Nano))
+	}
+}
+
+func TestIsGLMRequestRateLimitError(t *testing.T) {
+	tests := []struct {
+		name         string
+		responseBody string
+		want         bool
+	}{
+		{
+			name:         "标准1302错误",
+			responseBody: `{"type":"error","error":{"type":"rate_limit_error","code":"1302","message":"[1302][Rate limit reached for requests][xxx]"},"request_id":"xxx"}`,
+			want:         true,
+		},
+		{
+			name:         "code字段的1302错误",
+			responseBody: `{"error":{"type":"api_error","code":"1302","message":"account rate limited"}}`,
+			want:         true,
+		},
+		{
+			name:         "type字段的1302错误",
+			responseBody: `{"type":"error","error":{"type":"1302","message":"rate limited"}}`,
+			want:         true,
+		},
+		{
+			name:         "1308不是1302",
+			responseBody: `{"type":"error","error":{"type":"1308","message":"Usage limit reached for 5 hour"}}`,
+			want:         false,
+		},
+		{
+			name:         "非JSON",
+			responseBody: `not json`,
+			want:         false,
+		},
+		{
+			name:         "空响应体",
+			responseBody: ``,
+			want:         false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := IsGLMRequestRateLimitError([]byte(tt.responseBody)); got != tt.want {
+				t.Errorf("IsGLMRequestRateLimitError() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}

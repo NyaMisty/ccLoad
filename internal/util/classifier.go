@@ -76,6 +76,10 @@ const (
 	// WebsocketConnectionLimitCooldown 是上游 WebSocket 并发连接槽耗尽时的渠道冷却时长。
 	// 连接槽是瞬时资源：冷却只需覆盖“切走再回来”的窗口，绝不能走指数退避。
 	WebsocketConnectionLimitCooldown = 5 * time.Second
+	// GLMRequestRateLimitCooldown 是 GLM 1302（每分钟请求频率限制）的 Key 冷却时长。
+	// 1302 是按 Key 计的短窗口 RPM 限制，与 1308 的长窗口用量配额不同，
+	// 固定短冷却即可跨过限流窗口，不走指数退避。
+	GLMRequestRateLimitCooldown = 15 * time.Second
 	// xaiFreeUsageExhaustedCooldown 是 xAI 免费额度声明的滚动窗口上限。
 	xaiFreeUsageExhaustedCooldown = 24 * time.Hour
 	// RateLimitScope 常量
@@ -408,6 +412,18 @@ func classifyHTTPResponseWithMetaAt(statusCode int, headers map[string][]string,
 			KeyCooldownUntil:    resetTime,
 			HasKeyCooldownUntil: true,
 			KeyCooldownReason:   "1308",
+		}
+	}
+
+	// [INFO] 特殊处理：检测1302错误（GLM每分钟请求频率限制）
+	// 1302是按Key计的短窗口RPM限制，与1308长窗口用量配额不同：
+	// 固定15秒Key冷却让同渠道其他Key先顶上，避免通用429路径把它升级为模型/渠道冷却。
+	if IsGLMRequestRateLimitError(responseBody) {
+		return HTTPResponseClassification{
+			Level:               ErrorLevelKey,
+			KeyCooldownUntil:    now.Add(GLMRequestRateLimitCooldown),
+			HasKeyCooldownUntil: true,
+			KeyCooldownReason:   "1302",
 		}
 	}
 
@@ -1190,6 +1206,21 @@ func ParseResetTimeFrom1308Error(responseBody []byte) (time.Time, bool) {
 	}
 
 	return resetTime, true
+}
+
+// IsGLMRequestRateLimitError 判断响应体是否为 GLM 1302（每分钟请求频率限制）错误。
+// 错误格式: {"type":"error","error":{"type":"rate_limit_error","code":"1302","message":"[1302][Rate limit reached for requests][...]"},"request_id":"..."}
+// 识别方式与 ParseResetTimeFrom1308Error 一致：数字 code 优先于 type 字段，
+// 不依赖具体 message 文案。
+func IsGLMRequestRateLimitError(responseBody []byte) bool {
+	var errResp sseErrorResponse
+	if err := json.Unmarshal(responseBody, &errResp); err != nil {
+		return false
+	}
+	if code, _, ok := errResp.GLMErrorLevel(); ok {
+		return code == "1302"
+	}
+	return errResp.ErrorType() == "1302"
 }
 
 // ClassifyError 统一错误分类器（网络错误+HTTP错误）
