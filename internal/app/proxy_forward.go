@@ -3465,6 +3465,11 @@ func (s *Server) tryChannelWithKeys(ctx context.Context, cfg *model.Config, reqC
 	if cfg.RetryOtherKeysOnFailure {
 		maxUpstreamKeyAttempts = actualKeyCount
 	}
+	if cfg.CooldownFallback {
+		// 兜底探测只需回答“最早恢复的 Key 是否提前可用”，1 个 Key 足够；
+		// 逐 Key 扇出会把每个入站请求放大成对全部冷却 Key 的上游 429 风暴。
+		maxUpstreamKeyAttempts = 1
+	}
 	if reqCtx.claudeAffinityProbe {
 		maxUpstreamKeyAttempts = 1
 	}

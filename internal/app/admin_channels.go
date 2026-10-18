@@ -1837,6 +1837,7 @@ func (s *Server) removeDeletedChannelRuntimeState(cfg *model.Config) {
 	if s.channelRPMLimiter != nil {
 		s.channelRPMLimiter.RemoveChannel(id)
 	}
+	s.cooldownFallbackProbe.RemoveChannel(id)
 	if s.codexCredentials != nil {
 		s.codexCredentials.invalidate(id)
 	}

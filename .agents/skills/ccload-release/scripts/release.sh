@@ -463,8 +463,8 @@ repo_root=$(git rev-parse --show-toplevel 2>/dev/null) || fail "not inside a Git
 cd "$repo_root"
 
 origin_url=$(git remote get-url origin 2>/dev/null) || fail "origin remote is missing"
-if [[ ! "$origin_url" =~ (^|[:/])caidaoli/ccLoad(\.git)?$ ]]; then
-  fail "origin is not caidaoli/ccLoad: $origin_url"
+if [[ ! "$origin_url" =~ (^|[:/])(caidaoli|NyaMisty)/ccLoad(\.git)?$ ]]; then
+  fail "origin is not caidaoli/ccLoad or its fork NyaMisty/ccLoad: $origin_url"
 fi
 
 branch=$(git branch --show-current)

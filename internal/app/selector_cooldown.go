@@ -100,6 +100,12 @@ func (s *Server) filterCooldownChannelsInternal(ctx context.Context, channels []
 
 		best, readyIn := s.pickBestChannelWhenAllCooled(channels, requestModel, requestProtocol, channelCooldowns, keyCooldowns, modelCooldowns, now)
 		if best != nil {
+			// 兜底探测按渠道限频：窗口期内已探测过就快速失败（503），
+			// 否则每个入站请求都会真实请求冷却中的上游，形成 429 风暴。
+			if !s.cooldownFallbackProbe.allowProbe(best.ID) {
+				log.Printf("[INFO] 所有渠道冷却中，渠道 %d 兜底探测限频，快速失败（%.1fs 后就绪）", best.ID, readyIn.Seconds())
+				return nil, nil
+			}
 			log.Printf("[INFO] 所有渠道冷却中，兜底使用渠道 %d（%.1fs 后就绪）", best.ID, readyIn.Seconds())
 			return []*modelpkg.Config{cooldownFallbackCandidate(best)}, nil
 		}

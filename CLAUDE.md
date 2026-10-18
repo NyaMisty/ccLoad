@@ -81,7 +81,7 @@ www/                 独立介绍站(`make www-setup` 复制共享资源后可�
 - 成本限额达到 → 跳过该渠道
 - Key/模型/渠道共用指数退避:按错误类型取初始值(默认认证 5 min、服务端 2 min、超时/限流 1 min),翻倍并 30 min 封顶;上游或自定义规则给出精确 reset 截止时间时优先使用
 - **冷却探测规则**(`cooldown/detection.go`):渠道 `cooldown_detection_rules` 为空时继承系统设置 `global_cooldown_detection_rules`;按 rules 数组顺序(提交后重编号 0..N-1)匹配 status+正则,命名捕获组可解析精确 reset 时间。网络故障故意不进匹配器(没有可信上游错误体);规则命中但不可执行时回退内置分类器,不猜冷却时长。`EvaluateCooldownDetectionRules` 无副作用,代理链路与 admin 规则测试端点共用
-- **全冷却兜底**(`selector_cooldown.go`,`cooldown_fallback_enabled` 默认 true):所有渠道都冷却时不直接拒绝,挑「最早恢复」渠道打 `CooldownFallback` 标记继续正常流程,Key 也改选最早恢复的(`SelectCooldownFallbackKey`)。排查「明明全冷却了为什么还在发请求」先看这里;设 false 才直接拒绝
+- **全冷却兜底**(`selector_cooldown.go`,`cooldown_fallback_enabled` 默认 true):所有渠道都冷却时不直接拒绝,挑「最早恢复」渠道打 `CooldownFallback` 标记继续正常流程,Key 也改选最早恢复的(`SelectCooldownFallbackKey`)。兜底是**探测语义**:`cooldown_fallback_prober.go` 按渠道限频(15s 窗口内只放行一次真实上游探测,窗口内请求在选路阶段快速 503),且兜底渠道单请求只试 1 个 Key(`tryChannelWithKeys` 忽略 `max_key_retries`/`RetryOtherKeysOnFailure` 的扇出);探测成功走正常成功路径清除 Key/渠道冷却。排查「明明全冷却了为什么还在发请求」先看这里;设 false 才直接拒绝
 - **OAuth 凭证终态拒绝**(`proxy_forward.go:disableTerminalOAuthCredential`+`admin_oauth_cleanup.go:oauthRefreshTokenRejected`):刷新被上游明确拒绝(Token 端点 401,或 400/403 且错误码为 `invalid_grant`/`invalid_token`/`invalid_refresh_token`/`refresh_token_expired`/`refresh_token_revoked`/`expired_token`,或静态 PAT 本就不可刷新)时直接**禁用渠道**并清零其冷却,再按 `ActionRetryChannel` 切下一个渠道。禁用是凭证快照 CAS(`Store.DisableOAuthChannelIfCredentialMatches`:`WHERE id=? AND enabled=1 AND auth_type=? AND oauth_credential=?`),期间已重新授权的渠道快照不匹配,只打 INFO 跳过,绝不误禁;判定不成立的刷新失败仍走普通冷却
 - **Responses WebSocket 特例**:
   - 首个语义输出前:非 WS→非 WS、原生 WS→非 WS/原生 WS 均可网关内部切换,WS→非 WS 用 execution session 完整 transcript;非 WS 故障且下一候选为原生 WS 时返回 `status=502` 的 `server_error/upstream_unavailable` 并以 close 1011 断开,让 Codex 客户端完整 replay
@@ -92,6 +92,7 @@ www/                 独立介绍站(`make www-setup` 复制共享资源后可�
 
 - **499** 客户端取消:不计失败、不冷却;上游直接返回 499:模型级冷却
 - **596** 1308 配额超限 → Key 级冷却,不计健康度
+- **GLM 1302**(每分钟请求频率限制,随 429/597 到达):`IsGLMRequestRateLimitError` 在分类出口优先拦截,固定 15s Key 冷却(`GLMRequestRateLimitCooldown`),不走通用 429 的模型作用域路径,也不指数退避;1308/1310 仍按精确 reset 时间 Key 冷却
 - **597** SSE error(HTTP 200+错误体)→ `classifySSEError` 按 error.type 动态判级
 - **598** 首字节超时 → 模型级;**599** 流式中断 → 模型级
 - **`fwResult.StreamDiagMsg` 是 599 的判定开关,不只是日志字段**:非空即被 `forwardAttempt` 判为流不完整,置 599 并走模型级冷却。所以只有真实上游故障才允许写入,客户端断开必须先过 `isClientDisconnectError`(`buildStreamDiagnostics` 与 Codex 非流式收集器 `codex_wire.go` 各有一处),漏一处就会把 499 误升成 599。`markIncompleteStreamForwardResult` 不覆盖已经是 598 的状态码——两者冷却初值不同
