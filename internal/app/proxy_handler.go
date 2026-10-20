@@ -358,6 +358,48 @@ func (s *Server) selectRouteCandidates(ctx context.Context, c *gin.Context, orig
 	return s.selectCandidatesByModelAndClientProtocol(ctx, originalModel, clientProtocol, tokenHash)
 }
 
+// routeCandidateWaitBudget 是「全部候选冷却/被兜底探测限频」时排队等待的总预算。
+// 冷却到期通常是秒级窗口（模型冷却从 1min 起、兜底探测窗口 15s）；
+// 10s 覆盖了大部分瞬时窗口，又不会把客户端挂住到网关自己的 read/write timeout 上。
+const routeCandidateWaitBudget = 10 * time.Second
+
+// routeCandidateWaitPoll 是等待期间的选路重试间隔。
+// 500ms 足够小，能尽快感知冷却解除；足够大，不会把选路查询放大成 DB 压力。
+const routeCandidateWaitPoll = 500 * time.Millisecond
+
+// waitForRouteCandidates 在初次选路为空时排队等待：按固定间隔重试选路，
+// 拿到候选立即返回，超过 routeCandidateWaitBudget 或客户端断开才放弃。
+// 只在 HTTP 主链路使用；AlphaSearch 与 WebSocket 路径有各自的故障边界，不经过这里。
+func (s *Server) waitForRouteCandidates(ctx context.Context, c *gin.Context, originalModel string, clientProtocol string) []*model.Config {
+	deadline := time.Now().Add(routeCandidateWaitBudget)
+	timer := time.NewTimer(routeCandidateWaitPoll)
+	defer timer.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			// 客户端断开或上游取消：不白等，让上层按 ctx.Err() 处理
+			return nil
+		case <-timer.C:
+		}
+
+		cands, err := s.selectRouteCandidates(ctx, c, originalModel, clientProtocol)
+		if err == nil && len(cands) > 0 {
+			return cands
+		}
+		if err != nil {
+			// 令牌渠道限制等错误不会随等待消失，直接放弃避免把客户端挂住
+			return nil
+		}
+
+		if time.Now().Add(routeCandidateWaitPoll).After(deadline) {
+			// 下一轮已经超出预算：不再等，把最后一次空结果交回
+			return nil
+		}
+		timer.Reset(routeCandidateWaitPoll)
+	}
+}
+
 // ============================================================================
 // 主请求处理器
 // ============================================================================
@@ -534,22 +576,28 @@ func (s *Server) HandleProxyRequest(c *gin.Context) {
 			writeEmptyAlphaSearchResponse(c.Writer)
 			return
 		}
-		s.AddLogAsync(&model.LogEntry{
-			Time:               model.JSONTime{Time: time.Now()},
-			Model:              originalModel,
-			LogSource:          model.LogSourceProxy,
-			AuthTokenID:        tokenIDInt64,
-			ClientProtocol:     string(clientProtocol),
-			StatusCode:         503,
-			Message:            "no available upstream (all cooled or none)",
-			IsStreaming:        isStreaming,
-			ClientIP:           c.ClientIP(),
-			ThinkingEffort:     thinkingEffort,
-			IsTerminalOverride: true,
-			InboundRequest:     inboundRequest.Clone(),
-		})
-		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "no available upstream (all cooled or none)"})
-		return
+		// 全冷却兜底被 15s 探测限频拦下时请求会在选路阶段拿到空候选。
+		// 冷却到期通常是秒级窗口，让请求排队等待至多 10s 重试选路，
+		// 避免把可恢复的瞬时冷却放大成客户端可见的 503。
+		cands = s.waitForRouteCandidates(ctx, c, originalModel, string(clientProtocol))
+		if len(cands) == 0 {
+			s.AddLogAsync(&model.LogEntry{
+				Time:               model.JSONTime{Time: time.Now()},
+				Model:              originalModel,
+				LogSource:          model.LogSourceProxy,
+				AuthTokenID:        tokenIDInt64,
+				ClientProtocol:     string(clientProtocol),
+				StatusCode:         503,
+				Message:            "no available upstream (all cooled or none)",
+				IsStreaming:        isStreaming,
+				ClientIP:           c.ClientIP(),
+				ThinkingEffort:     thinkingEffort,
+				IsTerminalOverride: true,
+				InboundRequest:     inboundRequest.Clone(),
+			})
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "no available upstream (all cooled or none)"})
+			return
+		}
 	}
 
 	if tokenHashStr != "" {

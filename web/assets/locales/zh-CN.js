@@ -829,7 +829,7 @@ window.I18N_LOCALES['zh-CN'] = {
   'tokens.maxConcurrencyPlaceholder': '0 表示无限制',
   'tokens.priorityLabel': '优先级',
   'tokens.priorityPlaceholder': '默认 100，数值越大越优先',
-  'tokens.priorityHint': '并发排队时数值大的令牌优先',
+  'tokens.priorityHint': '数值大优先',
   'tokens.enableToken': '启用令牌',
   'tokens.createBtn': '创建',
   // 令牌结果对话框
