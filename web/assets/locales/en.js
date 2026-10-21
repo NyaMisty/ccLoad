@@ -829,7 +829,7 @@ window.I18N_LOCALES['en'] = {
   'tokens.maxConcurrencyPlaceholder': '0 means unlimited',
   'tokens.priorityLabel': 'Priority',
   'tokens.priorityPlaceholder': 'Default 100, higher wins',
-  'tokens.priorityHint': 'Higher wins',
+  'tokens.priorityHint': 'Higher priority wins when queued for slots',
   'tokens.enableToken': 'Enable token',
   'tokens.createBtn': 'Create',
   // Token result modal
