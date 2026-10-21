@@ -476,6 +476,7 @@ func (s *Server) executeResponsesWebsocketTurn(
 		header:                     header,
 		isStreaming:                true,
 		tokenHash:                  tokenHashString,
+		tokenPriority:              s.authService.TokenPriority(tokenHashString),
 		tokenID:                    tokenIDInt64,
 		clientIP:                   c.ClientIP(),
 		startTime:                  startTime,
@@ -487,6 +488,7 @@ func (s *Server) executeResponsesWebsocketTurn(
 		codexMultiAgentV2Optimized: executionSession.codexMultiAgentV2StateSnapshot(),
 	}
 	ctx = withCodexMultiAgentV2RequestContext(ctx, reqCtx)
+	ctx = withChannelSlotPriority(ctx, reqCtx.tokenPriority)
 	reqCtx.observer = &ForwardObserver{
 		OnBytesRead: func(n int64) {
 			s.activeRequests.AddBytes(reqCtx.activeReqID, n)

@@ -177,6 +177,105 @@ func (s *Server) pruneConcurrencyWaitersLocked() {
 }
 
 // ============================================================================
+// 渠道 Key 槽位优先队列（等待语义）
+// ============================================================================
+
+// channelKeySlotWaitBudget 是单个请求在渠道 Key 并发满载时排队等待槽位的总预算。
+// 预算请求级共享：请求按候选渠道顺序逐个等待，跨渠道累计不超过这一份。
+// 对齐 claudeAffinityConcurrencyWait 先例的量级。
+const channelKeySlotWaitBudget = 5 * time.Second
+
+// channelKeySlotWaitPoll 是排队等待的轮询节拍：enqueueChannelSlotWait 的 ctx 超时。
+// 授予是事件驱动的（释放即授予），轮询只兜底「其他 Key 冷却到期」这类
+// 不产生释放事件的恢复路径。
+const channelKeySlotWaitPoll = 500 * time.Millisecond
+
+// channelKeySlotWait 返回本请求的等待预算；Server.channelKeySlotWait 仅测试用来缩短。
+func (s *Server) channelKeySlotWait() time.Duration {
+	if s != nil && s.preferredChannelKeySlotWait > 0 {
+		return s.preferredChannelKeySlotWait
+	}
+	return channelKeySlotWaitBudget
+}
+
+// shouldWaitForKeySlot 判断是否为当前渠道排队等待 Key 槽位。
+// 全冷却兜底探测与 Claude 亲和探测各有专属语义，不排队；
+// 请求级预算未初始化或仍有剩余才值得等。
+func (s *Server) shouldWaitForKeySlot(cfg *model.Config, reqCtx *proxyRequestContext) bool {
+	if cfg == nil || reqCtx == nil {
+		return false
+	}
+	if cfg.CooldownFallback || reqCtx.claudeAffinityProbe {
+		return false
+	}
+	if reqCtx.slotWaitDeadline.IsZero() {
+		return true
+	}
+	return time.Now().Before(reqCtx.slotWaitDeadline)
+}
+
+// waitForChannelKeySlot 排队等待渠道 Key 槽位并重试同渠道。
+// 首次进入时初始化请求级共享预算；授予事件或轮询节拍唤醒后重试 tryChannelWithKeys，
+// 只有真实拿到槽位（或遇到非并发错误）才返回。预算耗尽返回最后的并发错误，
+// 交回上层按现有「跳过该渠道」分支溢出。
+func (s *Server) waitForChannelKeySlot(
+	ctx context.Context,
+	cfg *model.Config,
+	reqCtx *proxyRequestContext,
+	w http.ResponseWriter,
+) (*proxyResult, error) {
+	if reqCtx.slotWaitDeadline.IsZero() {
+		reqCtx.slotWaitDeadline = time.Now().Add(s.channelKeySlotWait())
+	}
+	// 重试链路里 acquire 的优先级来自 ctx value（doUpstreamRequest 读取）。
+	// 生产路径在请求入口已包装；这里幂等补包一次，覆盖直接调用本循环的路径
+	//（测试/未来调用点），保证重试按本请求令牌的优先级参与反偷窃与排队。
+	ctx = withChannelSlotPriority(ctx, reqCtx.tokenPriority)
+	log.Printf(
+		"[INFO] 渠道 %s (ID=%d) Key 并发满载，优先级 %d 令牌排队等待槽位（≤%.1fs）",
+		cfg.Name, cfg.ID, reqCtx.tokenPriority,
+		time.Until(reqCtx.slotWaitDeadline).Seconds(),
+	)
+
+	var lastErr error
+	for {
+		result, err := s.tryChannelWithKeys(ctx, cfg, reqCtx, w)
+		if !errors.Is(err, ErrKeyConcurrencyExceeded) {
+			return result, err
+		}
+		lastErr = err
+
+		if !time.Now().Before(reqCtx.slotWaitDeadline) {
+			return nil, lastErr
+		}
+		// 授予事件驱动为主；pollCtx 超时=轮询节拍，兜住冷却到期等无事件恢复。
+		// 被授予的等待者在真实 acquire 到槽位前保留优先级占用（防偷槽），
+		// 落座/放弃时 settle 解除。父 ctx 取消时返回 nil，由上层按 lastErr 溢出。
+		pollCtx, cancel := context.WithTimeout(ctx, channelKeySlotWaitPoll)
+		waiter := s.channelConcurrencyLimiter.enqueueChannelSlotWait(pollCtx, cfg.ID, reqCtx.tokenPriority)
+		cancel()
+		if waiter == nil {
+			// 轮询节拍到期或 ctx 取消：下一轮 tryChannelWithKeys 重试或收尾
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return nil, lastErr
+			}
+			continue
+		}
+		// 被授予：立即重试同渠道拿槽位；无论成败都 settle，解除队列占用。
+		grantResult, grantErr := s.tryChannelWithKeys(ctx, cfg, reqCtx, w)
+		s.channelConcurrencyLimiter.settleChannelSlotWaiter(waiter, grantErr == nil)
+		if grantErr != nil || grantResult != nil {
+			return grantResult, grantErr
+		}
+		// 极端情况：授予后仍拿不到（同渠道被更高优先级抢先落座且预算未到）——继续排队
+		lastErr = nil
+		if !time.Now().Before(reqCtx.slotWaitDeadline) {
+			return nil, lastErr
+		}
+	}
+}
+
+// ============================================================================
 // 请求解析
 // ============================================================================
 
@@ -582,6 +681,7 @@ func (s *Server) HandleProxyRequest(c *gin.Context) {
 		header:         c.Request.Header,
 		isStreaming:    isStreaming,
 		tokenHash:      tokenHashStr,
+		tokenPriority:  s.authService.TokenPriority(tokenHashStr),
 		tokenID:        tokenIDInt64,
 		clientIP:       c.ClientIP(),
 		startTime:      startTime,
@@ -597,6 +697,7 @@ func (s *Server) HandleProxyRequest(c *gin.Context) {
 	if executionSession != nil {
 		reqCtx.codexMultiAgentV2Optimized = executionSession.codexMultiAgentV2StateSnapshot()
 	}
+	ctx = withChannelSlotPriority(ctx, reqCtx.tokenPriority)
 	ctx = withCodexMultiAgentV2RequestContext(ctx, reqCtx)
 	if executionSession != nil && nativeRequestBody != nil {
 		reqCtx.nativeCodexWS = executionSession.upstream
@@ -763,6 +864,14 @@ func (s *Server) runProxyAttemptLoopWithFailureBoundary(
 	sawAlphaSearchUnsupported := false
 	for index, cfg := range cands {
 		result, err := s.tryChannelWithKeys(ctx, cfg, reqCtx, w)
+
+		// 渠道 Key 槽位优先队列：仅因并发满载（或被更高优先级等待者反偷窃拦下）失败时，
+		// 按令牌优先级排队等待槽位授予后重试同渠道，而不是立即溢出到下一渠道。
+		// 预算是请求级共享的：跨候选渠道累计不超过一份，不会 5s×N 叠加。
+		if err != nil && errors.Is(err, ErrKeyConcurrencyExceeded) &&
+			s.shouldWaitForKeySlot(cfg, reqCtx) {
+			result, err = s.waitForChannelKeySlot(ctx, cfg, reqCtx, w)
+		}
 
 		if err != nil && errors.Is(err, errClaudeAffinityTargetAlreadyTried) {
 			continue

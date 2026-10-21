@@ -24,6 +24,30 @@ const (
 
 type claudeAffinityConcurrencyWaitContextKey struct{}
 
+// channelSlotPriorityContextKey 携带当前请求的令牌优先级进入上游请求 ctx，
+// 供渠道 Key 槽位的优先级队列与反偷窃规则使用（仿 affinity wait 先例）。
+type channelSlotPriorityContextKey struct{}
+
+// channelSlotPriorityFromContext 读取请求令牌优先级；未携带（admin 测试路径等）用默认值。
+func channelSlotPriorityFromContext(ctx context.Context) int {
+	if ctx == nil {
+		return model.AuthTokenPriorityDefault
+	}
+	if priority, ok := ctx.Value(channelSlotPriorityContextKey{}).(int); ok && priority > 0 {
+		return priority
+	}
+	return model.AuthTokenPriorityDefault
+}
+
+// withChannelSlotPriority 把令牌优先级挂进代理链路 ctx，
+// 使上游请求的 Key 槽位获取与等待队列都按该优先级参与调度。
+func withChannelSlotPriority(ctx context.Context, priority int) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return context.WithValue(ctx, channelSlotPriorityContextKey{}, priority)
+}
+
 var claudeAffinityLoadFailureCount atomic.Uint64
 var claudeAffinityWriteFailureCount atomic.Uint64
 var claudeAffinityCleanupFailureCount atomic.Uint64

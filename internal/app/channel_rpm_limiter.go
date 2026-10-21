@@ -129,8 +129,8 @@ func (s *Server) reserveChannelRPM(cfg *model.Config) channelRPMReservation {
 	return s.channelRPMLimiter.reserve(cfg.ID, cfg.RPMLimit)
 }
 
-func (s *Server) reserveUpstreamRequest(cfg *model.Config, apiKey string) (release func(), err error) {
-	release, err = s.acquireKeyConcurrencySlot(cfg, apiKey)
+func (s *Server) reserveUpstreamRequest(ctx context.Context, cfg *model.Config, apiKey string) (release func(), err error) {
+	release, err = s.acquireKeyConcurrencySlot(cfg, apiKey, channelSlotPriorityFromContext(ctx))
 	if err != nil {
 		return nil, err
 	}
@@ -149,7 +149,7 @@ func (s *Server) reserveUpstreamRequestWithConcurrencyWait(
 	apiKey string,
 	wait time.Duration,
 ) (func(), error) {
-	release, err := s.reserveUpstreamRequest(cfg, apiKey)
+	release, err := s.reserveUpstreamRequest(ctx, cfg, apiKey)
 	if err == nil || wait <= 0 || !errors.Is(err, ErrKeyConcurrencyExceeded) {
 		return release, err
 	}

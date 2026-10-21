@@ -209,8 +209,8 @@ func TestProxy_NativeAnthropicSoftAffinityAcrossKeysAndChannels(t *testing.T) {
 		t.Fatalf("set primary Key concurrency: %v", err)
 	}
 	env.server.InvalidateChannelListCache()
-	heldRelease, _, _, ok := env.server.channelConcurrencyLimiter.acquire(
-		primaryCfg.ID, preferredKey, primaryCfg.MaxConcurrency,
+	heldRelease, _, _, _, ok := env.server.channelConcurrencyLimiter.acquire(
+		primaryCfg.ID, preferredKey, primaryCfg.MaxConcurrency, model.AuthTokenPriorityDefault,
 	)
 	if !ok {
 		t.Fatal("pre-acquire affinity Key failed")

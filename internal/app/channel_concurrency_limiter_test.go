@@ -17,24 +17,24 @@ func TestKeyConcurrencyLimiterIsolatesKeys(t *testing.T) {
 
 	limiter := newChannelConcurrencyLimiter()
 
-	releaseA, active, limit, ok := limiter.acquire(7, "key-a", 1)
+	releaseA, active, limit, _, ok := limiter.acquire(7, "key-a", 1, 100)
 	if !ok || active != 1 || limit != 1 {
 		t.Fatalf("first acquire got active=%d limit=%d ok=%v, want 1,1,true", active, limit, ok)
 	}
 
-	_, active, limit, ok = limiter.acquire(7, "key-a", 1)
+	_, active, limit, _, ok = limiter.acquire(7, "key-a", 1, 100)
 	if ok || active != 1 || limit != 1 {
 		t.Fatalf("second acquire for key-a got active=%d limit=%d ok=%v, want 1,1,false", active, limit, ok)
 	}
 
-	releaseB, active, limit, ok := limiter.acquire(7, "key-b", 1)
+	releaseB, active, limit, _, ok := limiter.acquire(7, "key-b", 1, 100)
 	if !ok || active != 1 || limit != 1 {
 		t.Fatalf("first acquire for key-b got active=%d limit=%d ok=%v, want 1,1,true", active, limit, ok)
 	}
 
 	releaseA()
 
-	releaseA, active, limit, ok = limiter.acquire(7, "key-a", 1)
+	releaseA, active, limit, _, ok = limiter.acquire(7, "key-a", 1, 100)
 	if !ok || active != 1 || limit != 1 {
 		t.Fatalf("key-a after release got active=%d limit=%d ok=%v, want 1,1,true", active, limit, ok)
 	}
@@ -46,7 +46,7 @@ func TestKeyConcurrencyLimiterWaitIsScopedToKey(t *testing.T) {
 	t.Parallel()
 
 	limiter := newChannelConcurrencyLimiter()
-	releaseA, _, _, ok := limiter.acquire(7, "key-a", 1)
+	releaseA, _, _, _, ok := limiter.acquire(7, "key-a", 1, 100)
 	if !ok {
 		t.Fatal("pre-acquire key-a failed")
 	}
@@ -69,7 +69,7 @@ func TestReserveUpstreamRequestWithConcurrencyWait(t *testing.T) {
 	t.Run("acquires released affinity slot", func(t *testing.T) {
 		server := &Server{channelConcurrencyLimiter: newChannelConcurrencyLimiter()}
 		cfg := &model.Config{ID: 7, MaxConcurrency: 1}
-		heldRelease, _, _, ok := server.channelConcurrencyLimiter.acquire(cfg.ID, "key-a", 1)
+		heldRelease, _, _, _, ok := server.channelConcurrencyLimiter.acquire(cfg.ID, "key-a", 1, 100)
 		if !ok {
 			t.Fatal("pre-acquire affinity Key failed")
 		}
@@ -90,7 +90,7 @@ func TestReserveUpstreamRequestWithConcurrencyWait(t *testing.T) {
 	t.Run("timeout remains a concurrency error", func(t *testing.T) {
 		server := &Server{channelConcurrencyLimiter: newChannelConcurrencyLimiter()}
 		cfg := &model.Config{ID: 7, MaxConcurrency: 1}
-		heldRelease, _, _, ok := server.channelConcurrencyLimiter.acquire(cfg.ID, "key-a", 1)
+		heldRelease, _, _, _, ok := server.channelConcurrencyLimiter.acquire(cfg.ID, "key-a", 1, 100)
 		if !ok {
 			t.Fatal("pre-acquire affinity Key failed")
 		}
@@ -240,7 +240,7 @@ func TestTryChannelWithKeysReportsConcurrencyScanCounts(t *testing.T) {
 	env.server.maxKeyRetries = 1
 
 	for _, apiKey := range []string{"sk-first", "sk-second"} {
-		release, _, _, ok := env.server.channelConcurrencyLimiter.acquire(cfg.ID, apiKey, 1)
+		release, _, _, _, ok := env.server.channelConcurrencyLimiter.acquire(cfg.ID, apiKey, 1, 100)
 		if !ok {
 			t.Fatalf("pre-acquire key %q failed", apiKey)
 		}

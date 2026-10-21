@@ -1514,7 +1514,7 @@ func (s *Server) doCodexWebsocketRequest(
 	if incrementalReq != nil {
 		incrementalBody = normalizeCodexWebsocketParallelToolCalls(incrementalBody, incrementalReq.Header)
 	}
-	release, err := s.reserveUpstreamRequest(cfg, apiKey)
+	release, err := s.reserveUpstreamRequest(ctx, cfg, apiKey)
 	if err != nil {
 		return nil, replayReq, replayBody, err
 	}

@@ -5096,7 +5096,7 @@ func TestProxy_SkipsChannelWhenOnlyKeyConcurrencyLimitExceeded(t *testing.T) {
 	}
 	env.server.InvalidateChannelListCache()
 
-	release, _, _, ok := env.server.channelConcurrencyLimiter.acquire(limitedID, "sk-limited", 1)
+	release, _, _, _, ok := env.server.channelConcurrencyLimiter.acquire(limitedID, "sk-limited", 1, 100)
 	if !ok {
 		t.Fatal("pre-acquire limited key slot failed")
 	}
@@ -5160,7 +5160,7 @@ func TestProxy_UsesNextKeyWhenFirstKeyConcurrencyLimitExceeded(t *testing.T) {
 	env.server.InvalidateAPIKeysCache(cfg.ID)
 	env.server.maxKeyRetries = 1
 
-	release, _, _, ok := env.server.channelConcurrencyLimiter.acquire(cfg.ID, "sk-first", 1)
+	release, _, _, _, ok := env.server.channelConcurrencyLimiter.acquire(cfg.ID, "sk-first", 1, 100)
 	if !ok {
 		t.Fatal("pre-acquire first key slot failed")
 	}
