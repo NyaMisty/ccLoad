@@ -139,6 +139,9 @@ type Server struct {
 	concurrencyWaitMu   sync.Mutex
 	concurrencyWaiters  []*concurrencyWaiter
 	concurrencyWaitSeq  atomic.Uint64
+	// preferredChannelKeySlotWait 是高优先级令牌在首选渠道 Key 并发满载时的等待预算。
+	// 0 表示使用 preferredChannelKeySlotWaitBudget 默认值；仅测试需要缩短。
+	preferredChannelKeySlotWait time.Duration
 
 	// 优雅关闭机制
 	baseCtx                 context.Context    // server生命周期context，Shutdown时取消

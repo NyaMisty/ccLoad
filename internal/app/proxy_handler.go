@@ -367,6 +367,65 @@ const routeCandidateWaitBudget = 10 * time.Second
 // 500ms 足够小，能尽快感知冷却解除；足够大，不会把选路查询放大成 DB 压力。
 const routeCandidateWaitPoll = 500 * time.Millisecond
 
+// preferredChannelKeySlotWaitBudget 是高优先级令牌在首选渠道 Key 并发满载时的等待预算，
+// 对齐 claudeAffinityConcurrencyWait 先例。期间通过渠道级释放事件 + 500ms 轮询重试同一渠道。
+const preferredChannelKeySlotWaitBudget = 5 * time.Second
+
+// preferredChannelSlotWaitPoll 是等待渠道 Key 槽位期间的兜底轮询间隔：
+// 覆盖「其他 Key 冷却到期」这类不产生释放事件的恢复路径。
+const preferredChannelSlotWaitPoll = routeCandidateWaitPoll
+
+// shouldWaitForPreferredChannel 判断是否值得为当前请求等待首选渠道的 Key 槽位。
+// 仅当：候选排序首位 + 非兜底/亲和探测 + 令牌优先级高于默认值。
+// 默认优先级令牌是背景负载，等待只会推高整体延迟，应立即溢出到下一渠道。
+func (s *Server) shouldWaitForPreferredChannel(cfg *model.Config, reqCtx *proxyRequestContext, index int) bool {
+	if cfg == nil || reqCtx == nil || index != 0 {
+		return false
+	}
+	if cfg.CooldownFallback || reqCtx.claudeAffinityProbe {
+		return false
+	}
+	return s.authService.TokenPriority(reqCtx.tokenHash) > model.AuthTokenPriorityDefault
+}
+
+// waitForPreferredChannelSlot 在首选渠道 Key 并发满载时等待槽位释放并重试同渠道。
+// 返回最后一次 tryChannelWithKeys 的结果；客户端断开由 ctx 随重试的 fail-fast 收尾。
+// 重试只在真实拿到槽位后才发上游请求，等待本身不放大上游流量。
+func (s *Server) waitForPreferredChannelSlot(
+	ctx context.Context,
+	cfg *model.Config,
+	reqCtx *proxyRequestContext,
+	w http.ResponseWriter,
+) (*proxyResult, error) {
+	budget := s.preferredChannelKeySlotWait
+	if budget <= 0 {
+		budget = preferredChannelKeySlotWaitBudget
+	}
+	priority := s.authService.TokenPriority(reqCtx.tokenHash)
+	log.Printf(
+		"[INFO] 渠道 %s (ID=%d) Key 并发满载，优先级 %d 令牌等待槽位（≤%s）",
+		cfg.Name, cfg.ID, priority, budget,
+	)
+
+	deadline := time.Now().Add(budget)
+	for {
+		result, err := s.tryChannelWithKeys(ctx, cfg, reqCtx, w)
+		if !errors.Is(err, ErrKeyConcurrencyExceeded) {
+			return result, err
+		}
+
+		if time.Now().After(deadline) {
+			return nil, err
+		}
+		// 等渠道级释放事件；waitCtx 的超时同时是兜底轮询间隔，
+		// 覆盖「其他 Key 冷却到期」这类不产生释放事件的恢复路径。
+		// 父 ctx 取消时这里立即返回，下一轮 tryChannelWithKeys 的 fail-fast 会收尾。
+		waitCtx, cancel := context.WithTimeout(ctx, preferredChannelSlotWaitPoll)
+		_ = s.channelConcurrencyLimiter.waitForChannelRelease(waitCtx, cfg.ID)
+		cancel()
+	}
+}
+
 // waitForRouteCandidates 在初次选路为空时排队等待：按固定间隔重试选路，
 // 拿到候选立即返回，超过 routeCandidateWaitBudget 或客户端断开才放弃。
 // 只在 HTTP 主链路使用；AlphaSearch 与 WebSocket 路径有各自的故障边界，不经过这里。
@@ -811,6 +870,13 @@ func (s *Server) runProxyAttemptLoopWithFailureBoundary(
 	sawAlphaSearchUnsupported := false
 	for index, cfg := range cands {
 		result, err := s.tryChannelWithKeys(ctx, cfg, reqCtx, w)
+
+		// 高优先级令牌在首选渠道仅因 Key 并发满载失败时，等待槽位后重试同渠道，
+		// 而不是立即溢出到低优先级渠道（等待语义见 shouldWaitForPreferredChannel）。
+		if err != nil && errors.Is(err, ErrKeyConcurrencyExceeded) &&
+			s.shouldWaitForPreferredChannel(cfg, reqCtx, index) {
+			result, err = s.waitForPreferredChannelSlot(ctx, cfg, reqCtx, w)
+		}
 
 		if err != nil && errors.Is(err, errClaudeAffinityTargetAlreadyTried) {
 			continue

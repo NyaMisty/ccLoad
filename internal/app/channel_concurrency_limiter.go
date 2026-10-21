@@ -70,12 +70,47 @@ type channelConcurrencyLimiter struct {
 	mu      sync.Mutex
 	active  map[keyConcurrencyID]int
 	changed map[keyConcurrencyID]chan struct{}
+	// channelChanged 按渠道广播「该渠道任一 Key 的槽位被释放」。
+	// 高优先级令牌的首选渠道等待靠它感知释放事件，配合轮询兜底。
+	channelChanged map[int64]chan struct{}
 }
 
 func newChannelConcurrencyLimiter() *channelConcurrencyLimiter {
 	return &channelConcurrencyLimiter{
-		active:  make(map[keyConcurrencyID]int),
-		changed: make(map[keyConcurrencyID]chan struct{}),
+		active:         make(map[keyConcurrencyID]int),
+		changed:        make(map[keyConcurrencyID]chan struct{}),
+		channelChanged: make(map[int64]chan struct{}),
+	}
+}
+
+// waitForChannelRelease 阻塞直到该渠道任一 Key 槽位被释放或 ctx 结束。
+// 唤醒后调用方自行重试选 Key；槽位不预留，与 per-key acquireContext 语义一致。
+func (l *channelConcurrencyLimiter) waitForChannelRelease(ctx context.Context, channelID int64) error {
+	if l == nil || channelID <= 0 {
+		return nil
+	}
+
+	l.mu.Lock()
+	changed := l.channelChanged[channelID]
+	if changed == nil {
+		changed = make(chan struct{})
+		l.channelChanged[channelID] = changed
+	}
+	l.mu.Unlock()
+
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-changed:
+		return nil
+	}
+}
+
+// broadcastChannelReleaseLocked 关闭并重建渠道级广播 channel（close 广播给全部等待者）。
+func (l *channelConcurrencyLimiter) broadcastChannelReleaseLocked(channelID int64) {
+	if changed, ok := l.channelChanged[channelID]; ok {
+		close(changed)
+		delete(l.channelChanged, channelID)
 	}
 }
 
@@ -142,6 +177,7 @@ func (l *channelConcurrencyLimiter) releaseFunc(id keyConcurrencyID) func() {
 				close(changed)
 				delete(l.changed, id)
 			}
+			l.broadcastChannelReleaseLocked(id.channelID)
 			l.mu.Unlock()
 		})
 	}

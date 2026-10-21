@@ -101,6 +101,7 @@ www/                 独立介绍站(`make www-setup` 复制共享资源后可�
 ## 关键机制(要点,细节读对应文件)
 
 - **选择顺序**:令牌渠道限制 → 成本限额检查 → 可用时段过滤 → 冷却过滤(正确性优先;模型冷却按各渠道解析重定向/模糊匹配后的实际上游模型过滤)→ 排序二选一:`enable_health_score` 默认 **false** 走渠道平滑加权轮询(按有效 Key 数),开启才走健康度排序(`calculateEffectivePriority`:`P_eff = Priority - 失败惩罚 - TTFB惩罚`,两种惩罚各按样本量打置信度折扣,TTFB 部分还要 `enable_ttfb_score` 单独开)
+- **首选渠道 Key 槽位等待**(`proxy_handler.go:waitForPreferredChannelSlot`):优先级 >100 的令牌在候选首位渠道仅因 Key 并发满载(`ErrKeyConcurrencyExceeded`)失败时,等待至多 5s(`preferredChannelKeySlotWaitBudget`,渠道级释放事件 + 500ms 轮询兜底,`Server.preferredChannelKeySlotWait` 可缩短供测试)后重试同渠道,而不是立即溢出到低优先级渠道;预算耗尽仍满载才溢出。不适用:候选首位之外、全冷却兜底探测、Claude 亲和探测;默认优先级令牌永远立即溢出。HTTP 与 Responses WS 共用 `runProxyAttemptLoopWithFailureBoundary`,两边同时生效。等待期间不持有全局/令牌并发槽位以外的资源,重试只在真实拿到 Key 槽位后才发上游请求
 - **令牌渠道限制是硬路由约束**(`selector.go:filterChannelsByTokenRestriction`):在快照查询之后、冷却过滤与全冷却兜底**之前**过滤,精确候选池、模糊匹配池、兜底池全部只含令牌允许的渠道——兜底挑「最早恢复」也只能在允许范围内挑。限制排除全部候选时返回哨兵 `ErrNoAllowedChannelForToken`(上层映射 403),绝不退回无限制全量池。注意 allow 空列表=无限制,不是全拒;`proxy_handler.go` 里旧的 `FilterAllowedChannels` 后置过滤保留为纵深防御
 - **渠道可用时段**(`model/config.go:IsAvailableAt`+`selector_cooldown.go:filterAvailableTimeChannels`):`available_time_start/end`(HH:MM,服务器本地时间)必须成对设置,均空=全天;支持跨午夜(如 22:00–08:00),半开区间,起止相等视为全天。硬路由约束:在冷却过滤与全冷却兜底**之前**过滤,时段外渠道绝不因「所有渠道冷却」被兜底选中
 - **多 URL**:探索优先 → 1/EWMA 加权随机,失败 URL 独立退避;延迟数据只来自真实请求的 TTFB。`ChannelURL.Exact` 派生运行时 `#` 标记实现精确转发,持久化 URL 本身不含标记。Antigravity OAuth 例外:固定 provider 回退顺序(daily → daily sandbox),不被延迟重排,仅跳过手动禁用的 URL(`orderURLsInConfiguredOrder`)
