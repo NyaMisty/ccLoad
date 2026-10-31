@@ -142,6 +142,9 @@ type Server struct {
 	// preferredChannelKeySlotWait 是渠道 Key 槽位优先队列的请求级等待预算。
 	// 0 表示使用 channelKeySlotWaitBudget 默认值；仅测试需要缩短。
 	preferredChannelKeySlotWait time.Duration
+	// slotScheduler 完全控制渠道尝试循环的槽位调度（跨渠道并发排队 +
+	// 全局档位预留/借用）；可为 nil（测试构造的最小 Server）。
+	slotScheduler *channelSlotScheduler
 
 	// 优雅关闭机制
 	baseCtx                 context.Context    // server生命周期context，Shutdown时取消
@@ -275,6 +278,10 @@ func NewServer(store storage.Store) *Server {
 		channelRPMLimiter:         newChannelRPMLimiter(time.Now),
 		channelConcurrencyLimiter: newChannelConcurrencyLimiter(),
 	}
+
+	// 槽位调度器：完全控制渠道尝试循环（跨渠道并发排队 + 全局档位预留）。
+	s.slotScheduler = newChannelSlotScheduler(s, s.channelConcurrencyLimiter)
+	s.slotScheduler.baseCtx = baseCtx
 
 	reg := protocol.NewRegistry()
 	protocolbuiltin.Register(reg)

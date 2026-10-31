@@ -3527,6 +3527,30 @@ func (s *Server) tryChannelWithKeys(ctx context.Context, cfg *model.Config, reqC
 		} else if !cfg.RetryOtherKeysOnFailure {
 			keyIndex, selectedKey, pinned = selectPinnedCodexWebsocketKey(cfg, apiKeys, triedKeys, reqCtx.nativeCodexWS)
 		}
+		// 槽位预留借用：档位 HELD hold 落座在本渠道且 Key 可用时直接借用
+		//（跳过 acquire）。亲和探测与兜底探测各有专属语义，不借用；
+		// WS pin 的 Key 身份优先。
+		borrowedToken := (*slotHoldBorrowToken)(nil)
+		if !pinned && !reqCtx.claudeAffinityProbe && !cfg.CooldownFallback && s.slotScheduler != nil {
+			if holdKey, ok := s.slotScheduler.pinBorrowedKey(cfg, apiKeys, triedKeys, reqCtx.tokenPriority, time.Now()); ok {
+				for _, apiKey := range apiKeys {
+					if apiKey != nil && apiKey.APIKey == holdKey {
+						keyIndex, selectedKey, pinned = apiKey.KeyIndex, apiKey.APIKey, true
+						borrowedToken = s.slotScheduler.borrowFor(cfg, reqCtx.tokenPriority, nil)
+						break
+					}
+				}
+			}
+		}
+		// 借用结算兜底：mint 过凭据就必须结算（成功消费/失败续预留），
+		// 否则预留的 +1 悬挂。attemptOutcome 由循环体各出口写入，
+		// defer 闭包在返回时读取终值（不能按值传参——defer 参数会立即求值）。
+		attemptOutcome := &proxyResult{}
+		if borrowedToken != nil {
+			defer func() {
+				s.slotScheduler.settleBorrowed(cfg, apiKeys, borrowedToken, attemptOutcome.succeeded)
+			}()
+		}
 		var selectErr error
 		if !pinned {
 			keyIndex, selectedKey, selectErr = s.selectKeyWithFallback(cfg, apiKeys, triedKeys)
@@ -3550,9 +3574,14 @@ func (s *Server) tryChannelWithKeys(ctx context.Context, cfg *model.Config, reqC
 		// 标记Key为已尝试
 		triedKeys[keyIndex] = true
 
-		// URL循环（单URL时退化为单次迭代）
+		// URL循环（单URL时退化为单次迭代）。借用预留时把凭据挂进 ctx，
+		// reserveUpstreamRequest 据此跳过 acquire（HTTP 与原生 WS 两条路径都覆盖）。
+		attemptCtx := ctx
+		if borrowedToken != nil {
+			attemptCtx = context.WithValue(ctx, slotHoldBorrowContextKey{}, borrowedToken)
+		}
 		immediate, urlLastFailure, attemptErr := s.attemptKeyAcrossURLs(
-			ctx, cfg, urls, selector,
+			attemptCtx, cfg, urls, selector,
 			keyIndex, selectedKey, reqCtx, w)
 		if attemptErr != nil {
 			if errors.Is(attemptErr, ErrKeyConcurrencyExceeded) {
@@ -3561,6 +3590,10 @@ func (s *Server) tryChannelWithKeys(ctx context.Context, cfg *model.Config, reqC
 				}
 				lastConcurrencyErr = attemptErr
 				concurrencyLimitedKeys++
+				// 满载 Key 记录给 slot scheduler（主动获取与幽灵 armKey 兜底）。
+				if s.slotScheduler != nil {
+					s.slotScheduler.noteKeySaturation(reqCtx, cfg.ID, selectedKey)
+				}
 				if _, limit, ok := keyConcurrencyLimit(attemptErr); ok {
 					perKeyConcurrencyLimit = limit
 				}
@@ -3570,11 +3603,13 @@ func (s *Server) tryChannelWithKeys(ctx context.Context, cfg *model.Config, reqC
 		}
 		upstreamKeyAttempts++
 		if immediate != nil {
+			*attemptOutcome = *immediate
 			return immediate, nil
 		}
 
 		// URL循环结束后的Key级决策
 		if urlLastFailure != nil {
+			*attemptOutcome = *urlLastFailure
 			lastFailure = urlLastFailure
 			if urlLastFailure.nextAction == cooldown.ActionRetryKey {
 				continue // 下一个Key

@@ -376,25 +376,26 @@ func TestChannelSlotQueue_Exclusions(t *testing.T) {
 
 	env, preferred, _, release := setupChannelSlotEnv(t)
 	defer release()
+	scheduler := env.server.slotScheduler
 
 	fallbackCfg := model.Config{ID: 999, Name: "cooldown-fallback", CooldownFallback: true}
-	if env.server.shouldWaitForKeySlot(&fallbackCfg, channelSlotTestRequestContext("any", model.AuthTokenPriorityDefault)) {
+	if scheduler.shouldFanout(&fallbackCfg, channelSlotTestRequestContext("any", model.AuthTokenPriorityDefault)) {
 		t.Fatal("cooldown fallback candidate must not queue")
 	}
 
 	probeCtx := channelSlotTestRequestContext("any", model.AuthTokenPriorityDefault)
 	probeCtx.claudeAffinityProbe = true
-	if env.server.shouldWaitForKeySlot(preferred, probeCtx) {
+	if scheduler.shouldFanout(preferred, probeCtx) {
 		t.Fatal("affinity probe must not queue")
 	}
 
-	if !env.server.shouldWaitForKeySlot(preferred, channelSlotTestRequestContext("any", model.AuthTokenPriorityDefault)) {
+	if !scheduler.shouldFanout(preferred, channelSlotTestRequestContext("any", model.AuthTokenPriorityDefault)) {
 		t.Fatal("ordinary attempt with fresh budget should queue")
 	}
 
 	expiredCtx := channelSlotTestRequestContext("any", model.AuthTokenPriorityDefault)
-	expiredCtx.slotWaitDeadline = time.Now().Add(-time.Second)
-	if env.server.shouldWaitForKeySlot(preferred, expiredCtx) {
+	expiredCtx.slotState = &slotRequestState{deadline: time.Now().Add(-time.Second)}
+	if scheduler.shouldFanout(preferred, expiredCtx) {
 		t.Fatal("expired budget must not queue")
 	}
 }

@@ -130,6 +130,19 @@ func (s *Server) reserveChannelRPM(cfg *model.Config) channelRPMReservation {
 }
 
 func (s *Server) reserveUpstreamRequest(ctx context.Context, cfg *model.Config, apiKey string) (release func(), err error) {
+	// 槽位预留借用：凭据经 ctx 传入且仍被调度器覆盖（BORROWED 未超硬宽限、
+	// 同渠道）时，本次获取已被预留的 +1 覆盖，跳过 acquire 返回 no-op release；
+	// RPM 预留照常。位置在本函数（而非 doUpstreamRequest），让 HTTP 与原生
+	// Codex WebSocket 两条上游路径统一覆盖。
+	if s != nil && s.slotScheduler != nil {
+		if noop := s.slotScheduler.borrowedRelease(ctx, cfg); noop != nil {
+			if reservation := s.reserveChannelRPM(cfg); !reservation.allowed {
+				return nil, &channelRPMExceededError{retryAfter: reservation.retryAfter}
+			}
+			return noop, nil
+		}
+	}
+
 	release, err = s.acquireKeyConcurrencySlot(cfg, apiKey, channelSlotPriorityFromContext(ctx))
 	if err != nil {
 		return nil, err

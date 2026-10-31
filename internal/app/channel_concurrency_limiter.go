@@ -92,13 +92,18 @@ func newChannelConcurrencyLimiter() *channelConcurrencyLimiter {
 // ready 在被授予槽位时关闭；granted 等待者**保留在队列**直到它真实 acquire 到槽位
 // 或放弃——被授予但尚未落座的等待者仍然占用优先级，新到请求不得偷走它的槽位。
 // abandoned 标记等待者已放弃（ctx 取消），惰性清理。
+// ghost/grantedKey 供 slot scheduler 使用：ghost 标记槽位预留的幽灵等待者
+//（同优先级 tie-break 让位于真实等待者）；grantedKey 记录授予来自哪个 key 的
+// 释放，幽灵落座必须回到同一个 key。
 type channelSlotWaiter struct {
-	priority  int
-	seq       uint64
-	ready     chan struct{}
-	granted   bool
-	acquired  bool
-	abandoned bool
+	priority   int
+	seq        uint64
+	ready      chan struct{}
+	granted    bool
+	acquired   bool
+	abandoned  bool
+	ghost      bool
+	grantedKey keyConcurrencyID
 }
 
 // enqueueChannelSlotWait 入队等待该渠道的下一个释放槽位。
@@ -145,16 +150,17 @@ func (l *channelConcurrencyLimiter) settleChannelSlotWaiter(waiter *channelSlotW
 
 // grantBestChannelWaiterLocked 把刚释放的槽位授予该渠道优先级最高（同优先级最早入队）的等待者。
 // 必须持 l.mu 调用；一次释放只授予一人。被授予者保留在队列（granted=true）直到落座或放弃。
-func (l *channelConcurrencyLimiter) grantBestChannelWaiterLocked(channelID int64) {
+// id 是触发本次释放的 key 身份：授予时记录到 grantedKey，供幽灵等待者落座回到同一 key。
+// 同优先级 tie-break：真实等待者（ghost=false）优先于幽灵——幽灵只做尽力预留，
+// 不与真实流量争抢授予顺序。
+func (l *channelConcurrencyLimiter) grantBestChannelWaiterLocked(channelID int64, id keyConcurrencyID) {
 	waiters := l.channelWaiters[channelID]
 	best := -1
 	for i, w := range waiters {
 		if w.abandoned || w.granted {
 			continue
 		}
-		if best < 0 ||
-			w.priority > waiters[best].priority ||
-			(w.priority == waiters[best].priority && w.seq < waiters[best].seq) {
+		if best < 0 || betterChannelWaiter(w, waiters[best]) {
 			best = i
 		}
 	}
@@ -162,7 +168,20 @@ func (l *channelConcurrencyLimiter) grantBestChannelWaiterLocked(channelID int64
 		return
 	}
 	waiters[best].granted = true
+	waiters[best].grantedKey = id
 	close(waiters[best].ready)
+}
+
+// betterChannelWaiter 报告 w 是否优先于 best 成为授予对象：
+// 优先级严格更高者优先；同优先级真实等待者先于 ghost；再比入队序（FIFO）。
+func betterChannelWaiter(w, best *channelSlotWaiter) bool {
+	if w.priority != best.priority {
+		return w.priority > best.priority
+	}
+	if w.ghost != best.ghost {
+		return !w.ghost
+	}
+	return w.seq < best.seq
 }
 
 // hasHigherChannelWaiterLocked 报告该渠道是否存在严格更高优先级的有效等待者
@@ -282,7 +301,7 @@ func (l *channelConcurrencyLimiter) releaseFunc(id keyConcurrencyID) func() {
 				delete(l.changed, id)
 			}
 			// 槽位释放：精确授予该渠道优先级最高的等待者（授予式，不广播竞速）。
-			l.grantBestChannelWaiterLocked(id.channelID)
+			l.grantBestChannelWaiterLocked(id.channelID, id)
 			l.mu.Unlock()
 		})
 	}

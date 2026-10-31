@@ -165,7 +165,7 @@ type proxyRequestContext struct {
 	isStreaming                bool
 	tokenHash                  string               // Token哈希值（用于统计）
 	tokenPriority              int                  // 令牌调度优先级（渠道 Key 槽位优先队列使用）
-	slotWaitDeadline           time.Time            // 渠道 Key 槽位等待预算的请求级共享截止时间（零值=未开始）
+	slotState                  *slotRequestState    // slot scheduler 的请求级状态（跨渠道排队/借用；惰性初始化）
 	tokenID                    int64                // Token ID（用于日志记录，0表示未使用token）
 	clientIP                   string               // 客户端IP地址（用于日志记录）
 	activeReqID                int64                // 活跃请求ID（用于更新渠道信息）
