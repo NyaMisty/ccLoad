@@ -97,6 +97,9 @@ func (s *Server) HandleRuntimeMetrics(c *gin.Context) {
 		"http_proxy":          s.httpRuntime.stats(),
 		"responses_websocket": stats,
 	}
+	if s.slotScheduler != nil {
+		data["slot_scheduler"] = s.slotScheduler.stats()
+	}
 	if provider, ok := s.store.(storage.HybridRuntimeMetricsProvider); ok {
 		data["storage"] = provider.RuntimeMetrics()
 	}

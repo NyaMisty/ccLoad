@@ -1,10 +1,13 @@
 package app
 
 import (
+	"bytes"
 	"context"
+	"encoding/hex"
 	"errors"
 	"log"
 	"net/http"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -61,6 +64,20 @@ const (
 	slotHoldHeld
 	slotHoldBorrowed
 )
+
+// String 供 runtime-metrics 快照使用。
+func (st slotHoldState) String() string {
+	switch st {
+	case slotHoldArmed:
+		return "armed"
+	case slotHoldHeld:
+		return "held"
+	case slotHoldBorrowed:
+		return "borrowed"
+	default:
+		return "unknown"
+	}
+}
 
 // slotHoldCandidate 是 arm 时从路由候选快照的渠道并发配置。
 type slotHoldCandidate struct {
@@ -160,6 +177,137 @@ func (s *channelSlotScheduler) aliveLocked(hold *slotHold) bool {
 }
 
 // ============================================================================
+// 运行状态快照（/admin/runtime-metrics）
+// ============================================================================
+
+// slotHoldStats 是单条 hold 的可观测快照。
+type slotHoldStats struct {
+	Tier            int    `json:"tier"`
+	State           string `json:"state"` // armed|held|borrowed
+	ChannelID       int64  `json:"channel_id,omitempty"`
+	SlotsHeld       int    `json:"slots_held"`           // armed=0，held/borrowed=1
+	Rearms          int    `json:"rearms"`
+	RearmLimit      int    `json:"rearm_limit"`
+	ExpiresInMs     int64  `json:"expires_in_ms"`        // 当前状态窗口剩余（≤0 已过期）
+	Candidates      int    `json:"candidates"`           // armed 期的候选渠道数
+}
+
+// slotSchedulerStats 是调度器整体快照：各档位 hold + 渠道 Key 槽位占用。
+type slotSchedulerStats struct {
+	Holds        []*slotHoldStats `json:"holds"`
+	HeldSlots    int              `json:"held_slots"`     // 所有档位合计占用的槽位数
+	ChannelKeys  []slotKeyStats   `json:"channel_keys"`   // 各渠道 Key 的 active/limit/等待者
+	TotalWaiters int              `json:"total_waiters"`  // 渠道级优先队列中的等待者总数
+}
+
+// slotKeyStats 是单个 (渠道, Key) 的槽位占用快照。Key 以哈希前 8 位标识，
+// 不落明文。Limit 来自最近一次 acquire 携带的渠道 MaxConcurrency（进程内观测值）。
+type slotKeyStats struct {
+	ChannelID     int64  `json:"channel_id"`
+	Key           string `json:"key"`
+	Active        int    `json:"active"`
+	Limit         int    `json:"limit,omitempty"`
+	Waiters       int    `json:"waiters"`
+}
+
+// stats 生成调度器与 limiter 的只读快照。持锁采集，惰性推进到期
+//（快照即当前真实状态，ARMED/HELD 到期的 hold 在此清理）。
+func (s *channelSlotScheduler) stats() slotSchedulerStats {
+	out := slotSchedulerStats{Holds: []*slotHoldStats{}}
+	if s == nil {
+		return out
+	}
+	now := s.clock()()
+	s.mu.Lock()
+	for _, hold := range s.holds {
+		s.expireLocked(hold)
+		if !s.aliveLocked(hold) {
+			continue
+		}
+		entry := &slotHoldStats{
+			Tier:       hold.tier,
+			State:      hold.state.String(),
+			ChannelID:  hold.channelID,
+			SlotsHeld:  0,
+			Rearms:     hold.rearms,
+			RearmLimit: slotSchedulerMaxRearms,
+			Candidates: len(hold.candidates),
+		}
+		switch hold.state {
+		case slotHoldHeld, slotHoldBorrowed:
+			entry.SlotsHeld = 1
+			entry.ExpiresInMs = hold.deadline.Sub(now).Milliseconds()
+			if entry.ExpiresInMs < 0 {
+				entry.ExpiresInMs = 0
+			}
+		case slotHoldArmed:
+			entry.ExpiresInMs = hold.armDeadline.Sub(now).Milliseconds()
+			if entry.ExpiresInMs < 0 {
+				entry.ExpiresInMs = 0
+			}
+		}
+		out.Holds = append(out.Holds, entry)
+		out.HeldSlots += entry.SlotsHeld
+	}
+	s.mu.Unlock()
+
+	out.ChannelKeys, out.TotalWaiters = s.limiter.slotKeyStatsSnapshot()
+	return out
+}
+
+// slotKeyStatsSnapshot 生成各 (渠道, Key) 槽位占用的只读快照。
+// Key 以哈希前 8 位十六进制标识（不落明文）；limit 是最近一次 acquire 携带的
+// 观测值。按 (channelID, key) 排序保证输出稳定。
+func (l *channelConcurrencyLimiter) slotKeyStatsSnapshot() ([]slotKeyStats, int) {
+	if l == nil {
+		return []slotKeyStats{}, 0
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	keys := make([]keyConcurrencyID, 0, len(l.active))
+	for id := range l.active {
+		keys = append(keys, id)
+	}
+	// keyLimits 可能含已释放（active 无记录）的 key：一并纳入，活跃数自然为 0。
+	for id := range l.keyLimits {
+		if _, active := l.active[id]; !active {
+			keys = append(keys, id)
+		}
+	}
+	sort.Slice(keys, func(i, j int) bool {
+		if keys[i].channelID != keys[j].channelID {
+			return keys[i].channelID < keys[j].channelID
+		}
+		return bytes.Compare(keys[i].keyHash[:], keys[j].keyHash[:]) < 0
+	})
+
+	stats := make([]slotKeyStats, 0, len(keys))
+	totalWaiters := 0
+	waitersByChannel := make(map[int64]int, len(l.channelWaiters))
+	for channelID, waiters := range l.channelWaiters {
+		count := 0
+		for _, w := range waiters {
+			if !w.abandoned && !w.acquired {
+				count++
+			}
+		}
+		waitersByChannel[channelID] = count
+		totalWaiters += count
+	}
+	for _, id := range keys {
+		stats = append(stats, slotKeyStats{
+			ChannelID: id.channelID,
+			Key:       hex.EncodeToString(id.keyHash[:4]),
+			Active:    l.active[id],
+			Limit:     l.keyLimits[id],
+			Waiters:   waitersByChannel[id.channelID],
+		})
+	}
+	return stats, totalWaiters
+}
+
+// ============================================================================
 // limiter 原语扩展（同包方法；不改上游 enqueueChannelSlotWait 签名）
 // ============================================================================
 
@@ -227,6 +375,9 @@ func (l *channelConcurrencyLimiter) acquireSlotByID(id keyConcurrencyID, limit i
 	}
 
 	l.mu.Lock()
+	if limit > 0 {
+		l.keyLimits[id] = limit // 观测值：runtime-metrics 快照展示 active/limit
+	}
 	current := l.active[id]
 	if limit > 0 && current >= limit {
 		l.mu.Unlock()

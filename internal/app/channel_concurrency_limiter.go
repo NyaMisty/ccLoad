@@ -78,13 +78,17 @@ type channelConcurrencyLimiter struct {
 	// 新到请求不得获取空闲槽位（反偷窃）。
 	channelWaiters map[int64][]*channelSlotWaiter
 	channelSeq    atomic.Uint64
+	// keyLimits 记录各 key 最近一次 acquire 携带的并发上限（观测值，
+	// 供 runtime-metrics 快照展示 active/limit；不参与任何调度判定）。
+	keyLimits map[keyConcurrencyID]int
 }
 
 func newChannelConcurrencyLimiter() *channelConcurrencyLimiter {
 	return &channelConcurrencyLimiter{
-		active:        make(map[keyConcurrencyID]int),
-		changed:       make(map[keyConcurrencyID]chan struct{}),
+		active:         make(map[keyConcurrencyID]int),
+		changed:        make(map[keyConcurrencyID]chan struct{}),
 		channelWaiters: make(map[int64][]*channelSlotWaiter),
+		keyLimits:      make(map[keyConcurrencyID]int),
 	}
 }
 
@@ -239,6 +243,7 @@ func (l *channelConcurrencyLimiter) acquire(channelID int64, apiKey string, limi
 	id := newKeyConcurrencyID(channelID, apiKey)
 
 	l.mu.Lock()
+	l.keyLimits[id] = limit // 观测值：runtime-metrics 快照展示 active/limit
 	current := l.active[id]
 	if current >= limit {
 		l.mu.Unlock()
